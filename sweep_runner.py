@@ -17,6 +17,9 @@ Usage: sweep_runner.py <modem> <cells.json> <out.csv> [tag]
        sweep_runner.py --calibrate-pep <modem> [target_dbfs] [payload] [timeout]
          (measure the modem's clean TX peak and write results/<modem>_txgain.txt so it
           is driven at equal PEP across modems; see docs/EQUAL-PEP.md)
+       sweep_runner.py --calibrate-pep-stressed <modem> [target_dbfs]
+         (same, but the MAX peak over a clean/AWGN/fading ladder, so a slower mode with a
+          higher peak is not missed -- slower, more thorough)
   modem: a key in the adapter registry — the built-ins (loopback, mercury, armstrong,
   ardop) plus anything
   in <BENCH_ROOT>/adapters.json or the file named by $BENCH_ADAPTERS. A new project
@@ -138,44 +141,71 @@ def modem_txgain(modem):
     means no calibration -> 1.0. EQUAL_GAIN=1 forces 1.0 regardless."""
     if os.environ.get("EQUAL_GAIN", "0").strip() == "1":
         return "1.0"
-    path = os.path.join(SWEEPDIR, "results", f"{modem}_txgain.txt")
+    path = os.path.join(BENCH_ROOT, "results", f"{modem}_txgain.txt")
     if not os.path.exists(path):
         return "1.0"
     return open(path).read().strip()
 
 
-def calibrate_pep(modem, target_dbfs=-1.0, payload=1500, timeout=70):
-    """Equal-PEP calibration: measure a modem's clean TX peak and write
-    results/<modem>_txgain.txt so it is driven at the target peak envelope power.
+# Channel ladder for --calibrate-pep-stressed: clean drives the modem to its fastest
+# mode, AWGN and fading push it down through its slower/robust modes, so the max TX peak
+# across the ladder reflects the whole mode set -- not just the clean-channel mode.
+STRESS_LADDER = [
+    {"sigma": 0},                              # clean: high-rate modes
+    {"sigma": 7000},                           # AWGN: middle modes
+    {"sigma": 4000, "watterson": "poor"},      # poor fade: low-rate / robust modes
+]
 
-    Runs the modem once on a clean channel (SIGMA=0) at TXGAIN=1.0 with signal stats
-    on, reads the ROBUST peak -- which excludes the ALSA-loopback cold-start transient;
-    normalizing off the raw peak sets the gain off that glitch and under-drives the
-    modem -- and computes TXGAIN = 10^(target_dbfs/20) * 32767 / robust_peak. Every
-    subsequent campaign run picks the file up automatically via modem_txgain().
+
+def calibrate_pep(modem, target_dbfs=-1.0, payload=1500, timeout=70, conditions=None):
+    """Equal-PEP calibration: measure a modem's TX peak and write results/<modem>_txgain.txt
+    so it is driven at the target peak envelope power.
+
+    Runs the modem at TXGAIN=1.0 with signal stats on, reads the ROBUST peak -- which
+    excludes the ALSA-loopback cold-start transient; normalizing off the raw peak sets the
+    gain off that glitch and under-drives the modem -- and computes
+    TXGAIN = 10^(target_dbfs/20) * 32767 / robust_peak. modem_txgain() picks the file up
+    automatically in every subsequent campaign run.
+
+    `conditions` is a list of channel dicts ({"sigma":.., "watterson":..}); the gain is
+    keyed to the MAX robust peak across all of them. The default (one clean cell) only
+    exercises the modes the rate controller reaches on a clean channel -- the connect mode
+    plus the fastest data mode. Pass STRESS_LADDER (--calibrate-pep-stressed) to drive the
+    modem through its whole mode set so a slower mode with a higher peak is not missed;
+    that path also uses a larger payload so the controller climbs to the top mode.
     """
     cfg = resolve_adapter(modem)
-    stats = os.path.join(LOGDIR, f"calib_{modem}")
-    env = dict(os.environ, SIGMA="0", TXGAIN="1.0", NP_STATS=stats)
-    env.setdefault("SIM_HALF_DUPLEX", "1")
-    env.setdefault("SIM_PTT", "1")
-    env.update(cfg["extra_env"])
-    print(f"measuring {modem} TX peak (clean run, payload={payload} B) ...", flush=True)
-    kill = int(timeout) + cfg["kill_pad"]
-    sp.run(["timeout", str(kill), harness_python(cfg["script"]), "-u",
-            cfg["script"], str(payload), str(timeout)], cwd=BENCH_ROOT, env=env)
+    conds = conditions or [{"sigma": 0}]
     peak = 0.0
     papr = 0.0
-    for sfx in (".11", ".22"):                     # both directions; take the higher peak
-        try:
-            d = json.load(open(stats + sfx))
-        except (OSError, ValueError):
-            continue
-        rp = float(d.get("robust_peak", d.get("peak", 0)) or 0)
-        print(f"  {sfx}: robust_peak={rp:.0f} ({20 * math.log10(max(rp, 1) / 32767):+.1f} dBFS)"
-              f"  rms={d.get('rms', 0):.0f}  papr={d.get('papr_robust_db', 0):.1f} dB", flush=True)
-        if rp > peak:
-            peak, papr = rp, float(d.get("papr_robust_db", 0.0))
+    peak_from = ""
+    for i, cond in enumerate(conds):
+        sigma = cond.get("sigma", 0)
+        watt = cond.get("watterson", "off")
+        label = f"sigma={sigma} fade={watt}"
+        stats = os.path.join(LOGDIR, f"calib_{modem}_{i}")
+        env = dict(os.environ, SIGMA=str(sigma), TXGAIN="1.0", NP_STATS=stats,
+                   SIM_WATTERSON=watt)
+        env.setdefault("SIM_HALF_DUPLEX", "1")
+        env.setdefault("SIM_PTT", "1")
+        env.update(cfg["extra_env"])
+        print(f"measuring {modem} TX peak ({label}, payload={payload} B) ...", flush=True)
+        kill = int(timeout) + cfg["kill_pad"]
+        sp.run(["timeout", str(kill), harness_python(cfg["script"]), "-u",
+                cfg["script"], str(payload), str(timeout)], cwd=BENCH_ROOT, env=env)
+        for sfx in (".11", ".22"):                 # both directions
+            try:
+                d = json.load(open(stats + sfx))
+            except (OSError, ValueError):
+                continue
+            rp = float(d.get("robust_peak", d.get("peak", 0)) or 0)
+            print(f"  [{label}] {sfx}: robust_peak={rp:.0f} "
+                  f"({20 * math.log10(max(rp, 1) / 32767):+.1f} dBFS)  "
+                  f"papr={d.get('papr_robust_db', 0):.1f} dB", flush=True)
+            if rp > peak:
+                peak, papr, peak_from = rp, float(d.get("papr_robust_db", 0.0)), label
+        if len(conds) > 1:
+            between_cell_cleanup()                 # clear the rig between conditions
     if peak <= 0:
         print(f"FAIL: no TX peak measured for {modem} -- did it connect and transmit? "
               f"(check {LOGDIR})", flush=True)
@@ -186,7 +216,9 @@ def calibrate_pep(modem, target_dbfs=-1.0, payload=1500, timeout=70):
     out = os.path.join(outdir, f"{modem}_txgain.txt")
     with open(out, "w") as f:
         f.write(f"{gain:.4f}\n")
-    print(f"\n{modem}: robust_peak={peak:.0f} ({20 * math.log10(max(peak, 1) / 32767):+.1f} dBFS), "
+    src = f" from [{peak_from}]" if len(conds) > 1 else ""
+    print(f"\n{modem}: max robust_peak={peak:.0f} "
+          f"({20 * math.log10(max(peak, 1) / 32767):+.1f} dBFS){src}, "
           f"PAPR={papr:.1f} dB  ->  TXGAIN={gain:.4f}  (target {target_dbfs:+.0f} dBFS)", flush=True)
     print(f"wrote {out}", flush=True)
     return 0
@@ -303,21 +335,33 @@ def run_cell(modem, cell, rep, writer, fcsv, tag):
 
 
 def main():
-    if len(sys.argv) > 1 and sys.argv[1] == "--calibrate-pep":
-        # sweep_runner.py --calibrate-pep <modem> [target_dbfs=-1] [payload=1500] [timeout=70]
+    if len(sys.argv) > 1 and sys.argv[1] in ("--calibrate-pep", "--calibrate-pep-stressed"):
+        # --calibrate-pep <modem> [target_dbfs=-1] [payload=1500] [timeout=70]  (clean run)
+        # --calibrate-pep-stressed <modem> [target_dbfs=-1]  (max peak over a mode ladder)
+        stressed = sys.argv[1] == "--calibrate-pep-stressed"
         if len(sys.argv) < 3:
-            sys.exit("usage: sweep_runner.py --calibrate-pep <modem> "
-                     "[target_dbfs] [payload] [timeout]")
+            sys.exit(f"usage: sweep_runner.py {sys.argv[1]} <modem> [target_dbfs]"
+                     + ("" if stressed else " [payload] [timeout]"))
         modem = sys.argv[2]
         resolve_adapter(modem)      # fail fast with the known-modem list on a typo
         target = float(sys.argv[3]) if len(sys.argv) > 3 else -1.0
+        between_cell_cleanup()
+        if stressed:
+            # a bigger payload so the rate controller climbs to the top mode on the clean
+            # cell, and a generous per-cell timeout for the slow fading cell
+            return calibrate_pep(modem, target, payload=8192, timeout=200,
+                                 conditions=STRESS_LADDER)
         payload = int(sys.argv[4]) if len(sys.argv) > 4 else 1500
         timeout = int(sys.argv[5]) if len(sys.argv) > 5 else 70
-        between_cell_cleanup()
         return calibrate_pep(modem, target, payload, timeout)
     modem, spec, out = sys.argv[1], sys.argv[2], sys.argv[3]
     tag = sys.argv[4] if len(sys.argv) > 4 else "sw"
     resolve_adapter(modem)          # fail fast with the known-modem list on a typo
+    if ("TXGAIN" not in os.environ and os.environ.get("EQUAL_GAIN", "0").strip() != "1"
+            and not os.path.exists(os.path.join(BENCH_ROOT, "results", f"{modem}_txgain.txt"))):
+        print(f"WARNING: no results/{modem}_txgain.txt -- running uncalibrated at TXGAIN=1.0; "
+              f"run `sweep_runner.py --calibrate-pep {modem}` for a fair cross-modem comparison",
+              flush=True)
     cells = json.load(open(spec))
     # Column order is owned by results_schema (the versioned corpus contract, B4) so a
     # rename can't silently desync the writer from downstream readers.

@@ -40,6 +40,29 @@ off the `robust_peak`, which excludes the loopback cold-start transient -- setti
 gain off the raw peak would key it to that glitch and under-drive the modem by several
 dB.
 
+## Scope: which modes it measures
+
+The default clean run only exercises the modes the rate controller reaches on a clean
+channel -- the connect/handshake mode plus the fastest data mode it climbs to during the
+transfer. It does **not** drive the modem down its whole mode ladder, so a slower, more
+robust mode the modem only uses under noise or fading is never transmitted; if that mode
+has a *higher* peak it is not captured, and the modem could exceed the target PEP when it
+drops to it. If a modem scales every waveform to a common peak -- as HF modems targeting
+the PEP limit usually do -- one clean run is representative and this does not matter;
+otherwise it can.
+
+To key the gain to the peak across the modem's whole mode set, use the stressed variant:
+
+    python3 sweep_runner.py --calibrate-pep-stressed <modem> [target_dbfs]
+
+It runs the modem over a ladder of conditions -- clean (high modes), AWGN (middle modes),
+and poor fading (low / robust modes) -- and takes the **maximum** robust peak across all
+of them. It uses a larger payload (8192 B) so the rate controller has time to climb to the
+top mode on the clean cell, plus a generous per-cell timeout for the slow fading cell; the
+transfer need not complete, only transmit through the modes. It is several times slower
+than the clean run, so it is the once-per-build thorough calibration while plain
+`--calibrate-pep` is the quick check.
+
 ## Notes
 
 - Re-run after any change that moves a modem's TX peak (a mode or geometry change, a

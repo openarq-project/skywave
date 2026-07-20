@@ -43,8 +43,10 @@ def harness_python(script):
 # registered WITHOUT editing this file — see load_adapters() (drop an adapters.json beside
 # the repository root, or point $BENCH_ADAPTERS at one). Collecting adapters is a project goal.
 BUILTIN_ADAPTERS = {
-    "loopback": {"script": "example_loopback_adapter.py", "kill_pad": 30, "extra_env": {}},
-    "mercury":  {"script": "mercury_adapter.py", "kill_pad": 80, "extra_env": {}},
+    "loopback":  {"script": "example_loopback_adapter.py", "kill_pad": 30, "extra_env": {}},
+    "mercury":   {"script": "mercury_adapter.py",   "kill_pad": 80, "extra_env": {}},
+    "armstrong": {"script": "armstrong_adapter.py", "kill_pad": 90, "extra_env": {}},
+    "ardop":     {"script": "ardop_adapter.py",     "kill_pad": 90, "extra_env": {}},
 }
 
 

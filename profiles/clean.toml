@@ -1,0 +1,5 @@
+# clean — baseline channel: no noise, no fade. (channel_profile schema, A3.)
+[meta]
+name = "clean"
+description = "Clean channel — no noise, no fade. The bit-exact AWGN-off baseline."
+seed = 1234

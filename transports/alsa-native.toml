@@ -1,0 +1,10 @@
+# alsa-native — the real-hardware-faithful default: four snd-aloop cards. This is what a
+# provisioned bench box runs. Listed explicitly so the default topology is nameable/
+# shareable; leaving SIM_TRANSPORT_PROFILE unset gives the identical behaviour.
+[meta]
+name = "alsa-native"
+description = "Native 4-card snd-aloop transport (bench-box default, real-hardware-faithful)."
+
+[transport]
+kind = "alsa"
+clock = "real_time"

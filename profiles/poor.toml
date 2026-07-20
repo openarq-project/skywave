@@ -1,0 +1,20 @@
+# poor — CCIR 520-2 "Poor" HF channel. (channel_profile schema, A3.)
+[meta]
+name = "poor"
+description = "CCIR 520-2 Poor: 2 ms / 1.0 Hz Watterson fade at a moderate SNR."
+seed = 1234
+
+[fade]
+preset = "poor"          # watterson.PRESETS: 2.0 ms / 1.0 Hz
+
+[noise]
+sigma = 4000             # per-sample int16 noise std
+
+[rx]
+rig_bpf = "data"
+pad_db = -12
+
+[link]
+delay_ms = 3
+tr_key_ms = 15
+tr_unkey_ms = 25

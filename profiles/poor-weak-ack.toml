@@ -1,0 +1,16 @@
+# poor-weak-ack — asymmetric ARQ stress cell: a decent forward path but a much weaker
+# reverse (ACK) path. The classic retransmit-storm scenario a SYMMETRIC channel cannot
+# produce. Uses the [reverse] asymmetry hook (channel_profile schema, A3).
+[meta]
+name = "poor-weak-ack"
+description = "Poor fade; forward path clean-ish, reverse/ACK path buried — ARQ asymmetry stress."
+seed = 1234
+
+[fade]
+preset = "poor"
+
+[noise]
+sigma = 1500             # forward (A->B) noise floor — data gets through
+
+[reverse]
+sigma = 9000             # reverse (B->A / ACK path) buried — stresses ACK survival

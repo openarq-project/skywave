@@ -1,0 +1,15 @@
+# sock-virt_time — fastest and deterministic: unix sockets with the block-lockstep
+# virtual-time clock. The sim is the clock master; neither station computes ahead of the
+# other and there is no real-time pacing, so a run goes as fast as the slower station
+# computes and the result is reproducible. Requires sock-capable stations (a modem's
+# `--audio sock` backend). max_virtual_s bounds the run in virtual-clock seconds (a TO=900 cell
+# -> 900 here); 0 = unbounded (the driver's wall-clock timeout is the hang backstop).
+[meta]
+name = "sock-virt_time"
+description = "Unix-socket transport, block-lockstep virtual-time clock; fastest and deterministic."
+
+[transport]
+kind = "sock"
+clock = "virt_time"
+accept_s = 30
+max_virtual_s = 0

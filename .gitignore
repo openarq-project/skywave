@@ -1,0 +1,10 @@
+__pycache__/
+*.pyc
+.pytest_cache/
+# run artifacts
+logs/
+results/
+*.csv
+*.log
+# extraction working doc (references the private source repo — not for publication)
+EXTRACTION-AUDIT.md

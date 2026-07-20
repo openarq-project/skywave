@@ -1,0 +1,14 @@
+# sock-real_time — the PORTABLE, aloop-free transport: framed unix sockets, real-time
+# pacing. Byte-identical channel to the ALSA path with NO snd-aloop rig, so the harness
+# comes up on a plain host (CI, a laptop, another modem project). Pair it with a
+# sock-capable station (a modem's `--audio sock` backend) or the in-process reference adapter for
+# a fully device-free run.
+[meta]
+name = "sock-real_time"
+description = "Portable unix-socket transport, real-time clock; runs with no ALSA aloop rig."
+
+[transport]
+kind = "sock"
+clock = "real_time"
+accept_s = 30
+sock_buf = 65536

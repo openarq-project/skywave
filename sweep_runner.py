@@ -14,7 +14,11 @@ and fade realizations). An optional per-modem level calibration
 gain-scaled nominal.
 
 Usage: sweep_runner.py <modem> <cells.json> <out.csv> [tag]
-  modem: a key in the adapter registry — the built-ins (loopback, mercury) plus anything
+       sweep_runner.py --calibrate-pep <modem> [target_dbfs] [payload] [timeout]
+         (measure the modem's clean TX peak and write results/<modem>_txgain.txt so it
+          is driven at equal PEP across modems; see docs/EQUAL-PEP.md)
+  modem: a key in the adapter registry — the built-ins (loopback, mercury, armstrong,
+  ardop) plus anything
   in <BENCH_ROOT>/adapters.json or the file named by $BENCH_ADAPTERS. A new project
   registers its modem there instead of editing this file (see MODEM-ADAPTER-CONTRACT.md).
   An unknown modem prints the list. BENCH_ROOT overrides the repository root (default:
@@ -140,6 +144,54 @@ def modem_txgain(modem):
     return open(path).read().strip()
 
 
+def calibrate_pep(modem, target_dbfs=-1.0, payload=1500, timeout=70):
+    """Equal-PEP calibration: measure a modem's clean TX peak and write
+    results/<modem>_txgain.txt so it is driven at the target peak envelope power.
+
+    Runs the modem once on a clean channel (SIGMA=0) at TXGAIN=1.0 with signal stats
+    on, reads the ROBUST peak -- which excludes the ALSA-loopback cold-start transient;
+    normalizing off the raw peak sets the gain off that glitch and under-drives the
+    modem -- and computes TXGAIN = 10^(target_dbfs/20) * 32767 / robust_peak. Every
+    subsequent campaign run picks the file up automatically via modem_txgain().
+    """
+    cfg = resolve_adapter(modem)
+    stats = os.path.join(LOGDIR, f"calib_{modem}")
+    env = dict(os.environ, SIGMA="0", TXGAIN="1.0", NP_STATS=stats)
+    env.setdefault("SIM_HALF_DUPLEX", "1")
+    env.setdefault("SIM_PTT", "1")
+    env.update(cfg["extra_env"])
+    print(f"measuring {modem} TX peak (clean run, payload={payload} B) ...", flush=True)
+    kill = int(timeout) + cfg["kill_pad"]
+    sp.run(["timeout", str(kill), harness_python(cfg["script"]), "-u",
+            cfg["script"], str(payload), str(timeout)], cwd=BENCH_ROOT, env=env)
+    peak = 0.0
+    papr = 0.0
+    for sfx in (".11", ".22"):                     # both directions; take the higher peak
+        try:
+            d = json.load(open(stats + sfx))
+        except (OSError, ValueError):
+            continue
+        rp = float(d.get("robust_peak", d.get("peak", 0)) or 0)
+        print(f"  {sfx}: robust_peak={rp:.0f} ({20 * math.log10(max(rp, 1) / 32767):+.1f} dBFS)"
+              f"  rms={d.get('rms', 0):.0f}  papr={d.get('papr_robust_db', 0):.1f} dB", flush=True)
+        if rp > peak:
+            peak, papr = rp, float(d.get("papr_robust_db", 0.0))
+    if peak <= 0:
+        print(f"FAIL: no TX peak measured for {modem} -- did it connect and transmit? "
+              f"(check {LOGDIR})", flush=True)
+        return 1
+    gain = (10.0 ** (target_dbfs / 20.0)) * 32767.0 / peak
+    outdir = os.path.join(BENCH_ROOT, "results")
+    os.makedirs(outdir, exist_ok=True)
+    out = os.path.join(outdir, f"{modem}_txgain.txt")
+    with open(out, "w") as f:
+        f.write(f"{gain:.4f}\n")
+    print(f"\n{modem}: robust_peak={peak:.0f} ({20 * math.log10(max(peak, 1) / 32767):+.1f} dBFS), "
+          f"PAPR={papr:.1f} dB  ->  TXGAIN={gain:.4f}  (target {target_dbfs:+.0f} dBFS)", flush=True)
+    print(f"wrote {out}", flush=True)
+    return 0
+
+
 def read_np_stats(prefix):
     """Signal stats from the data-heavy direction (larger active-sample count)."""
     best = {}
@@ -251,6 +303,18 @@ def run_cell(modem, cell, rep, writer, fcsv, tag):
 
 
 def main():
+    if len(sys.argv) > 1 and sys.argv[1] == "--calibrate-pep":
+        # sweep_runner.py --calibrate-pep <modem> [target_dbfs=-1] [payload=1500] [timeout=70]
+        if len(sys.argv) < 3:
+            sys.exit("usage: sweep_runner.py --calibrate-pep <modem> "
+                     "[target_dbfs] [payload] [timeout]")
+        modem = sys.argv[2]
+        resolve_adapter(modem)      # fail fast with the known-modem list on a typo
+        target = float(sys.argv[3]) if len(sys.argv) > 3 else -1.0
+        payload = int(sys.argv[4]) if len(sys.argv) > 4 else 1500
+        timeout = int(sys.argv[5]) if len(sys.argv) > 5 else 70
+        between_cell_cleanup()
+        return calibrate_pep(modem, target, payload, timeout)
     modem, spec, out = sys.argv[1], sys.argv[2], sys.argv[3]
     tag = sys.argv[4] if len(sys.argv) > 4 else "sw"
     resolve_adapter(modem)          # fail fast with the known-modem list on a typo

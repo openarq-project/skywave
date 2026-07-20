@@ -102,6 +102,8 @@ Harness and transports:
 - [docs/TRANSPORT.md](docs/TRANSPORT.md): running with or without an ALSA loopback rig.
 - [docs/TRANSPORT-DESIGN.md](docs/TRANSPORT-DESIGN.md): the socket and virtual-clock
   transport design.
+- [docs/EQUAL-PEP.md](docs/EQUAL-PEP.md): equalizing transmit drive (PEP) across modems
+  for a fair comparison, and the `--calibrate-pep` command.
 
 ## License
 

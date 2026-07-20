@@ -98,8 +98,9 @@ should prefer this; the RESULT line stays for the current parser.
    relative `script` resolves against the registry file's own directory, so you ship the
    adapter alongside its registry. Then `sweep_runner mymodem <spec.json> <out.csv>`
    drives it; an unknown name prints the known list. `BENCH_ROOT` relocates the repository root.
-4. Optionally calibrate its drive → `results/<mymodem>_txgain.txt`, so it is compared at a
-   matched level in cross-modem campaigns (see `modem_txgain` in `sweep_runner.py`).
+4. Optionally calibrate its drive to equal PEP: `sweep_runner.py --calibrate-pep <mymodem>`
+   writes `results/<mymodem>_txgain.txt`, applied automatically in every cross-modem
+   campaign so all modems transmit at a matched peak power. See docs/EQUAL-PEP.md.
 
 Nothing else changes: the channel, transports, A/B drivers, and scoring are all reused.
 

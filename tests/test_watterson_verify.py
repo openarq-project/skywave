@@ -17,7 +17,7 @@ These are seeded and deterministic.
 """
 import numpy as np
 
-import watterson
+from skywave import watterson
 
 
 def _tap_process(doppler_hz, fs_low, n):

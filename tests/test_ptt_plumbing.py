@@ -3,7 +3,7 @@ import io
 import types
 
 from conftest import load_sim
-import bench_pipes
+from skywave import bench_pipes
 
 
 def fake_sim():

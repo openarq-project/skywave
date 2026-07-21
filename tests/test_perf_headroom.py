@@ -13,8 +13,8 @@ from conftest import load_sim, make_link, feed, interleave
 
 
 def test_worst_config_p99_headroom():
-    import watterson
-    import rig_effects as fxm
+    from skywave import watterson
+    from skywave import rig_effects as fxm
     from conftest import make_fx
     cs = load_sim(SIGMA=2000, SIM_HALF_DUPLEX=1, SIM_PA_P=2,
                   SIM_WATTERSON="poor", SIM_RIG_BPF="default",

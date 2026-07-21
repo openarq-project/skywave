@@ -48,8 +48,8 @@ import sys
 
 import numpy as np
 
-import watterson
-from rig_effects import ImpulsiveNoise, QrmGenerator, RxAgc, _hilbert_fir
+from skywave import watterson
+from skywave.rig_effects import ImpulsiveNoise, QrmGenerator, RxAgc, _hilbert_fir
 
 try:
     from scipy.signal import butter, sosfilt
@@ -231,7 +231,7 @@ def main(argv=None):
     # (link/tr/alc/reverse) have no hfchan knob and are ignored.
     prelim, _ = p.parse_known_args(argv)
     if prelim.profile:
-        import channel_profile
+        from skywave import channel_profile
         p.set_defaults(**channel_profile.to_hfchan_defaults(
             channel_profile.load_profile(prelim.profile)))
     a = p.parse_args(argv)

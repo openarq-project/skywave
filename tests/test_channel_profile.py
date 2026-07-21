@@ -12,7 +12,7 @@ import os
 import numpy as np
 import pytest
 
-import channel_profile as cp
+from skywave import channel_profile as cp
 
 HERE = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 PROFILES = os.path.join(HERE, "profiles")
@@ -115,7 +115,7 @@ def test_shipped_profiles_load_and_validate():
 
 def test_hfchan_profile_applies_noise_and_fade(tmp_path):
     """hfchan --profile loads the channel; the profile's sigma sets the added-noise std."""
-    import hfchan
+    from skywave import hfchan
     inp, outp = tmp_path / "in.raw", tmp_path / "out.raw"
     n = 8000 * 3
     (5000.0 * np.sin(2 * np.pi * 1000 * np.arange(n) / 8000)).astype("<i2").tofile(inp)
@@ -129,7 +129,7 @@ def test_hfchan_profile_applies_noise_and_fade(tmp_path):
 
 def test_hfchan_cli_flag_overrides_profile(tmp_path):
     """An explicit flag beats the profile default (precedence)."""
-    import hfchan
+    from skywave import hfchan
     inp, outp = tmp_path / "in.raw", tmp_path / "out.raw"
     (5000.0 * np.sin(2 * np.pi * 1000 * np.arange(8000 * 3) / 8000)).astype("<i2").tofile(inp)
     prof = _write(tmp_path, "[noise]\nsigma = 800\n")

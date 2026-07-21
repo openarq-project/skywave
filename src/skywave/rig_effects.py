@@ -15,7 +15,7 @@ import math
 
 import numpy as np
 
-from watterson import _hilbert_fir
+from skywave.watterson import _hilbert_fir
 
 
 class FreqShift:

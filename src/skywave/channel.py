@@ -5,8 +5,8 @@ The in-process library API: run audio through the HF/VHF channel simulator IN-PR
 typed ChannelConfig, instead of spawning channel_sim as a subprocess and piping over
 ALSA/sockets.
 
-    from channel_config import ChannelConfig
-    from channel import Channel
+    from skywave.channel_config import ChannelConfig
+    from skywave.channel import Channel
     ch = Channel(ChannelConfig(sigma=200, watterson="poor"))
     rx_block = ch.process(tx_block)          # one block, NSAMP int16 in -> NSAMP int16 out
 
@@ -33,7 +33,7 @@ import importlib
 import os
 import threading
 
-import channel_sim as _cs
+from skywave import channel_sim as _cs
 
 # env keys channel_sim reads that are NOT SIM_*-prefixed (cleared on (re)configure so a
 # stale value can't leak into the reloaded module) -- mirrors the harness reload contract.

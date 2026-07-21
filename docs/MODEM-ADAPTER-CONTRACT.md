@@ -1,7 +1,7 @@
 # Modem-adapter contract for the skywave harness
 
-*Reference implementation: `modem_adapter.py` (base class),
-`example_loopback_adapter.py` (runnable template), `tests/test_modem_adapter.py`
+*Reference implementation: `skywave/modem_adapter.py` (base class),
+`skywave/adapters/example.py` (runnable template), `tests/test_modem_adapter.py`
 (contract tests).*
 
 This is the Device-Under-Test contract: what a modem adapter receives from the harness,
@@ -88,17 +88,17 @@ should prefer this; the RESULT line stays for the current parser.
 ## 5. Adding your modem
 
 1. `class MyAdapter(ModemAdapter):` with `name` and the four required hooks. Copy
-   `example_loopback_adapter.py` and replace each fake hook with the real thing
+   `skywave/adapters/example.py` and replace each fake hook with the real thing
    (subprocess launch, control-protocol connect, native handshake, data transfer). See
-   `mercury_adapter.py` for a concrete external-modem shape (a TCP TNC protocol).
+   `skywave/adapters/mercury.py` for a concrete external-modem shape (a TCP TNC protocol).
 2. `if __name__ == "__main__": sys.exit(run_adapter(MyAdapter))`.
 3. Register it **without editing the framework**: drop an `adapters.json` in the
    repository root (or point `$BENCH_ADAPTERS` at one) with
    `{"mymodem": {"script": "my_arq_pipe.py", "kill_pad": N, "extra_env": {...}}}`. A
    relative `script` resolves against the registry file's own directory, so you ship the
-   adapter alongside its registry. Then `sweep_runner mymodem <spec.json> <out.csv>`
-   drives it; an unknown name prints the known list. `BENCH_ROOT` relocates the repository root.
-4. Optionally calibrate its drive to equal PEP: `sweep_runner.py --calibrate-pep <mymodem>`
+   adapter alongside its registry. Then `skywave-sweep mymodem <spec.json> <out.csv>`
+   drives it; an unknown name prints the known list. `BENCH_ROOT` sets the artifact/cwd root.
+4. Optionally calibrate its drive to equal PEP: `skywave-sweep --calibrate-pep <mymodem>`
    writes `results/<mymodem>_txgain.txt`, applied automatically in every cross-modem
    campaign so all modems transmit at a matched peak power. See docs/EQUAL-PEP.md.
 
@@ -106,8 +106,8 @@ Nothing else changes: the channel, transports, A/B drivers, and scoring are all 
 
 ## 6. References
 
-- `modem_adapter.py` — base class + `AdapterConfig`/`AdapterResult`.
-- `example_loopback_adapter.py` — runnable, hardware-free reference/template.
-- `sweep_runner.py` — the campaign loop (input env, `RES_*` parsers, classification).
-- `bench_pipes.py` — `launch_channel_sim()` + `fwd_ptt()` (the channel/PTT seam).
-- `mercury_adapter.py` — a real external-modem adapter (Mercury over a TCP TNC).
+- `skywave/modem_adapter.py` — base class + `AdapterConfig`/`AdapterResult`.
+- `skywave/adapters/example.py` — runnable, hardware-free reference/template.
+- `skywave/sweep_runner.py` — the campaign loop (input env, `RES_*` parsers, classification).
+- `skywave/bench_pipes.py` — `launch_channel_sim()` + `fwd_ptt()` (the channel/PTT seam).
+- `skywave/adapters/mercury.py` — a real external-modem adapter (Mercury over a TCP TNC).

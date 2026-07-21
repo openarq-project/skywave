@@ -41,19 +41,33 @@ One goal of skywave is a growing collection of adapters covering the modems peop
 run. It ships with an in-process reference adapter and a Mercury adapter. More are welcome;
 the ModemAdapter contract is documented in docs/MODEM-ADAPTER-CONTRACT.md.
 
+## Install
+
+skywave is a `src/`-layout Python package (`skywave`), needs Python 3.11+, and
+depends on numpy and scipy. From a checkout:
+
+```
+pip install -e .          # editable; add [test] for pytest: pip install -e ".[test]"
+```
+
+This puts the `skywave` package on the path and installs three console scripts:
+`hfchan`, `skywave-sweep`, and `skywave-channel`. You can also run any entry
+point without installing, straight from `src/`, with
+`PYTHONPATH=src python3 -m skywave.<module>`.
+
 ## Quick start
 
 A one-way channel filter, compatible with the codec2 `ch` tool:
 
 ```
-python3 hfchan.py --No -20 --fade poor < tx.s16 > rx.s16
+hfchan --No -20 --fade poor < tx.s16 > rx.s16
 ```
 
 In-process, from a typed config:
 
 ```python
-from channel_config import ChannelConfig
-from channel import Channel
+from skywave.channel_config import ChannelConfig
+from skywave.channel import Channel
 
 ch = Channel(ChannelConfig(sigma=200, watterson="poor"))
 rx_block = ch.process(tx_block)
@@ -62,7 +76,7 @@ rx_block = ch.process(tx_block)
 Compare a modem across a set of cells:
 
 ```
-python3 sweep_runner.py mymodem cells.json out.csv
+skywave-sweep mymodem cells.json out.csv
 ```
 
 ## Documentation

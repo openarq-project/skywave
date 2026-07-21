@@ -15,7 +15,7 @@ def test_fm_fade_off_by_default():
 def test_ionos_fade_traces_envelope_through_link():
     cs = load_sim(SIM_FM_PORT="data9600",
                   SIM_FM_FADE="ionos:20:3")
-    import fm_channel
+    from skywave import fm_channel
     fade = fm_channel.FmFade(cs.FS, "ionos", 60.0, 1,
                              ionos_depth_db=20.0, ionos_rate_hz=3.0)
     link = make_link(cs, fade=fade)
@@ -31,7 +31,7 @@ def test_ionos_fade_traces_envelope_through_link():
 def test_rayleigh_fade_preserves_mean_power_through_link():
     cs = load_sim(SIM_FM_PORT="data9600", SIM_FM_FADE="mobile-urban",
                   SIM_FM_BAND="2m")
-    import fm_channel
+    from skywave import fm_channel
     spec = fm_channel.resolve_fade_spec("mobile-urban", "2m")
     fade = fm_channel.FmFade(cs.FS, spec[0], 120.0, cs.FADE_SEED + 11,
                              fd_hz=spec[1])
@@ -50,7 +50,7 @@ def test_seeded_fade_determinism_through_link():
     outs = []
     for _ in range(2):
         cs = load_sim(SIM_FM_PORT="data9600", SIM_FM_FADE="rayleigh:20")
-        import fm_channel
+        from skywave import fm_channel
         fade = fm_channel.FmFade(cs.FS, "rayleigh", 30.0, cs.FADE_SEED + 11,
                                  fd_hz=20.0)
         link = make_link(cs, fade=fade)
@@ -63,7 +63,7 @@ def test_noise_shaper_bandlimits_link_noise_floor():
     # undelivered path (no TX signal): receiver hears the shaped noise floor
     cs = load_sim(SIM_FM_PORT="data9600", SIM_FM_NOISE_BW="6000",
                   SIGMA="1000")
-    import fm_channel
+    from skywave import fm_channel
     link = make_link(cs)
     link.noise_lpf = fm_channel.NoiseShaper(cs.FS, 6000.0, cs.NCH)
     zero = interleave(cs, np.zeros(cs.BLOCK))
@@ -82,13 +82,14 @@ def _main_rc(**env):
     import os
     import subprocess as sp
     import sys as _sys
+    import skywave
     e = {k: v for k, v in os.environ.items()
          if not (k.startswith("SIM_") or k in ("SIGMA", "TXGAIN", "SEED"))}
     e.update({"SIGMA": "0", "TXGAIN": "1.0", "SEED": "1"})
     e.update({k: str(v) for k, v in env.items()})
     repo_root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-    r = sp.run([_sys.executable, "channel_sim.py"], env=e, cwd=repo_root,
-               capture_output=True, text=True, timeout=30)
+    r = sp.run([_sys.executable, "-m", "skywave.channel_sim"], env=skywave.child_env(e),
+               cwd=repo_root, capture_output=True, text=True, timeout=30)
     return r.returncode, r.stderr
 
 

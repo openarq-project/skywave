@@ -16,7 +16,7 @@ A **transport profile** names a transport once, in one shareable TOML/JSON file,
 of a scatter of `SIM_*` env vars:
 
 ```console
-$ SIM_TRANSPORT_PROFILE=transports/sock-real_time.toml python3 channel_sim.py
+$ SIM_TRANSPORT_PROFILE=transports/sock-real_time.toml skywave-channel
 ```
 
 Three are shipped in `transports/`:
@@ -36,7 +36,7 @@ physics runs over any transport:
 ```console
 $ SIM_PROFILE=profiles/poor.toml \
   SIM_TRANSPORT_PROFILE=transports/sock-virt_time.toml \
-  python3 channel_sim.py
+  skywave-channel
 ```
 
 **Precedence:** the profile is the baseline; an explicit `SIM_TRANSPORT` / `SIM_SOCK_*` /
@@ -49,7 +49,7 @@ also needs a station that speaks sockets:
 
 - **A sock-capable station** — e.g. a modem's `--audio sock` backend — talks to the sim directly
   over the sockets. Fully aloop-free.
-- **The in-process reference adapter** (`example_loopback_adapter.py`) — no subprocess,
+- **The in-process reference adapter** (`skywave/adapters/example.py`) — no subprocess,
   no ALSA at all; the portable starting point for a new modem's `ModemAdapter`.
 - **`SIM_SOCK_SHIM=1`** bridges sockets ↔ ALSA so a modem that *only* speaks ALSA can run
   on the sock sim — but that bridge still needs an aloop rig, so it is **not** the

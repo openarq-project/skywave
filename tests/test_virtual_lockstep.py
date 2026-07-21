@@ -15,9 +15,10 @@ import time
 
 import numpy as np
 
+import skywave
 from conftest import REPO_ROOT, load_sim, make_link, feed, tone_block
 
-import sock_frames
+from skywave import sock_frames
 
 
 def start_sim(tmp_path, **env_over):
@@ -29,9 +30,8 @@ def start_sim(tmp_path, **env_over):
     env.update({k: str(v) for k, v in env_over.items()})
     for k in ("NP_STATS", "SIM_TXDUMP", "SIM_KEYLOG", "SIM_SOCK_SHIM"):
         env.pop(k, None)
-    return sp.Popen([sys.executable, "-u",
-                     os.path.join(REPO_ROOT, "channel_sim.py")],
-                    env=env, cwd=REPO_ROOT, stderr=sp.PIPE)
+    return sp.Popen([sys.executable, "-u", "-m", "skywave.channel_sim"],
+                    env=skywave.child_env(env), cwd=REPO_ROOT, stderr=sp.PIPE)
 
 
 def connect(tmp_path, name):
@@ -166,7 +166,7 @@ def test_clock_virtual_requires_sock_transport(tmp_path):
     env.update({"SIM_TRANSPORT": "alsa", "SIM_CLOCK": "virt_time",
                 "SIGMA": "0", "TXGAIN": "1.0", "SIM_NCH": "2",
                 "SIM_BLOCK": "1024", "SEED": "1"})
-    r = sp.run([sys.executable, os.path.join(REPO_ROOT, "channel_sim.py")],
-               env=env, cwd=REPO_ROOT, capture_output=True, timeout=15)
+    r = sp.run([sys.executable, "-m", "skywave.channel_sim"],
+               env=skywave.child_env(env), cwd=REPO_ROOT, capture_output=True, timeout=15)
     assert r.returncode == 2
     assert b"SIM_CLOCK=virt_time requires" in r.stderr

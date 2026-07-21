@@ -10,9 +10,9 @@ Run:  cd skywave && python3 -m pytest tests/test_results_schema.py -q
 import csv
 import json
 
-import sweep_runner                       # the writer side
-import results_schema
-from results_schema import (
+from skywave import sweep_runner                       # the writer side
+from skywave import results_schema
+from skywave.results_schema import (
     COLUMNS, COLUMN_TYPES, RESULTS_SCHEMA,
     manifest, write_manifest, read_manifest, read_corpus, cast_row, manifest_path,
 )

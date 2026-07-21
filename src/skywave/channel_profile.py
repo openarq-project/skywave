@@ -5,8 +5,8 @@ A profile is a small TOML (or JSON) file that names a channel once — fade, noi
 chain, QRM, link timing, and optional per-direction asymmetry — instead of a sprawl of
 `SIM_*` env vars (channel_sim) or `hfchan` flags (filter). One shareable file, two consumers:
 
-  channel_sim.py : `SIM_PROFILE=poor.toml python3 channel_sim.py ...`
-  hfchan.py      : `hfchan --profile poor.toml < tx.s16 > rx.s16`
+  channel_sim : `SIM_PROFILE=poor.toml skywave-channel ...`
+  hfchan      : `hfchan --profile poor.toml < tx.s16 > rx.s16`
 
 PRECEDENCE — the profile is the BASELINE; explicit env/CLI OVERRIDES it (the caller/operator
 wins, per the standing directive). `channel_sim` loads the profile then leaves any env

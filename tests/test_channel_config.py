@@ -14,7 +14,7 @@ import os
 import pytest
 
 from conftest import load_sim, _BASE
-from channel_config import ChannelConfig
+from skywave.channel_config import ChannelConfig
 
 # ChannelConfig field -> the channel_sim module global it must equal.
 FIELD_TO_GLOBAL = {

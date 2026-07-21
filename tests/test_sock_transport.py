@@ -18,7 +18,8 @@ import numpy as np
 
 from conftest import REPO_ROOT, load_sim, make_link, feed, tone_block
 
-import sock_frames
+import skywave
+from skywave import sock_frames
 
 PAYLOAD12 = bytes(range(12))   # 3 frames x NCH=2 x i16 = 12 sample bytes
 
@@ -171,8 +172,8 @@ def test_channel_sim_end_to_end_over_sockets(tmp_path):
     for k in ("NP_STATS", "SIM_TXDUMP", "SIM_KEYLOG", "SIM_HALF_DUPLEX",
               "SIM_PTT", "SIM_SOCK_SHIM"):
         env.pop(k, None)
-    sim = sp.Popen([sys.executable, "-u", os.path.join(REPO_ROOT, "channel_sim.py")],
-                   env=env, cwd=REPO_ROOT, stderr=sp.PIPE)
+    sim = sp.Popen([sys.executable, "-u", "-m", "skywave.channel_sim"],
+                   env=skywave.child_env(env), cwd=REPO_ROOT, stderr=sp.PIPE)
     try:
         def connect(name):
             path = os.path.join(str(tmp_path), name)
@@ -218,7 +219,7 @@ def test_channel_sim_sock_accept_timeout_exits_2(tmp_path):
                 "SIM_NCH": "2", "SIM_BLOCK": "1024", "SEED": "1"})
     for k in ("NP_STATS", "SIM_SOCK_SHIM"):
         env.pop(k, None)
-    r = sp.run([sys.executable, os.path.join(REPO_ROOT, "channel_sim.py")],
-               env=env, cwd=REPO_ROOT, capture_output=True, timeout=15)
+    r = sp.run([sys.executable, "-m", "skywave.channel_sim"],
+               env=skywave.child_env(env), cwd=REPO_ROOT, capture_output=True, timeout=15)
     assert r.returncode == 2
     assert b"did not connect" in r.stderr

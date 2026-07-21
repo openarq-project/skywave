@@ -16,7 +16,7 @@ but **not** a fair cross-modem comparison.
 
 ## Measuring it: `--calibrate-pep`
 
-    python3 sweep_runner.py --calibrate-pep <modem> [target_dbfs] [payload] [timeout]
+    skywave-sweep --calibrate-pep <modem> [target_dbfs] [payload] [timeout]
 
 This runs the modem once on a clean channel (`SIGMA=0`) at `TXGAIN=1.0` with signal
 stats on, reads its robust TX peak, and writes the `TXGAIN` that puts that peak at
@@ -27,7 +27,7 @@ the target:
 Defaults: `target_dbfs=-1` (1 dB below the int16 full-scale rail, leaving headroom
 for the constructive fade-up and noise before the rail), `payload=1500`, `timeout=70`.
 
-    $ python3 sweep_runner.py --calibrate-pep armstrong
+    $ skywave-sweep --calibrate-pep armstrong
     measuring armstrong TX peak (clean run, payload=1500 B) ...
       .11: robust_peak=17232 (-5.6 dBFS)  rms=4600  papr=11.4 dB
       .22: robust_peak=17232 (-5.6 dBFS)  rms=4600  papr=11.4 dB
@@ -53,7 +53,7 @@ otherwise it can.
 
 To key the gain to the peak across the modem's whole mode set, use the stressed variant:
 
-    python3 sweep_runner.py --calibrate-pep-stressed <modem> [target_dbfs]
+    skywave-sweep --calibrate-pep-stressed <modem> [target_dbfs]
 
 It runs the modem over a ladder of conditions -- clean (high modes), AWGN (middle modes),
 and poor fading (low / robust modes) -- and takes the **maximum** robust peak across all

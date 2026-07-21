@@ -19,9 +19,9 @@ import numpy as np
 import pytest
 
 from conftest import make_link, feed, tone_block
-import channel_sim
-from channel import Channel, ChannelConfigError
-from channel_config import ChannelConfig
+from skywave import channel_sim
+from skywave.channel import Channel, ChannelConfigError
+from skywave.channel_config import ChannelConfig
 
 
 @pytest.fixture(autouse=True)

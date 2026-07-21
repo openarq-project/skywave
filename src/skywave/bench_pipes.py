@@ -12,7 +12,10 @@ Teardown: os.killpg(os.getpgid(p.pid), 9) on the returned Popen kills the sim AN
 arecord/aplay children (they inherit the sim's process group).
 """
 import os
+import sys
 import subprocess as sp
+
+import skywave
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 SIM = os.path.join(HERE, "channel_sim.py")
@@ -25,7 +28,7 @@ def launch_channel_sim(extra_env=None):
 
     In SIM_PTT mode the sim's stdin is a pipe: the harness writes 'a 1'/'a 0'/'b 1'/'b 0'
     lines (relayed from each modem's host PTT ON/OFF) to gate the channel on real PTT."""
-    env = dict(os.environ)
+    env = skywave.child_env()               # src root on PYTHONPATH for a source checkout
     if extra_env:
         env.update({k: str(v) for k, v in extra_env.items()})
     stdin = sp.PIPE if env.get("SIM_PTT", "0").strip() == "1" else None
@@ -38,7 +41,7 @@ def launch_channel_sim(extra_env=None):
     # actually completed. A log file preserves SIM_KEYLOG/diagnostics while breaking the
     # inherited-pipe leak. Overridable via SIM_LOG.
     simlog = open(env.get("SIM_LOG", "/tmp/channel_sim.log"), "wb")
-    p = sp.Popen(["python3", "-u", SIM], env=env, stdin=stdin,
+    p = sp.Popen([sys.executable, "-u", SIM], env=env, stdin=stdin,
                  stdout=simlog, stderr=sp.STDOUT, preexec_fn=os.setsid)
     simlog.close()  # the child holds its own dup; the parent doesn't need it
     return p

@@ -9,7 +9,7 @@ import pytest
 from scipy.signal import hilbert
 
 from conftest import REPO_ROOT  # noqa: F401  (ensures sys.path)
-import watterson
+from skywave import watterson
 
 FS = 48000
 

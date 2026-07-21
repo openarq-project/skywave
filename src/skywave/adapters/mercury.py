@@ -8,7 +8,7 @@ modem on the ModemAdapter contract -- copy it as a starting point for another mo
 
 Set MERCURY_BIN to the Mercury binary, then run it via the harness as the `mercury` modem:
 
-  sweep_runner.py mercury spec.json out.csv
+  skywave-sweep mercury spec.json out.csv
 """
 import os
 import re
@@ -18,7 +18,7 @@ import socket
 import subprocess as sp
 import time
 
-from modem_adapter import ModemAdapter, run_adapter
+from skywave.modem_adapter import ModemAdapter, run_adapter
 
 
 class MercuryAdapter(ModemAdapter):

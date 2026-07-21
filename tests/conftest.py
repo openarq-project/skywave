@@ -15,8 +15,12 @@ import threading
 import numpy as np
 
 REPO_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-if REPO_ROOT not in sys.path:
-    sys.path.insert(0, REPO_ROOT)
+# Make the `skywave` package importable when running from a source checkout
+# without an editable install. `pyproject.toml` sets pytest's pythonpath too;
+# this insert is the belt-and-suspenders that also covers a bare `pytest`.
+SRC = os.path.join(REPO_ROOT, "src")
+if SRC not in sys.path:
+    sys.path.insert(0, SRC)
 
 # every env key channel_sim reads (keep in sync with its header block)
 _SIM_ENV = ("SIGMA", "TXGAIN", "SEED", "NP_STATS", "SIM_TXDUMP", "SIM_KEYLOG")
@@ -41,7 +45,7 @@ def load_sim(**env):
         if k.startswith("SIM_") or k in _SIM_ENV:
             del os.environ[k]
     os.environ.update(e)
-    import channel_sim
+    from skywave import channel_sim
     return importlib.reload(channel_sim)
 
 

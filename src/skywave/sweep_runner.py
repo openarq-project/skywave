@@ -28,32 +28,39 @@ Usage: sweep_runner.py <modem> <cells.json> <out.csv> [tag]
   this file's dir).
 """
 import os, sys, json, subprocess as sp, time, re, csv, math, signal
-from rig_version import RIG_GEN
-from results_schema import COLUMNS, RESULTS_SCHEMA, write_manifest
+import skywave
+from skywave.rig_version import RIG_GEN
+from skywave.results_schema import COLUMNS, RESULTS_SCHEMA, write_manifest
 
 SWEEPDIR = os.path.dirname(os.path.abspath(__file__))
-# Repository root: where per-run artifacts (logs, results, adapters.json) and the adapter
-# scripts live. Derived from this file by default (no hardcoded absolute path); a
-# relocated tree sets BENCH_ROOT. Previously this was a hardcoded absolute path.
-BENCH_ROOT = os.path.abspath(os.environ.get("BENCH_ROOT") or SWEEPDIR)
-LOGDIR  = os.path.join(SWEEPDIR, "logs")
+# Bench root: where per-run artifacts (logs, results) and an optional adapters.json live,
+# and the cwd the adapters run under. Defaults to the CURRENT DIRECTORY (the package now
+# lives under src/skywave, so the old "this file's dir" default would bury artifacts in the
+# install tree); set BENCH_ROOT to pin it elsewhere.
+BENCH_ROOT = os.path.abspath(os.environ.get("BENCH_ROOT") or os.getcwd())
+LOGDIR  = os.path.join(BENCH_ROOT, "logs")
 os.makedirs(LOGDIR, exist_ok=True)
 
 
-def harness_python(script):
-    """Interpreter to launch an adapter under. An adapter that needs its own interpreter
-    (a separate venv, say) sets $ADAPTER_PY; otherwise the plain python3."""
-    return os.environ.get("ADAPTER_PY") or "python3"
+def adapter_argv(cfg, *args):
+    """Launch argv for an adapter. A built-in carries a "module" and runs via
+    `python -m skywave.adapters.<name>`; an external adapter carries a "script" path and
+    runs directly. An adapter needing its own interpreter (a separate venv, say) sets
+    $ADAPTER_PY; otherwise this interpreter. Trailing args are appended as strings."""
+    interp = os.environ.get("ADAPTER_PY") or sys.executable
+    head = [interp, "-u", "-m", cfg["module"]] if cfg.get("module") else \
+           [interp, "-u", cfg["script"]]
+    return head + [str(a) for a in args]
 
-# script = adapter to invoke; kill_pad = seconds added to the cell's internal
-# timeout for the outer `timeout` process-kill; extra_env applied last. More modems are
-# registered WITHOUT editing this file — see load_adapters() (drop an adapters.json beside
-# the repository root, or point $BENCH_ADAPTERS at one). Collecting adapters is a project goal.
+# Built-ins run as package modules (module=...); an external project registers its own with
+# a "script" path via adapters.json instead of editing this file — see load_adapters().
+# kill_pad = seconds added to the cell's internal timeout for the outer `timeout`
+# process-kill; extra_env applied last. Collecting adapters is a project goal.
 BUILTIN_ADAPTERS = {
-    "loopback":  {"script": "example_loopback_adapter.py", "kill_pad": 30, "extra_env": {}},
-    "mercury":   {"script": "mercury_adapter.py",   "kill_pad": 80, "extra_env": {}},
-    "armstrong": {"script": "armstrong_adapter.py", "kill_pad": 90, "extra_env": {}},
-    "ardop":     {"script": "ardop_adapter.py",     "kill_pad": 90, "extra_env": {}},
+    "loopback":  {"module": "skywave.adapters.example",   "kill_pad": 30, "extra_env": {}},
+    "mercury":   {"module": "skywave.adapters.mercury",   "kill_pad": 80, "extra_env": {}},
+    "armstrong": {"module": "skywave.adapters.armstrong", "kill_pad": 90, "extra_env": {}},
+    "ardop":     {"module": "skywave.adapters.ardop",     "kill_pad": 90, "extra_env": {}},
 }
 
 
@@ -65,7 +72,7 @@ def load_adapters(root=None, extra_path=None, builtin=None):
     (or `extra_path`). Each external entry needs a "script"; "kill_pad" (90) and
     "extra_env" ({}) default. A relative "script" is resolved against the registry
     file's own directory (so a project ships its adapter alongside its registry),
-    while a bare built-in name stays relative to BENCH_ROOT at launch (cwd)."""
+    while the built-ins launch as package modules (adapter_argv, "module" key)."""
     root = root or BENCH_ROOT
     merged = {k: dict(v) for k, v in (builtin or BUILTIN_ADAPTERS).items()}
     for path in (os.path.join(root, "adapters.json"),
@@ -191,8 +198,8 @@ def calibrate_pep(modem, target_dbfs=-1.0, payload=1500, timeout=70, conditions=
         env.update(cfg["extra_env"])
         print(f"measuring {modem} TX peak ({label}, payload={payload} B) ...", flush=True)
         kill = int(timeout) + cfg["kill_pad"]
-        sp.run(["timeout", str(kill), harness_python(cfg["script"]), "-u",
-                cfg["script"], str(payload), str(timeout)], cwd=BENCH_ROOT, env=env)
+        sp.run(["timeout", str(kill), *adapter_argv(cfg, payload, timeout)],
+               cwd=BENCH_ROOT, env=skywave.child_env(env))
         for sfx in (".11", ".22"):                 # both directions
             try:
                 d = json.load(open(stats + sfx))
@@ -280,9 +287,9 @@ def run_cell(modem, cell, rep, writer, fcsv, tag):
     for att in range(attempts):
         t0 = time.time()
         with open(log, "wb") as lf:
-            p = sp.run(["timeout", str(kill), harness_python(cfg["script"]), "-u",
-                        cfg["script"], str(payload), str(tmo)],
-                       cwd=BENCH_ROOT, env=env, stdout=lf, stderr=sp.STDOUT)
+            p = sp.run(["timeout", str(kill), *adapter_argv(cfg, payload, tmo)],
+                       cwd=BENCH_ROOT, env=skywave.child_env(env),
+                       stdout=lf, stderr=sp.STDOUT)
         el = round(time.time() - t0, 1)
         txt = open(log, errors="replace").read()
         got = tot = 0; dt = el; intact = "false"; gp = 0.0; peak = 0; sn = -99.0

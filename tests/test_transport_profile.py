@@ -19,8 +19,8 @@ import numpy as np
 import pytest
 
 from conftest import REPO_ROOT, load_sim, make_link, feed, tone_block
-import sock_frames
-import transport_profile as tp
+from skywave import sock_frames
+from skywave import transport_profile as tp
 
 TRANSPORTS = os.path.join(REPO_ROOT, "transports")
 
@@ -122,8 +122,9 @@ def test_channel_sim_over_sockets_via_profile(tmp_path):
     for k in ("SIM_TRANSPORT", "SIM_CLOCK", "NP_STATS", "SIM_TXDUMP", "SIM_KEYLOG",
               "SIM_HALF_DUPLEX", "SIM_PTT", "SIM_SOCK_SHIM"):
         env.pop(k, None)
-    sim = sp.Popen([sys.executable, "-u", os.path.join(REPO_ROOT, "channel_sim.py")],
-                   env=env, cwd=REPO_ROOT, stderr=sp.PIPE)
+    import skywave
+    sim = sp.Popen([sys.executable, "-u", "-m", "skywave.channel_sim"],
+                   env=skywave.child_env(env), cwd=REPO_ROOT, stderr=sp.PIPE)
     try:
         def connect(name):
             path = os.path.join(str(tmp_path), name)

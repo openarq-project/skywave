@@ -16,7 +16,7 @@ def test_gen7_shipped_defaults_are_realistic_profile():
     for k in list(os.environ):
         if k.startswith("SIM_") or k in _SIM_ENV:
             del os.environ[k]
-    import channel_sim
+    from skywave import channel_sim
     cs = importlib.reload(channel_sim)
     assert cs.RIG_BPF == "data"
     assert cs.RIG_BPF_PRESETS["data"] == (150.0, 2900.0)
@@ -26,5 +26,5 @@ def test_gen7_shipped_defaults_are_realistic_profile():
 
 
 def test_rig_gen_is_7():
-    from rig_version import RIG_GEN
+    from skywave.rig_version import RIG_GEN
     assert RIG_GEN == 7

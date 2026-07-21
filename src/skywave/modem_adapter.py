@@ -29,7 +29,7 @@ THE CONTRACT (see MODEM-ADAPTER-CONTRACT.md for the full spec):
           sweep_runner classifies as `fail_connect`.
 
 A runnable reference adapter (in-process fake modem, no ALSA/subprocess) lives in
-example_loopback_adapter.py -- copy it as a starting point.
+adapters/example.py -- copy it as a starting point.
 """
 import abc
 import json
@@ -43,7 +43,7 @@ from dataclasses import dataclass, field, asdict
 
 import numpy as np
 
-import bench_pipes
+from skywave import bench_pipes
 
 RESULT_SCHEMA = "modem-adapter-result/1"
 

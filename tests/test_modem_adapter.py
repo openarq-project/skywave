@@ -15,9 +15,9 @@ import re
 
 import pytest
 
-import sweep_runner                       # the framework side -- reuse its real parsers
-from modem_adapter import AdapterConfig, AdapterResult, ModemAdapter, run_adapter
-from example_loopback_adapter import LoopbackAdapter
+from skywave import sweep_runner                       # the framework side -- reuse its real parsers
+from skywave.modem_adapter import AdapterConfig, AdapterResult, ModemAdapter, run_adapter
+from skywave.adapters.example import LoopbackAdapter
 
 
 def _run_capture(adapter_cls, argv, env):

@@ -8,19 +8,19 @@ fixture. To adapt a REAL modem, replace each hook body with the real thing:
 
   start_stations   -> launch two modem processes wired to the channel transport
                       (ALSA plughw cards, or SIM_TRANSPORT=sock), append handles to
-                      self._stations. See mercury_adapter.py for the shape.
+                      self._stations. See adapters/mercury.py for the shape.
   wait_ready       -> poll each modem's control endpoint (TCP TNC / REST / KISS) until up.
   link_connect     -> drive the native connect handshake; call self.on_line(st, line)
                       for every control line (relays PTT + scans telemetry).
   transfer         -> send the payload on the data channel, read until len(payload) or
                       the deadline, pumping control lines through self.on_line(...).
 
-Run it:  python3 example_loopback_adapter.py 4096 10
-         SIGMA=40000 python3 example_loopback_adapter.py 4096 10   # forces a partial
+Run it:  python3 -m skywave.adapters.example 4096 10
+         SIGMA=40000 python3 -m skywave.adapters.example 4096 10   # forces a partial
 """
 import sys
 
-from modem_adapter import ModemAdapter, run_adapter
+from skywave.modem_adapter import ModemAdapter, run_adapter
 
 
 class LoopbackAdapter(ModemAdapter):

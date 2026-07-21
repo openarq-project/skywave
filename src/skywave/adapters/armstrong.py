@@ -15,7 +15,7 @@ but goodput is then wall-referenced rather than on-air seconds).
 
 Set ARMSTRONG_BIN to a flat-CLI `armstrong-hf` build, then run it as `armstrong`:
 
-  python3 sweep_runner.py armstrong spec.json out.csv
+  skywave-sweep armstrong spec.json out.csv
 """
 import os
 import re
@@ -24,8 +24,8 @@ import socket
 import subprocess as sp
 import time
 
-import bench_pipes
-from modem_adapter import ModemAdapter, run_adapter
+from skywave import bench_pipes
+from skywave.modem_adapter import ModemAdapter, run_adapter
 
 
 class ArmstrongAdapter(ModemAdapter):

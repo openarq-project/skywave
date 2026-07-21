@@ -8,20 +8,22 @@ import os
 
 import pytest
 
-import sweep_runner
+from skywave import sweep_runner
 
 
 def test_no_hardcoded_absolute_root():
-    # BENCH_ROOT is derived from the file, not a hardcoded absolute path.
-    assert sweep_runner.BENCH_ROOT == os.path.dirname(os.path.abspath(sweep_runner.__file__))
+    # BENCH_ROOT is env-derived (defaulting to the cwd), never a hardcoded absolute path
+    # and never the buried package dir (which would drop run artifacts into the install).
+    assert sweep_runner.BENCH_ROOT != os.path.dirname(os.path.abspath(sweep_runner.__file__))
     src = open(sweep_runner.__file__).read()
     assert 'os.environ.get("BENCH_ROOT")' in src          # env-derived, not hardcoded
+    assert "os.getcwd()" in src                            # defaults to cwd, not the file's dir
 
 
 def test_builtins_present_without_external():
     ad = sweep_runner.load_adapters(root="/nonexistent", extra_path=None)
     assert {"loopback", "mercury"} <= set(ad)
-    assert ad["mercury"]["script"] == "mercury_adapter.py"
+    assert ad["mercury"]["module"] == "skywave.adapters.mercury"
 
 
 def test_external_registry_adds_and_resolves_script(tmp_path):

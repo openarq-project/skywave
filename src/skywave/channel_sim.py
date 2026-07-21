@@ -63,10 +63,10 @@ import subprocess as sp
 import gc
 import numpy as np
 
-import sock_frames
+from skywave import sock_frames
 
 try:
-    from rig_version import RIG_GEN
+    from skywave.rig_version import RIG_GEN
 except ImportError:  # run outside the skywave source dir
     RIG_GEN = -1
 
@@ -74,13 +74,13 @@ FS = 48000
 # SIM_PROFILE=<file.toml|.json> pre-populates the SIM_* channel knobs
 # from a declarative channel_profile BEFORE the reads below. setdefault semantics: any
 # SIM_* already in the environment (campaign/operator) OVERRIDES the profile (explicit env wins).
-import channel_profile as _channel_profile
+from skywave import channel_profile as _channel_profile
 _PROFILE_NAME = _channel_profile.apply_to_environ()
 # SIM_TRANSPORT_PROFILE=<file.toml|.json> pre-populates the transport
 # knobs (SIM_TRANSPORT/SIM_SOCK_*/SIM_CLOCK) from a declarative transport_profile BEFORE
 # the TRANSPORT reads below. Orthogonal to the channel profile above; same setdefault
 # semantics (explicit env wins). Portable, aloop-free selection in one shareable file.
-import transport_profile as _transport_profile
+from skywave import transport_profile as _transport_profile
 _TRANSPORT_PROFILE_NAME = _transport_profile.apply_to_environ()
 # Cable channel count. Default 2 (the validated setup for VARA/Mercury/ARDOP,
 # which open via plughw and adapt). FreeDATA opens the RAW snd-aloop hw device at mono and
@@ -1003,15 +1003,17 @@ def _sock_rig(procs):
         s.settimeout(SOCK_ACCEPT_S)
         lst[st] = s
     if SOCK_SHIM:
+        import skywave
         here = os.path.dirname(os.path.abspath(__file__))
         shim = os.path.join(here, "sock_alsa_shim.py")
+        cenv = skywave.child_env()          # src root on PYTHONPATH for a source checkout
         for st in ("a", "b"):
             # inherits our process group -> the harness's killpg teardown
             # reaches the shims and their arecord/aplay children, as before
             procs.append(sp.Popen(
-                ["python3", "-u", shim, "--station", st,
+                [sys.executable, "-u", shim, "--station", st,
                  "--sock", os.path.join(SOCK_DIR, st + ".sock")],
-                stderr=sys.stderr))
+                env=cenv, stderr=sys.stderr))
     conns = {}
     for st in ("a", "b"):
         try:
@@ -1105,7 +1107,7 @@ def build_channel_effects():
     fdelay = fdop = None
     fade_desc = "fade=off"
     if FADE_SCHEDULE:
-        import watterson
+        from skywave import watterson
         segs = []
         for tok in FADE_SCHEDULE.split(","):
             name, _, secs = tok.strip().partition(":")
@@ -1132,7 +1134,7 @@ def build_channel_effects():
         fdelay, fdop = float(FADE_DELAY), float(FADE_DOPPLER)
         fade_name = "custom"
     elif WATTERSON != "off":
-        import watterson
+        from skywave import watterson
         p = watterson.PRESETS.get(WATTERSON)
         if p is None:
             print(f"channel_sim: unknown SIM_WATTERSON='{WATTERSON}' (use {list(watterson.PRESETS)})",
@@ -1141,7 +1143,7 @@ def build_channel_effects():
         fdelay, fdop = p
         fade_name = WATTERSON
     if fdop is not None:
-        import watterson
+        from skywave import watterson
         fade_ab = watterson.WattersonChannel(FS, fdelay, fdop, FADE_DUR_S, FADE_SEED + 11)
         fade_ba = watterson.WattersonChannel(FS, fdelay, fdop, FADE_DUR_S, FADE_SEED + 22)
         fade_desc = f"fade={fade_name}({fdelay}ms/{fdop}Hz)"
@@ -1180,7 +1182,7 @@ def build_channel_effects():
                   "the FM fade axis is SIM_FM_FADE (+SIM_FM_SHADOW)",
                   file=sys.stderr, flush=True)
             return 2
-        import fm_rig
+        from skywave import fm_rig
         rig_ab_tx = fm_rig.FmPortTx(FS, FM_PORT, FM_ORDER, FM_CTCSS_HZ, FM_CTCSS_AMP)
         rig_ba_tx = fm_rig.FmPortTx(FS, FM_PORT, FM_ORDER, FM_CTCSS_HZ, FM_CTCSS_AMP)
         rig_ab_rx = fm_rig.FmPortRx(FS, FM_PORT, FM_ORDER)
@@ -1209,7 +1211,7 @@ def build_channel_effects():
         # Tier A: FM flat fade + shadowing occupy the fade slot
         # (mutually exclusive with the Watterson knobs, checked above).
         if FM_FADE != "off" or FM_SHADOW != "off":
-            import fm_channel
+            from skywave import fm_channel
             try:
                 fspec = fm_channel.resolve_fade_spec(FM_FADE, FM_BAND)
                 shspec = fm_channel.resolve_shadow_spec(FM_SHADOW)
@@ -1232,7 +1234,7 @@ def build_channel_effects():
             if shspec is not None:
                 fade_desc += f" fm_shadow={ssig:g}dB/tau{stau:g}s"
         if FM_NOISE_BW != "off":
-            import fm_channel
+            from skywave import fm_channel
             try:
                 _bw = float(FM_NOISE_BW)
                 noise_lpf_ab = fm_channel.NoiseShaper(FS, _bw, NCH)
@@ -1263,7 +1265,7 @@ def build_channel_effects():
     _foff_ramp = float(FOFF_RAMP_HZ) if FOFF_RAMP_HZ else None
     if any((FOFF_HZ, _foff_ramp, CLOCK_PPM, ALC_DB, RX_AGC, NOISE_VD,
             QRM_OCC, QRM_SWEEP)):
-        import rig_effects as fxm
+        from skywave import rig_effects as fxm
         if ALC_DB:
             fx_ab.alc = fxm.AlcOvershoot(FS, ALC_DB, ALC_SETTLE_MS, nch=NCH,
                                          rearm_s=_alc_rearm_s)

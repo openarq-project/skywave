@@ -30,7 +30,7 @@ import sys
 import threading
 import time
 
-import sock_frames
+from skywave import sock_frames
 
 FS = 48000
 NCH = int(os.environ.get("SIM_NCH", "2").strip() or "2")

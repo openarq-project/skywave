@@ -1,6 +1,11 @@
 __pycache__/
 *.pyc
 .pytest_cache/
+# packaging / install artifacts
+build/
+dist/
+*.egg-info/
+.eggs/
 # run artifacts
 logs/
 results/

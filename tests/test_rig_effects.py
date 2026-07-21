@@ -6,7 +6,7 @@ import pytest
 from scipy.signal import hilbert
 
 from conftest import load_sim, make_link, make_fx, feed, interleave
-import rig_effects as fxm
+from skywave import rig_effects as fxm
 
 FS = 48000
 

@@ -14,7 +14,7 @@ A transport profile is a small TOML (or JSON) file that names a transport once -
 clock, socket dir/buffer/accept, shim -- instead of a scatter of SIM_* env vars, so a
 portable run is one shareable file:
 
-  channel_sim.py : `SIM_TRANSPORT_PROFILE=transports/sock-real_time.toml python3 channel_sim.py`
+  channel_sim : `SIM_TRANSPORT_PROFILE=transports/sock-real_time.toml skywave-channel`
 
 This is the SEPARABILITY COMPLEMENT to the channel_profile module: that one carries channel
 PHYSICS (fade/noise/rig-chain), this one carries HARNESS TRANSPORT. They are ORTHOGONAL

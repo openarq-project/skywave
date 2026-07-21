@@ -10,7 +10,7 @@ resamples to the 8 kHz cable.
 
 Set ARDOP_BIN to the ardopcf binary, then run it as the `ardop` modem:
 
-  python3 sweep_runner.py ardop spec.json out.csv
+  skywave-sweep ardop spec.json out.csv
 """
 import os
 import select
@@ -19,7 +19,7 @@ import struct
 import subprocess as sp
 import time
 
-from modem_adapter import ModemAdapter, run_adapter
+from skywave.modem_adapter import ModemAdapter, run_adapter
 
 
 class ArdopAdapter(ModemAdapter):

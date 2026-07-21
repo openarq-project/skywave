@@ -15,7 +15,7 @@ import subprocess
 import numpy as np
 import pytest
 
-import hfchan
+from skywave import hfchan
 
 FS = 8000
 CH_BIN = os.path.expanduser("~/tools/mercury/modem/freedv/ch")

@@ -62,6 +62,9 @@ BUILTIN_ADAPTERS = {
     "mercury":   {"module": "skywave.adapters.mercury",   "kill_pad": 80, "extra_env": {}},
     "armstrong": {"module": "skywave.adapters.armstrong", "kill_pad": 90, "extra_env": {}},
     "ardop":     {"module": "skywave.adapters.ardop",     "kill_pad": 90, "extra_env": {}},
+    # VARA needs two VARA.exe instances already listening on 8300/8310 (external
+    # up/down lifecycle; VARA.exe persists across cells). See adapters/vara.py.
+    "vara":      {"module": "skywave.adapters.vara",      "kill_pad": 80, "extra_env": {}},
 }
 
 

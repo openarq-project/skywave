@@ -24,6 +24,12 @@ The ALSA rig is the only Linux-only piece of the core. Off Linux the harness fai
 with a clear message pointing at the `sock` transport rather than a cryptic
 `arecord`/`aplay` error; the gate lives in one place, `skywave/_platform.py`.
 
+To run a *real modem* off Linux, prefer its own device-free PCM path (Armstrong
+`--audio sock`, Mercury `-x fifo`) bridged through the channel sim; a virtual
+audio device (BlackHole, VB-CABLE) is only needed for a modem that speaks nothing
+but a soundcard. The full analysis and per-modem breakdown is in
+[REAL-AUDIO-RIG.md](REAL-AUDIO-RIG.md).
+
 ## Running on macOS
 
 Requirements: Python 3.11+ (the system `python3` on current macOS is 3.9, too old).

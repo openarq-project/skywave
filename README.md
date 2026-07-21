@@ -141,6 +141,9 @@ Harness and transports:
   transport design.
 - [docs/PORTABILITY.md](docs/PORTABILITY.md): platform support (Linux/macOS), the
   device-free path off Linux, and what a Windows port needs.
+- [docs/REAL-AUDIO-RIG.md](docs/REAL-AUDIO-RIG.md): running real soundcard modems
+  off Linux — device-free pipes/sockets vs. virtual audio devices (BlackHole,
+  VB-CABLE), per modem, with a recommendation.
 - [docs/EQUAL-PEP.md](docs/EQUAL-PEP.md): equalizing transmit drive (PEP) across modems
   for a fair comparison, and the `--calibrate-pep` command.
 

@@ -67,6 +67,17 @@ This puts the `skywave` package on the path and installs three console scripts:
 point without installing, straight from `src/`, with
 `PYTHONPATH=src python3 -m skywave.<module>`.
 
+### Platforms
+
+The channel sim, the DSP, and the full test suite run on Linux and macOS. The
+device-free `sock` transport runs on both, so a modem with a native socket audio
+backend can be benchmarked with no audio hardware. The real snd-aloop **ALSA rig is
+Linux-only**; off Linux the harness says so and points at the `sock` transport.
+Windows is not supported yet (the small, catalogued gaps are in
+[docs/PORTABILITY.md](docs/PORTABILITY.md)). On macOS you need Python 3.11+ (the
+system 3.9 is too old); see [docs/PORTABILITY.md](docs/PORTABILITY.md) for a
+one-command setup and a device-free end-to-end example.
+
 ## Quick start
 
 A one-way channel filter, compatible with the codec2 `ch` tool:
@@ -128,6 +139,8 @@ Harness and transports:
 - [docs/TRANSPORT.md](docs/TRANSPORT.md): running with or without an ALSA loopback rig.
 - [docs/TRANSPORT-DESIGN.md](docs/TRANSPORT-DESIGN.md): the socket and virtual-clock
   transport design.
+- [docs/PORTABILITY.md](docs/PORTABILITY.md): platform support (Linux/macOS), the
+  device-free path off Linux, and what a Windows port needs.
 - [docs/EQUAL-PEP.md](docs/EQUAL-PEP.md): equalizing transmit drive (PEP) across modems
   for a fair comparison, and the `--calibrate-pep` command.
 

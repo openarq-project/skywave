@@ -104,7 +104,7 @@ def test_shipped_profiles_valid(name, kind, clock):
 
 # ------------------------------------------- end-to-end: sock selected via profile only
 
-def test_channel_sim_over_sockets_via_profile(tmp_path):
+def test_channel_sim_over_sockets_via_profile(sock_dir):
     """channel_sim as a real process, sock transport selected ONLY by
     SIM_TRANSPORT_PROFILE (SIM_TRANSPORT absent from env), no ALSA: B's delivered frames
     are byte-identical to the Link.process ground truth."""
@@ -115,7 +115,7 @@ def test_channel_sim_over_sockets_via_profile(tmp_path):
 
     env = dict(os.environ)
     env.update({"SIM_TRANSPORT_PROFILE": os.path.join(TRANSPORTS, "sock-real_time.toml"),
-                "SIM_SOCK_DIR": str(tmp_path), "SIM_SOCK_ACCEPT_S": "10",
+                "SIM_SOCK_DIR": sock_dir, "SIM_SOCK_ACCEPT_S": "10",
                 "SIGMA": "150", "SEED": "555", "TXGAIN": "1.0",
                 "SIM_NCH": "2", "SIM_BLOCK": "1024"})
     # prove the PROFILE selects sock: no explicit transport env, and clear leftovers
@@ -127,7 +127,7 @@ def test_channel_sim_over_sockets_via_profile(tmp_path):
                    env=skywave.child_env(env), cwd=REPO_ROOT, stderr=sp.PIPE)
     try:
         def connect(name):
-            path = os.path.join(str(tmp_path), name)
+            path = os.path.join(sock_dir, name)
             deadline = time.monotonic() + 10.0
             while True:
                 s = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)

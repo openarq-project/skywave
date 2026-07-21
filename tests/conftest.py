@@ -9,10 +9,13 @@ Run:  cd skywave && python3 -m pytest tests/ -q
 """
 import importlib
 import os
+import shutil
 import sys
+import tempfile
 import threading
 
 import numpy as np
+import pytest
 
 REPO_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 # Make the `skywave` package importable when running from a source checkout
@@ -21,6 +24,28 @@ REPO_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 SRC = os.path.join(REPO_ROOT, "src")
 if SRC not in sys.path:
     sys.path.insert(0, SRC)
+
+def _short_tmp_root():
+    """Shortest writable tmp root for AF_UNIX sockets. pytest's tmp_path on macOS
+    (/private/var/folders/...) is long enough to overflow sun_path (104 B), so
+    socket-bearing tests bind here instead -- the same /tmp channel_sim defaults to."""
+    for root in ("/tmp", tempfile.gettempdir()):
+        if os.path.isdir(root) and os.access(root, os.W_OK):
+            return root
+    return tempfile.gettempdir()
+
+
+@pytest.fixture
+def sock_dir():
+    """A short, unique, auto-cleaned directory for SIM_SOCK_DIR / AF_UNIX sockets.
+    Use in place of pytest's tmp_path for anything that bind()s a unix socket:
+    tmp_path overflows the macOS 104-byte sun_path limit ("AF_UNIX path too long")."""
+    d = tempfile.mkdtemp(prefix="skw-", dir=_short_tmp_root())
+    try:
+        yield d
+    finally:
+        shutil.rmtree(d, ignore_errors=True)
+
 
 # every env key channel_sim reads (keep in sync with its header block)
 _SIM_ENV = ("SIGMA", "TXGAIN", "SEED", "NP_STATS", "SIM_TXDUMP", "SIM_KEYLOG")

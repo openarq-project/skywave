@@ -64,6 +64,7 @@ import gc
 import numpy as np
 
 from skywave import sock_frames
+from skywave import _platform
 
 try:
     from skywave.rig_version import RIG_GEN
@@ -396,6 +397,11 @@ SOCK_DIR = os.environ.get("SIM_SOCK_DIR", "").strip() or f"/tmp/simsock-{os.getp
 SOCK_SHIM = os.environ.get("SIM_SOCK_SHIM", "0").strip() == "1"
 SOCK_ACCEPT_S = float(os.environ.get("SIM_SOCK_ACCEPT_S", "30").strip() or "30")
 SOCK_BUF = int(os.environ.get("SIM_SOCK_BUF", "65536").strip() or "65536")
+# AF_UNIX addresses are OS-capped: sockaddr_un.sun_path holds 108 bytes on Linux,
+# 104 on macOS/BSD (the last is the NUL terminator). A socket path over the limit
+# fails bind()/connect() with a cryptic "AF_UNIX path too long" -- easy to hit on
+# macOS, where a deep SIM_SOCK_DIR (or a long system tempdir) overflows fast.
+_SUN_PATH_MAX = 108 if sys.platform.startswith("linux") else 104
 # Virtual-rig stage 2 — block-lockstep virtual clock.
 # SIM_CLOCK=virt_time (requires SIM_TRANSPORT=sock, a station's `--audio sock` backend):
 # the sim is the clock master — per block it sends both stations their RX frame
@@ -993,6 +999,12 @@ def _sock_rig(procs):
     lst = {}
     for st in ("a", "b"):
         path = os.path.join(SOCK_DIR, st + ".sock")
+        if len(os.fsencode(path)) >= _SUN_PATH_MAX:
+            raise RuntimeError(
+                f"socket path too long: '{path}' is {len(os.fsencode(path))} "
+                f"bytes but this platform caps AF_UNIX paths at "
+                f"{_SUN_PATH_MAX - 1}; set SIM_SOCK_DIR to a shorter directory "
+                f"(default /tmp/simsock-<pid>)")
         try:
             os.unlink(path)
         except FileNotFoundError:
@@ -1425,6 +1437,10 @@ def main():
                       rig_ba_tx, rig_ba_rx, fx_ba,
                       squelch=sql_ba, gain=GAIN_B, sigma=SIGMA_BA)   # B TX -> A RX
     else:
+        alsa_err = _platform.alsa_rig_error()
+        if alsa_err:
+            print(f"channel_sim: {alsa_err}", file=sys.stderr, flush=True)
+            return 2
         rec_a = arecord(CAP_A); procs.append(rec_a)
         rec_b = arecord(CAP_B); procs.append(rec_b)
         play_a = aplay(PLAY_A); procs.append(play_a)

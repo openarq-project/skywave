@@ -42,6 +42,15 @@ class ArmstrongAdapter(ModemAdapter):
         super().__init__(cfg)
         self.arm = os.environ.get("ARMSTRONG_BIN", "").strip() or "armstrong-hf"
         self.sock = os.environ.get("SIM_TRANSPORT", "").strip() == "sock"   # opt-in device-free path
+        # Post-CONNECT settle before data. In virt_time the modem's FSM clock races wall
+        # time on a fast host, so a long WALL-clock idle here can burn past the ARQ
+        # keepalive-loss budget (arq KEEPALIVE 30s x3) and drop the link before any data
+        # flows -- a 2 s settle disconnected reproducibly on an M5 Mac (~9x faster virt
+        # stepping than the Linux benches, where 2 s was safe). Keep it brief in virt_time;
+        # the real-time/ALSA rig keeps the full 2 s so the rate controller settles before
+        # the first burst. Tunable via ARM_SETTLE_S for an unusually slow virt_time host.
+        _virt = self.sock and os.environ.get("SIM_CLOCK", "virt_time").strip() == "virt_time"
+        self.settle_s = float(os.environ.get("ARM_SETTLE_S", "0.3" if _virt else "2.0"))
         self.sockdir = (os.environ.get("SIM_SOCK_DIR", "").strip()
                         or f"/tmp/skywave-armsock-{os.getpid()}")
         if self.sock:
@@ -138,8 +147,9 @@ class ArmstrongAdapter(ModemAdapter):
             if self._pump(min(deadline, time.time() + 60),
                           stop=lambda t: t.startswith("CONNECTED")):
                 # let the rate controller settle before data, but keep pumping so PTT
-                # and telemetry keep flowing (a hard sleep squelches the first burst)
-                self._pump(time.time() + 2.0)
+                # and telemetry keep flowing (a hard sleep squelches the first burst).
+                # settle_s is short in virt_time so it can't race past keepalive-loss.
+                self._pump(time.time() + self.settle_s)
                 self.adat = socket.create_connection(("127.0.0.1", self.A_PORT + 1))       # A sender
                 self.bdat = socket.create_connection(("127.0.0.1", self.B_PORT + 1)); self.bdat.setblocking(False)
                 return True

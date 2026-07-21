@@ -31,6 +31,7 @@ import threading
 import time
 
 from skywave import sock_frames
+from skywave import _platform
 
 FS = 48000
 NCH = int(os.environ.get("SIM_NCH", "2").strip() or "2")
@@ -121,6 +122,9 @@ def main():
     ap.add_argument("--cap", default=None)
     ap.add_argument("--play", default=None)
     a = ap.parse_args()
+    alsa_err = _platform.alsa_rig_error()
+    if alsa_err:
+        sys.exit(f"sock_alsa_shim: {alsa_err}")
     cap_dev, play_dev = DEV[a.station]
     cap_dev = a.cap or cap_dev
     play_dev = a.play or play_dev

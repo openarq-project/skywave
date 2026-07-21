@@ -21,10 +21,10 @@ from conftest import REPO_ROOT, load_sim, make_link, feed, tone_block
 from skywave import sock_frames
 
 
-def start_sim(tmp_path, **env_over):
+def start_sim(sock_dir, **env_over):
     env = dict(os.environ)
     env.update({"SIM_TRANSPORT": "sock", "SIM_CLOCK": "virt_time",
-                "SIM_SOCK_DIR": str(tmp_path), "SIM_SOCK_ACCEPT_S": "10",
+                "SIM_SOCK_DIR": sock_dir, "SIM_SOCK_ACCEPT_S": "10",
                 "SIGMA": "0", "SEED": "777", "TXGAIN": "1.0",
                 "SIM_NCH": "2", "SIM_BLOCK": "1024"})
     env.update({k: str(v) for k, v in env_over.items()})
@@ -34,8 +34,8 @@ def start_sim(tmp_path, **env_over):
                     env=skywave.child_env(env), cwd=REPO_ROOT, stderr=sp.PIPE)
 
 
-def connect(tmp_path, name):
-    path = os.path.join(str(tmp_path), name)
+def connect(sock_dir, name):
+    path = os.path.join(sock_dir, name)
     deadline = time.monotonic() + 10.0
     while True:
         s = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
@@ -63,7 +63,7 @@ def stop_sim(sim):
         return sim.communicate()[1] or b""
 
 
-def test_lockstep_barrier_latency_ptt_and_byte_exactness(tmp_path):
+def test_lockstep_barrier_latency_ptt_and_byte_exactness(sock_dir):
     cs = load_sim(SIGMA=150, SEED=777, SIM_HALF_DUPLEX=1, SIM_PTT=1)
     nblocks = 6
     tones = [tone_block(cs, block_index=i) for i in range(nblocks)]
@@ -73,9 +73,9 @@ def test_lockstep_barrier_latency_ptt_and_byte_exactness(tmp_path):
     ref = make_link(cs, seed=777 + 11, ptt=ptt)
     want = [feed(ref, b) for b in tones]
 
-    sim = start_sim(tmp_path, SIGMA=150, SIM_HALF_DUPLEX=1, SIM_PTT=1)
+    sim = start_sim(sock_dir, SIGMA=150, SIM_HALF_DUPLEX=1, SIM_PTT=1)
     try:
-        sa, sb = connect(tmp_path, "a.sock"), connect(tmp_path, "b.sock")
+        sa, sb = connect(sock_dir, "a.sock"), connect(sock_dir, "b.sock")
         fa, fb = sa.makefile("rb"), sb.makefile("rb")
         buf_a = bytearray(cs.NBYTES)
         buf_b = bytearray(cs.NBYTES)
@@ -108,11 +108,11 @@ def test_lockstep_barrier_latency_ptt_and_byte_exactness(tmp_path):
     assert b"clock=virt_time" in err
 
 
-def test_lockstep_unkeyed_station_delivers_noise_floor_only(tmp_path):
+def test_lockstep_unkeyed_station_delivers_noise_floor_only(sock_dir):
     cs = load_sim(SIGMA=0, SEED=777, SIM_HALF_DUPLEX=1, SIM_PTT=1)
-    sim = start_sim(tmp_path, SIGMA=0, SIM_HALF_DUPLEX=1, SIM_PTT=1)
+    sim = start_sim(sock_dir, SIGMA=0, SIM_HALF_DUPLEX=1, SIM_PTT=1)
     try:
-        sa, sb = connect(tmp_path, "a.sock"), connect(tmp_path, "b.sock")
+        sa, sb = connect(sock_dir, "a.sock"), connect(sock_dir, "b.sock")
         fa, fb = sa.makefile("rb"), sb.makefile("rb")
         buf = bytearray(cs.NBYTES)
         tone = tone_block(cs).tobytes()
@@ -133,10 +133,10 @@ def test_lockstep_unkeyed_station_delivers_noise_floor_only(tmp_path):
         stop_sim(sim)
 
 
-def test_lockstep_virtual_timeout_marker(tmp_path):
+def test_lockstep_virtual_timeout_marker(sock_dir):
     cs = load_sim(SIGMA=0)
-    sim = start_sim(tmp_path, SIM_MAX_VIRTUAL_S="0.5")
-    sa, sb = connect(tmp_path, "a.sock"), connect(tmp_path, "b.sock")
+    sim = start_sim(sock_dir, SIM_MAX_VIRTUAL_S="0.5")
+    sa, sb = connect(sock_dir, "a.sock"), connect(sock_dir, "b.sock")
     fa, fb = sa.makefile("rb"), sb.makefile("rb")
     buf = bytearray(cs.NBYTES)
     silence = bytes(cs.NBYTES)

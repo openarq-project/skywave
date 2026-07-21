@@ -11,6 +11,7 @@ import os
 import socket
 import subprocess as sp
 import sys
+import tempfile
 import threading
 import time
 
@@ -156,7 +157,7 @@ def test_socklink_rejects_wrong_block_size():
 
 # ----------------------------------------------- full sim process over sockets
 
-def test_channel_sim_end_to_end_over_sockets(tmp_path):
+def test_channel_sim_end_to_end_over_sockets(sock_dir):
     """channel_sim as a real process, SIM_TRANSPORT=sock, no ALSA anywhere:
     station A sends a tone + station B silence; B's delivered frames are
     byte-identical to the Link.process ground truth (AWGN seeded SEED+11)."""
@@ -166,7 +167,7 @@ def test_channel_sim_end_to_end_over_sockets(tmp_path):
     want = [feed(ref, b) for b in blocks]
 
     env = dict(os.environ)
-    env.update({"SIM_TRANSPORT": "sock", "SIM_SOCK_DIR": str(tmp_path),
+    env.update({"SIM_TRANSPORT": "sock", "SIM_SOCK_DIR": sock_dir,
                 "SIM_SOCK_ACCEPT_S": "10", "SIGMA": "150", "SEED": "777",
                 "TXGAIN": "1.0", "SIM_NCH": "2", "SIM_BLOCK": "1024"})
     for k in ("NP_STATS", "SIM_TXDUMP", "SIM_KEYLOG", "SIM_HALF_DUPLEX",
@@ -176,7 +177,7 @@ def test_channel_sim_end_to_end_over_sockets(tmp_path):
                    env=skywave.child_env(env), cwd=REPO_ROOT, stderr=sp.PIPE)
     try:
         def connect(name):
-            path = os.path.join(str(tmp_path), name)
+            path = os.path.join(sock_dir, name)
             deadline = time.monotonic() + 10.0
             while True:
                 s = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
@@ -211,10 +212,10 @@ def test_channel_sim_end_to_end_over_sockets(tmp_path):
             sim.wait()
 
 
-def test_channel_sim_sock_accept_timeout_exits_2(tmp_path):
+def test_channel_sim_sock_accept_timeout_exits_2(sock_dir):
     """Nobody connects -> the sim exits 2 with a clear message, no hang."""
     env = dict(os.environ)
-    env.update({"SIM_TRANSPORT": "sock", "SIM_SOCK_DIR": str(tmp_path),
+    env.update({"SIM_TRANSPORT": "sock", "SIM_SOCK_DIR": sock_dir,
                 "SIM_SOCK_ACCEPT_S": "0.3", "SIGMA": "0", "TXGAIN": "1.0",
                 "SIM_NCH": "2", "SIM_BLOCK": "1024", "SEED": "1"})
     for k in ("NP_STATS", "SIM_SOCK_SHIM"):
@@ -223,3 +224,20 @@ def test_channel_sim_sock_accept_timeout_exits_2(tmp_path):
                env=skywave.child_env(env), cwd=REPO_ROOT, capture_output=True, timeout=15)
     assert r.returncode == 2
     assert b"did not connect" in r.stderr
+
+
+def test_over_long_sock_dir_rejected_cleanly():
+    """A SIM_SOCK_DIR whose socket path exceeds the AF_UNIX sun_path limit exits 2
+    with an actionable "too long" message instead of a cryptic OSError at bind()
+    (the macOS-portability guard; sun_path is 104 B on macOS/BSD, 108 on Linux)."""
+    long_dir = os.path.join(tempfile.gettempdir(), "s" * 120)
+    env = dict(os.environ)
+    env.update({"SIM_TRANSPORT": "sock", "SIM_SOCK_DIR": long_dir,
+                "SIM_SOCK_ACCEPT_S": "1", "SIGMA": "0", "TXGAIN": "1.0",
+                "SIM_NCH": "2", "SIM_BLOCK": "1024", "SEED": "1"})
+    for k in ("NP_STATS", "SIM_SOCK_SHIM"):
+        env.pop(k, None)
+    r = sp.run([sys.executable, "-m", "skywave.channel_sim"],
+               env=skywave.child_env(env), cwd=REPO_ROOT, capture_output=True, timeout=15)
+    assert r.returncode == 2
+    assert b"too long" in r.stderr

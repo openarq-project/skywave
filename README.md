@@ -38,8 +38,20 @@ channel, transport, and scoring stack. The harness provides:
 ## Adapters
 
 One goal of skywave is a growing collection of adapters covering the modems people actually
-run. It ships with an in-process reference adapter and a Mercury adapter. More are welcome;
-the ModemAdapter contract is documented in docs/MODEM-ADAPTER-CONTRACT.md.
+run. A modem is added by writing one adapter against the ModemAdapter contract (documented
+in docs/MODEM-ADAPTER-CONTRACT.md); it then gets the whole harness for free. The adapters
+that ship today:
+
+| Adapter | Modem | Notes |
+|---|---|---|
+| `loopback` | in-process reference | no external modem — copy this to start a new adapter |
+| `mercury` | Mercury HF | TCP TNC |
+| `armstrong` | Armstrong (OpenARQ reference) | ALSA loopback; native unix-socket transport optional |
+| `ardop` | ARDOP (`ardopcf`) | includes chunked, buffer-throttled bulk TX |
+| `vara` | VARA HF | proprietary, typically under Wine; two instances brought up by an external up/down lifecycle |
+| `freedata` | FreeDATA | REST + websocket; runs under FreeDATA's own venv (set `ADAPTER_PY`) |
+
+More are welcome.
 
 ## Install
 

@@ -65,6 +65,9 @@ BUILTIN_ADAPTERS = {
     # VARA needs two VARA.exe instances already listening on 8300/8310 (external
     # up/down lifecycle; VARA.exe persists across cells). See adapters/vara.py.
     "vara":      {"module": "skywave.adapters.vara",      "kill_pad": 80, "extra_env": {}},
+    # FreeDATA needs its own venv (fastapi/uvicorn + websocket-client): set ADAPTER_PY
+    # to that python so adapter_argv launches the adapter under it. See adapters/freedata.py.
+    "freedata":  {"module": "skywave.adapters.freedata",  "kill_pad": 110, "extra_env": {}},
 }
 
 

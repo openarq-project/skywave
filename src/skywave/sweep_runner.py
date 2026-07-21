@@ -13,19 +13,20 @@ and fade realizations). An optional per-modem level calibration
 1.0. The per-row snr3k comes from the sim's measured act_rms (NP_STATS), falling back to a
 gain-scaled nominal.
 
-Usage: sweep_runner.py <modem> <cells.json> <out.csv> [tag]
-       sweep_runner.py --calibrate-pep <modem> [target_dbfs] [payload] [timeout]
+Usage: skywave-sweep <modem> <cells.json> <out.csv> [tag]
+       skywave-sweep --calibrate-pep <modem> [target_dbfs] [payload] [timeout]
          (measure the modem's clean TX peak and write results/<modem>_txgain.txt so it
           is driven at equal PEP across modems; see docs/EQUAL-PEP.md)
-       sweep_runner.py --calibrate-pep-stressed <modem> [target_dbfs]
+       skywave-sweep --calibrate-pep-stressed <modem> [target_dbfs]
          (same, but the MAX peak over a clean/AWGN/fading ladder, so a slower mode with a
           higher peak is not missed -- slower, more thorough)
+  (equivalently `python -m skywave.sweep_runner ...` from a source checkout.)
   modem: a key in the adapter registry — the built-ins (loopback, mercury, armstrong,
   ardop) plus anything
   in <BENCH_ROOT>/adapters.json or the file named by $BENCH_ADAPTERS. A new project
   registers its modem there instead of editing this file (see MODEM-ADAPTER-CONTRACT.md).
-  An unknown modem prints the list. BENCH_ROOT overrides the repository root (default:
-  this file's dir).
+  An unknown modem prints the list. BENCH_ROOT sets the artifact/cwd root (default:
+  the current directory).
 """
 import os, sys, json, subprocess as sp, time, re, csv, math, signal
 import skywave
@@ -112,7 +113,7 @@ ADAPTERS = load_adapters()
 
 # Processes to sweep between cells so a wedged transport can't poison the next. CAUTION:
 # these run via `pkill -9 -f` so each pattern MUST NOT be a substring of THIS driver's own
-# cmdline ("python3 sweep_runner.py <modem> <spec> <csv> <tag>") or the driver self-kills.
+# cmdline ("...python -m skywave.sweep_runner <modem> <spec> <csv> <tag>") or it self-kills.
 # Match the transport processes only; an adapter cleans its own modem processes via its
 # preclean_patterns() (see ModemAdapter).
 KILL_PATS = ["channel_sim.py", "arecord -D plughw", "aplay -D plughw"]

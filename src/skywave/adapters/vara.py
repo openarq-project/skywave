@@ -70,23 +70,34 @@ class VaraAdapter(ModemAdapter):
         pass
 
     def wait_ready(self, deadline):
-        return (self._wait_listen(self.A_PORT, deadline)
-                and self._wait_listen(self.B_PORT, deadline))
-
-    def _wait_listen(self, port, deadline):
-        while time.time() < deadline:
-            try:
-                socket.create_connection(("127.0.0.1", port), timeout=1).close()
-                return True
-            except OSError:
-                time.sleep(0.3)
-        return False
-
-    def link_connect(self, deadline):
-        self.a = socket.create_connection(("127.0.0.1", self.A_PORT)); self.a.setblocking(False)
-        self.b = socket.create_connection(("127.0.0.1", self.B_PORT)); self.b.setblocking(False)
+        # VARA permits ONE client per command port and treats a client disconnect as a
+        # session event. The base contract splits "is it listening?" (wait_ready) from
+        # "open the link" (link_connect); a connect-CLOSE probe here followed by a
+        # re-open in link_connect therefore hits VARA's command port TWICE at machine
+        # speed, and the second open races VARA's teardown of the first -- tripping a
+        # reset on the real link right after MYCALL (deterministic, box-independent).
+        # The proven original driver opens each command socket EXACTLY ONCE. Match that:
+        # establish the persistent A/B command sockets HERE and let link_connect reuse
+        # them (no probe, no re-open).
+        self.a = self._connect(self.A_PORT, deadline)
+        self.b = self._connect(self.B_PORT, deadline)
+        if self.a is None or self.b is None:
+            return False
+        self.a.setblocking(False); self.b.setblocking(False)
         self.nm = {self.a: "A", self.b: "B"}
         self.buf = {self.a: b"", self.b: b""}
+        return True
+
+    def _connect(self, port, deadline):
+        while time.time() < deadline:
+            try:
+                return socket.create_connection(("127.0.0.1", port), timeout=1)
+            except OSError:
+                time.sleep(0.3)
+        return None
+
+    def link_connect(self, deadline):
+        # Command sockets (self.a/self.b) were opened ONCE in wait_ready; reuse them.
         for s, call in ((self.a, self.ACALL), (self.b, self.BCALL)):
             for c in (f"MYCALL {call}", "COMPRESSION OFF", "BW2300"):
                 self._snd(s, c); time.sleep(0.2)

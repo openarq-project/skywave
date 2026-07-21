@@ -60,6 +60,9 @@ def adapter_argv(cfg, *args):
 BUILTIN_ADAPTERS = {
     "loopback":  {"module": "skywave.adapters.example",   "kill_pad": 30, "extra_env": {}},
     "mercury":   {"module": "skywave.adapters.mercury",   "kill_pad": 80, "extra_env": {}},
+    # Device-free Mercury: -x fifo bridged through hfchan, no ALSA/soundcard (runs on
+    # macOS). Same control plane as `mercury`; only the audio transport differs.
+    "mercury_fifo": {"module": "skywave.adapters.mercury_fifo", "kill_pad": 80, "extra_env": {}},
     "armstrong": {"module": "skywave.adapters.armstrong", "kill_pad": 90, "extra_env": {}},
     "ardop":     {"module": "skywave.adapters.ardop",     "kill_pad": 90, "extra_env": {}},
     # VARA needs two VARA.exe instances already listening on 8300/8310 (external

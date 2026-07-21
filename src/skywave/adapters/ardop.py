@@ -8,6 +8,13 @@ length-prefixed data frames (a 2-byte big-endian length, an optional 3-byte
 ARQ/FEC/ERR tag, then the payload bytes). ardopcf runs at 12 kHz, so plughw
 resamples to the 8 kHz cable.
 
+TX is CHUNKED + BUFFER-throttled (works for small AND bulk payloads, so no separate
+"ardop_bulk" adapter): ardopcf's host data buffer cannot hold a whole large frame -- a
+single 32 KB <len><data> send delivers 0 B -- so the payload is fed in ARDOP_CHUNK-byte
+blocks, throttled on the sender's "BUFFER n" reports (n = bytes still queued in ardopcf's
+TX buffer) to keep outstanding bytes under ARDOP_BUF_HIGH (< the proven ~4096 single-frame
+ceiling). A ~4 KB payload just streams out in the first few blocks.
+
 Set ARDOP_BIN to the ardopcf binary, then run it as the `ardop` modem:
 
   skywave-sweep ardop spec.json out.csv
@@ -29,6 +36,10 @@ class ArdopAdapter(ModemAdapter):
     ACALL, BCALL = "W1ARD", "W2ARD"
     ready_timeout_s = 20.0
     connect_timeout_s = 150.0
+    # Chunked TX: feed CHUNK-byte blocks, keeping ardopcf's TX buffer below BUF_HIGH
+    # (both < the ~4096 single-frame ceiling). Env-overridable.
+    CHUNK = int(os.environ.get("ARDOP_CHUNK", "1000"))
+    BUF_HIGH = int(os.environ.get("ARDOP_BUF_HIGH", "3000"))
 
     def __init__(self, cfg):
         super().__init__(cfg)
@@ -88,13 +99,18 @@ class ArdopAdapter(ModemAdapter):
         return False
 
     def transfer(self, payload, deadline):
-        # send the whole payload as one length-prefixed frame on B's data port
-        self.bdat.sendall(struct.pack(">H", len(payload)) + payload)
-        print(f"sent {len(payload)} B on B.data; reading A.data ...", flush=True)
+        # Feed the payload in CHUNK-byte length-prefixed blocks on B's data port,
+        # throttled on ardopcf's own "BUFFER n" reports so its host TX buffer never
+        # overflows (a single whole-payload send delivers 0 B for large payloads).
+        total = len(payload)
+        off = 0            # bytes handed to ardopcf so far
+        last_buf = 0       # ardopcf's reported TX-buffer occupancy (sender b)
+        print(f"feeding {total} B in {self.CHUNK}-B blocks (buf <= {self.BUF_HIGH}) "
+              f"on B.data; reading A.data ...", flush=True)
         recv = bytearray()
         rbuf = b""
-        while len(recv) < len(payload) and time.time() < deadline:
-            r, _, _ = select.select([self.adat, self.a, self.b], [], [], 0.5)
+        while len(recv) < total and time.time() < deadline:
+            r, _, _ = select.select([self.adat, self.a, self.b], [], [], 0.2)
             for s in r:
                 if s is self.adat:
                     try:
@@ -113,7 +129,14 @@ class ArdopAdapter(ModemAdapter):
                     self.buf[s] += d
                     while b"\r" in self.buf[s]:
                         ln, self.buf[s] = self.buf[s].split(b"\r", 1)
-                        self.on_line(self.nm[s], ln.decode(errors="replace").strip())
+                        t = ln.decode(errors="replace").strip()
+                        self.on_line(self.nm[s], t)
+                        # Track the SENDER's TX-buffer level to gate the feed.
+                        if s is self.b and t.startswith("BUFFER"):
+                            try:
+                                last_buf = int(t.split()[1])
+                            except (IndexError, ValueError):
+                                pass
             # parse <2-byte len>[3-byte ARQ/FEC/ERR tag]<data> frames off the data stream
             while len(rbuf) >= 2:
                 flen = struct.unpack(">H", rbuf[:2])[0]
@@ -122,6 +145,13 @@ class ArdopAdapter(ModemAdapter):
                 frame = rbuf[2:2 + flen]
                 rbuf = rbuf[2 + flen:]
                 recv += frame[3:] if frame[:3] in (b"ARQ", b"FEC", b"ERR") else frame
+            # feed while payload remains and ardopcf's TX buffer has headroom
+            while off < total and last_buf < self.BUF_HIGH:
+                end = min(off + self.CHUNK, total)
+                blk = payload[off:end]
+                self.bdat.sendall(struct.pack(">H", len(blk)) + blk)
+                off = end
+                last_buf += len(blk)      # optimistic; the next BUFFER report corrects it
         return bytes(recv)
 
     def teardown_stations(self):

@@ -34,6 +34,7 @@ or later). Set MERCURY_BIN, then run as the `mercury_sock` modem:
   skywave-sweep mercury_sock spec.json out.csv
 """
 import os
+import socket
 import subprocess as sp
 import sys
 import time
@@ -74,6 +75,12 @@ class MercurySockAdapter(MercuryAdapter):
             "SIM_FS": str(FS),
             "SIM_NCH": "1",
             "SIM_BLOCK": "160",
+            # Mercury's protocol timers are virtual but its thread handoffs
+            # are wall-scheduled; unbounded pace (60-175x observed on an M5)
+            # turns milliseconds of scheduling into virtual seconds and blows
+            # its channel guards. 10x keeps handoffs ~two orders below the
+            # ~700 ms guards while still far faster than real time.
+            "SIM_VIRT_MAX_RATIO": os.environ.get("SIM_VIRT_MAX_RATIO", "10"),
         })
 
     # ---- stations: mercury -x sock, audio path via env ----
@@ -88,6 +95,39 @@ class MercurySockAdapter(MercuryAdapter):
                       "-p", str(port), "-b", str(bcast), "-m", "1"],
                      env=env, stdout=open(log, "wb"), stderr=sp.STDOUT)
         self._stations.append(p)
+
+    def link_connect(self, deadline):
+        """The base's connect choreography, re-paced for virtual time.
+
+        Mercury's whole CALL/ACCEPT cycle runs in signal time, which on a fast
+        host steps 10-60x wall -- a failed attempt is over in well under a
+        second of wall time, and the base's wall-clock sleeps (1 s settle, 45 s
+        pump, 3 s between attempts) let tens of virtual seconds of ACCEPT
+        window expire unobserved (observed on the M5: caller exhausted all CALL
+        slots in 0.3 s wall). So: brief sleeps, brief per-attempt pumps, and
+        MORE attempts -- the caller/callee retry interleave is what needs the
+        tries, and tries are nearly free in wall time."""
+        time.sleep(0.3)
+        self.a = socket.create_connection(("127.0.0.1", self.A_PORT)); self.a.setblocking(False)
+        self.b = socket.create_connection(("127.0.0.1", self.B_PORT)); self.b.setblocking(False)
+        self.adat = socket.create_connection(("127.0.0.1", self.A_PORT + 1)); self.adat.setblocking(False)
+        self.bdat = socket.create_connection(("127.0.0.1", self.B_PORT + 1))
+        self.nm = {self.a: "A", self.b: "B"}
+        self.buf = {self.a: b"", self.b: b""}
+        self._snd(self.a, "MYCALL W1ABC"); self._snd(self.b, "MYCALL W2XYZ")
+        self._pump(time.time() + 0.3)
+        self._snd(self.a, "LISTEN ON"); time.sleep(0.2)
+        for attempt in range(1, 13):
+            self._snd(self.b, "CONNECT W2XYZ W1ABC")
+            if self._pump(min(deadline, time.time() + 12),
+                          stop=lambda t: t.startswith("CONNECTED")):
+                return True
+            if time.time() >= deadline:
+                break
+            print(f"  (connect {attempt}/12 failed; retry)", flush=True)
+            self._snd(self.b, "ABORT"); time.sleep(0.5)
+            self._snd(self.a, "LISTEN ON"); time.sleep(0.2)
+        return False
 
     def teardown_stations(self):
         try:

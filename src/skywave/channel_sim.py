@@ -425,6 +425,15 @@ _SUN_PATH_MAX = 108 if sys.platform.startswith("linux") else 104
 # marker; 0 = unbounded (the driver's wall timeout is the hang backstop).
 SIM_CLOCK = (os.environ.get("SIM_CLOCK", "real_time").strip().lower() or "real_time")
 MAX_VIRTUAL_S = float(os.environ.get("SIM_MAX_VIRTUAL_S", "0").strip() or "0")
+# SIM_VIRT_MAX_RATIO: cap the virtual clock at N x wall time (0 = unlimited,
+# the default). For a modem whose protocol timers are virtual but whose
+# internal thread handoffs are wall-scheduled (mercury: cond-waits between the
+# ARQ loop, TX worker, and demod), an unbounded pace amplifies every wall
+# scheduling delay into virtual seconds — at 100x, a 5 ms handoff is half a
+# second of signal time, larger than the modem's own channel guards. Capping
+# keeps wall latencies negligible in virtual terms while still running far
+# faster than real time. Sans-io stations (armstrong) don't need it.
+VIRT_MAX_RATIO = float(os.environ.get("SIM_VIRT_MAX_RATIO", "0").strip() or "0")
 # Virtual now (seconds) for stats in lockstep mode; module-level so write_stats
 # can report it (drivers score virtual goodput off this).
 VIRT_NOW_S = 0.0
@@ -475,19 +484,30 @@ def write_all(fd, buf):
 class PttState:
     """External per-station PTT (SIM_PTT mode): set by the stdin listener from the harness's
     relay of each modem's host PTT ON/OFF, read by `_update_key` as the `active` source in
-    place of the VOX RMS threshold. Bool attr read/write is atomic under the GIL."""
+    place of the VOX RMS threshold. Bool attr read/write is atomic under the GIL.
+
+    inband_a/inband_b: latched once a station reports real in-band PTT on a sock
+    frame. From then on the stdin relay is IGNORED for that station: the relay
+    rides the wall-paced host protocol, so under a fast virtual clock its lines
+    arrive many virtual seconds stale and would fight the block-exact in-band
+    edges (observed: stale re-keys breaking the half-duplex data phase)."""
 
     def __init__(self):
         self.a = False
         self.b = False
+        self.inband_a = False
+        self.inband_b = False
 
 
 def ptt_listener(ptt):
     """Read 'a 1'/'a 0'/'b 1'/'b 0' lines from stdin (written by the harness) and update the
-    shared PttState. Exits on EOF (harness closed the pipe). Run as a daemon thread."""
+    shared PttState. Exits on EOF (harness closed the pipe). Run as a daemon thread.
+    Lines for a station that reports in-band PTT are dropped (see PttState)."""
     for line in sys.stdin:
         p = line.split()
         if len(p) >= 2 and p[0] in ("a", "b"):
+            if getattr(ptt, "inband_" + p[0], False):
+                continue
             setattr(ptt, p[0], p[1] == "1")
 
 
@@ -987,6 +1007,7 @@ class SockLink(Link):
         # shim): leave PttState to the stdin listener, exactly as before.
         if ptt_v != sock_frames.PTT_UNKNOWN and self.ptt is not None:
             setattr(self.ptt, self.src_name, ptt_v == 1)
+            setattr(self.ptt, "inband_" + self.src_name, True)
         return True
 
     def write_block(self):
@@ -1066,9 +1087,17 @@ def run_lockstep(ab, ba, ptt, stop):
     silence = bytes(NBYTES)
     out_a, out_b = silence, silence      # next RX block for each station
     max_v_ms = int(MAX_VIRTUAL_S * 1000) if MAX_VIRTUAL_S > 0 else None
+    wall_t0 = time.monotonic()
     k = 0
     while not stop.is_set():
         vnow_ms = ((k + 1) * BLOCK * 1000) // FS     # block END time, exact
+        # Pace cap (SIM_VIRT_MAX_RATIO): never let signal time run more than
+        # RATIO x wall. Sleeping only ever slows the sim down — determinism
+        # (no starvation, no missed real-time deadline) is unaffected.
+        if VIRT_MAX_RATIO > 0:
+            ahead_s = (vnow_ms / 1000.0) / VIRT_MAX_RATIO - (time.monotonic() - wall_t0)
+            if ahead_s > 0:
+                time.sleep(ahead_s)
         if max_v_ms is not None and vnow_ms > max_v_ms:
             print(f"channel_sim: VIRTUAL-TIMEOUT at {vnow_ms / 1000.0:.1f}s "
                   f"(SIM_MAX_VIRTUAL_S={MAX_VIRTUAL_S:g})", file=sys.stderr, flush=True)
@@ -1095,6 +1124,7 @@ def run_lockstep(ab, ba, ptt, stop):
                 break
             if hdr[1] != sock_frames.PTT_UNKNOWN:
                 setattr(ptt, L.src_name, hdr[1] == 1)
+                setattr(ptt, "inband_" + L.src_name, True)
         if died:
             break
         # Keying for BOTH directions first, then both deliver gates.

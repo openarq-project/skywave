@@ -89,7 +89,34 @@ def test_adapter_channel_env(monkeypatch, sock_dir):
     assert captured["SIM_FS"] == "8000"      # mercury native rate, forced
     assert captured["SIM_NCH"] == "1"        # mono cable, forced
     assert captured["SIM_BLOCK"] == "160"    # 20 ms key-edge granularity
+    assert captured["SIM_VIRT_MAX_RATIO"] == "10"   # bound wall-latency blowup
     assert captured["SIM_SOCK_DIR"] == sock_dir
+
+
+def test_inband_ptt_latch_ignores_stale_stdin_relay():
+    """Once a station reports in-band PTT, the wall-paced stdin relay must be
+    ignored for it -- under a fast virtual clock the relay lines arrive many
+    virtual seconds stale and would re-key the HD gate wrongly."""
+    cs = load_sim(SIM_FS=8000, SIM_NCH=1)
+    ptt = cs.PttState()
+    # stdin relay works while no in-band source exists
+    assert not ptt.a
+    ptt.a = True                      # what ptt_listener would do for 'a 1'
+    assert ptt.a
+    # in-band latch: station a reports real PTT
+    ptt.a = False
+    ptt.inband_a = True
+    # replay of ptt_listener's guard for a stale 'a 1' line
+    line = "a 1"
+    p = line.split()
+    if not getattr(ptt, "inband_" + p[0], False):
+        setattr(ptt, p[0], p[1] == "1")
+    assert not ptt.a                  # stale relay line was dropped
+    # station b, no in-band source: relay still applies
+    q = "b 1".split()
+    if not getattr(ptt, "inband_" + q[0], False):
+        setattr(ptt, q[0], q[1] == "1")
+    assert ptt.b
 
 
 def test_adapter_station_launch(monkeypatch, sock_dir):

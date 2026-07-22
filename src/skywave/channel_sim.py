@@ -23,7 +23,13 @@ flowing on its own clock, exactly as the two pipes did.
 
 Env:
   TXGAIN   transmitter drive (sets the drive level); applied before the PEP clip [1.0]
-  SIGMA    fixed channel noise std (int16 LSBs), added after the peak clip          [0.0]
+  SIGMA    fixed channel noise std (int16 LSBs), added after the peak clip.
+           Specified AT THE REFERENCE CABLE RATE (SIM_SIGMA_REF_FS): the injected
+           per-sample std is scaled by sqrt(FS/REF), keeping the modem-passband
+           noise density -- and so the cell's SNR -- invariant across cable
+           rates. 48 kHz-calibrated cell values stay valid verbatim at any FS. [0.0]
+  SIM_SIGMA_REF_FS  reference rate for the SIGMA semantics above; 0 = disable
+           (SIGMA is then the raw per-sample std at the cable rate)         [48000]
   SEED     base RNG seed; per-direction seeds = SEED+11 (A->B), SEED+22 (B->A)      [1234]
   NP_STATS if set, write per-direction signal stats JSON to <path>.11 / <path>.22
   SIM_BLOCK    pipe block size in frames/channel                                    [1024]
@@ -397,8 +403,25 @@ if NOISE_ENV != "off":
 # distortion effect). NOTE: RF power in watts is NOT a distinct axis in an audio-domain
 # sim — it collapses to SNR (SIGMA); SIM_TXGAIN_* is the transmit AUDIO drive, the
 # nonlinear-distortion axis. SIM_SIGMA_* override the post-noise-env SIGMA absolutely.
-SIGMA_AB = float(os.environ.get("SIM_SIGMA_AB", "").strip() or SIGMA)
-SIGMA_BA = float(os.environ.get("SIM_SIGMA_BA", "").strip() or SIGMA)
+# --- Reference-rate noise semantics (2026-07-22) --------------------------------------
+# SIGMA / SIM_SIGMA_AB/BA are specified at the reference cable rate (SIM_SIGMA_REF_FS,
+# default 48000). White noise is per-sample, so a given sigma packs 6x (7.8 dB) more
+# power into the modem passband at 8 kHz than at 48 kHz; scaling the injected std by
+# sqrt(FS/REF) keeps the IN-BAND density -- and therefore the cell's SNR -- invariant,
+# so every 48 kHz-calibrated cell/profile value is valid verbatim on any cable (e.g.
+# the 8 kHz mercury -x sock rig). It also keeps the documented SNR3k conversion
+# (test_noise_calibration.py) FS-independent: the density shift and the narrower
+# Nyquist band cancel exactly. QRM (INR is sigma-relative) and impulsive noise
+# (sigma-relative) inherit the scale consistently by construction. Set
+# SIM_SIGMA_REF_FS=0 for raw per-sample std at the cable rate.
+SIGMA_REF_FS = float(os.environ.get("SIM_SIGMA_REF_FS", "48000").strip() or "48000")
+SIGMA_SCALE = math.sqrt(FS / SIGMA_REF_FS) if SIGMA_REF_FS > 0 else 1.0
+SIGMA_SPEC = SIGMA                     # as specified (reference-rate units), for the banner
+SIGMA *= SIGMA_SCALE                   # the global is the injected per-sample std (Link default)
+_sab = os.environ.get("SIM_SIGMA_AB", "").strip()
+_sba = os.environ.get("SIM_SIGMA_BA", "").strip()
+SIGMA_AB = float(_sab) * SIGMA_SCALE if _sab else SIGMA
+SIGMA_BA = float(_sba) * SIGMA_SCALE if _sba else SIGMA
 GAIN_A = float(os.environ.get("SIM_TXGAIN_A", "").strip() or GAIN)
 GAIN_B = float(os.environ.get("SIM_TXGAIN_B", "").strip() or GAIN)
 ASYM = (SIGMA_AB != SIGMA_BA) or (GAIN_A != GAIN_B)
@@ -1528,7 +1551,9 @@ def main():
     if SIM_CLOCK == "virt_time":
         transport += f" clock=virt_time(max={MAX_VIRTUAL_S:g}s)"
     _level_desc = (f"gain(A/B)={GAIN_A:g}/{GAIN_B:g} sigma(AB/BA)={SIGMA_AB:g}/{SIGMA_BA:g} ASYM"
-                   if ASYM else f"gain={GAIN:g} sigma={SIGMA:g}")
+                   if ASYM else f"gain={GAIN:g} sigma={SIGMA_SPEC:g}")
+    if SIGMA_SCALE != 1.0:
+        _level_desc += f" (x{SIGMA_SCALE:.3f}@{FS}Hz -> per-sample {SIGMA_AB:g}/{SIGMA_BA:g})"
     _prof_desc = f"profile={_PROFILE_NAME}  " if _PROFILE_NAME else ""
     print(f"channel_sim[gen{RIG_GEN}]: {_prof_desc}transport={transport}  {mode}  {tr}  {chan}  "
           f"block={BLOCK}f/{BLOCK_MS:.1f}ms  {_level_desc}",

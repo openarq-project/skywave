@@ -15,11 +15,13 @@ The cable runs at Mercury's native rate: SIM_FS=8000, SIM_NCH=1 (mono), so no
 resampler on either side. Mercury reports PTT in-band on every station frame
 (block-exact key edges); the stdin PTT relay stays as a harmless second source.
 
-CELL CALIBRATION CAVEAT: SIGMA is a per-sample noise std, so its in-band
-density depends on the cable rate -- at 8 kHz all the noise power lands in
-4 kHz instead of 24 kHz. For the same in-band noise density as a 48 kHz cell,
-scale sigma by sqrt(8/48) ~ 0.408 (e.g. 48 kHz sigma=1000 -> 8 kHz sigma=408).
-Do NOT reuse 48 kHz cell specs verbatim. Determinism scope: the transport and
+CELL CALIBRATION: SIGMA is specified at the 48 kHz reference rate and
+channel_sim auto-scales the injected per-sample std by sqrt(FS/48000)
+(SIM_SIGMA_REF_FS, default 48000), so the in-band noise density -- the cell's
+SNR -- is rate-invariant: reuse 48 kHz cell specs verbatim. Set
+SIM_SIGMA_REF_FS=0 only if you deliberately want raw per-sample sigma at
+8 kHz (each unit is then ~2.45x the 48 kHz in-band effect).
+Determinism scope: the transport and
 all ARQ timing are virtual (no real-time pacing, no starvation flake), but
 Mercury's internal thread interleavings still vary run-to-run, so results are
 stable, not bit-identical.

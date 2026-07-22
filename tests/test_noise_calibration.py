@@ -41,6 +41,56 @@ def test_noise_is_white_3k_band_fraction():
     assert abs(frac - 3000.0 / 24000.0) < 0.01, f"3k band fraction {frac:.4f}"
 
 
+def test_sigma_ref_rate_identity_at_48k():
+    """At the reference rate the scale is exactly 1: every existing 48 kHz cell
+    is byte-identical under the reference-rate semantics."""
+    cs = load_sim(SIGMA=1200)
+    assert cs.SIGMA_SCALE == 1.0
+    assert cs.SIGMA_AB == 1200.0 and cs.SIGMA_BA == 1200.0
+
+
+def test_sigma_ref_rate_scales_at_8k():
+    """SIGMA is specified at 48 kHz; the injected per-sample std at 8 kHz is
+    sigma*sqrt(8/48), keeping in-band noise density (cell SNR) rate-invariant."""
+    cs = load_sim(SIGMA=1000, SIM_FS=8000, SIM_NCH=1)
+    assert abs(cs.SIGMA_SCALE - math.sqrt(8000 / 48000)) < 1e-12
+    assert abs(cs.SIGMA_AB - 1000 * math.sqrt(8000 / 48000)) < 1e-9
+    # measured through the full Link chain
+    link = make_link(cs)
+    zeros = np.zeros(cs.NSAMP, dtype="<i2")
+    buf = [feed(link, zeros).astype(np.float64) for _ in range(400)]
+    y = np.concatenate(buf)
+    assert abs(y.std() / cs.SIGMA_AB - 1.0) < 0.02, f"noise std {y.std():.1f}"
+
+
+def test_sigma_ref_rate_in_band_density_invariant():
+    """The actual guarantee: the same SIGMA yields the same noise power per Hz
+    in the modem band (500-2500 Hz) at 48 kHz and at 8 kHz."""
+    def band_density(cs):
+        link = make_link(cs)
+        zeros = np.zeros(cs.NSAMP, dtype="<i2")
+        buf = [feed(link, zeros)[0::cs.NCH].astype(np.float64) for _ in range(400)]
+        y = np.concatenate(buf)
+        Y = np.abs(np.fft.rfft(y)) ** 2
+        f = np.fft.rfftfreq(len(y), 1.0 / cs.FS)
+        m = (f >= 500.0) & (f <= 2500.0)
+        return Y[m].sum() / len(y) / 2000.0          # power per Hz in band
+    d48 = band_density(load_sim(SIGMA=2000))
+    d8 = band_density(load_sim(SIGMA=2000, SIM_FS=8000, SIM_NCH=1))
+    ratio_db = 10 * math.log10(d8 / d48)
+    assert abs(ratio_db) < 0.3, f"in-band density differs by {ratio_db:.2f} dB"
+
+
+def test_sigma_ref_rate_disable_and_per_direction_override():
+    """SIM_SIGMA_REF_FS=0 restores raw per-sample sigma; SIM_SIGMA_AB/BA
+    overrides carry the same reference-rate semantics as SIGMA."""
+    cs = load_sim(SIGMA=1000, SIM_FS=8000, SIM_NCH=1, SIM_SIGMA_REF_FS=0)
+    assert cs.SIGMA_SCALE == 1.0 and cs.SIGMA_AB == 1000.0
+    cs = load_sim(SIGMA=1000, SIM_FS=8000, SIM_NCH=1, SIM_SIGMA_AB=600)
+    assert abs(cs.SIGMA_AB - 600 * math.sqrt(8000 / 48000)) < 1e-9
+    assert abs(cs.SIGMA_BA - 1000 * math.sqrt(8000 / 48000)) < 1e-9
+
+
 def test_deterministic_given_seed():
     """Same SEED => byte-identical channel output (paired-arm reproducibility)."""
     outs = []

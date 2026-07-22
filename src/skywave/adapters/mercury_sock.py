@@ -96,6 +96,18 @@ class MercurySockAdapter(MercuryAdapter):
                      env=env, stdout=open(log, "wb"), stderr=sp.STDOUT)
         self._stations.append(p)
 
+    def bench_time(self):
+        """SIGNAL time from the sim's status file (<sockdir>/virt_now_ms), so
+        `seconds`/`goodput` are real-time equivalent regardless of the virtual
+        pace: a 10x-capped run and a 1x run report the same goodput. The file
+        exists long before the transfer starts (the sim writes it every 500 ms
+        of signal time from block 0); wall clock is only a startup fallback."""
+        try:
+            with open(os.path.join(self.sockdir, "virt_now_ms")) as f:
+                return int(f.read()) / 1000.0
+        except (OSError, ValueError):
+            return time.time()
+
     def link_connect(self, deadline):
         """The base's connect choreography, re-paced for virtual time.
 

@@ -141,6 +141,19 @@ def test_adapter_station_launch(monkeypatch, sock_dir):
     assert len(ad._stations) == 2
 
 
+def test_bench_time_reads_signal_time(monkeypatch, sock_dir):
+    """bench_time() returns the sim's published signal time, so reported
+    seconds/goodput are real-time equivalent at any virtual pace; wall clock
+    only as a fallback before the status file exists."""
+    import time
+    ad = _mk_adapter(monkeypatch, sock_dir)
+    w0 = time.time()
+    assert abs(ad.bench_time() - w0) < 2.0          # no file yet: wall fallback
+    with open(os.path.join(sock_dir, "virt_now_ms"), "w") as f:
+        f.write("73500")
+    assert ad.bench_time() == 73.5                  # signal seconds, not wall
+
+
 def test_adapter_registered():
     from skywave import sweep_runner
     entry = sweep_runner.BUILTIN_ADAPTERS["mercury_sock"]

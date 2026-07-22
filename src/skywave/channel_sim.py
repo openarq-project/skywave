@@ -1088,6 +1088,12 @@ def run_lockstep(ab, ba, ptt, stop):
     out_a, out_b = silence, silence      # next RX block for each station
     max_v_ms = int(MAX_VIRTUAL_S * 1000) if MAX_VIRTUAL_S > 0 else None
     wall_t0 = time.monotonic()
+    # Signal-time status file: <SIM_SOCK_DIR>/virt_now_ms, refreshed every
+    # ~500 ms of virtual time (atomic rename). Harnesses read it to time
+    # transfers in SIGNAL seconds, so goodput is pace-invariant (real-time
+    # equivalent) instead of silently scaling with the virtual pace.
+    virt_status = os.path.join(SOCK_DIR, "virt_now_ms")
+    last_status_ms = -10**9
     k = 0
     while not stop.is_set():
         vnow_ms = ((k + 1) * BLOCK * 1000) // FS     # block END time, exact
@@ -1098,6 +1104,14 @@ def run_lockstep(ab, ba, ptt, stop):
             ahead_s = (vnow_ms / 1000.0) / VIRT_MAX_RATIO - (time.monotonic() - wall_t0)
             if ahead_s > 0:
                 time.sleep(ahead_s)
+        if vnow_ms - last_status_ms >= 500:
+            try:
+                with open(virt_status + ".tmp", "w") as f:
+                    f.write(str(vnow_ms))
+                os.replace(virt_status + ".tmp", virt_status)
+                last_status_ms = vnow_ms
+            except OSError:
+                pass                     # status is best-effort, never fatal
         if max_v_ms is not None and vnow_ms > max_v_ms:
             print(f"channel_sim: VIRTUAL-TIMEOUT at {vnow_ms / 1000.0:.1f}s "
                   f"(SIM_MAX_VIRTUAL_S={MAX_VIRTUAL_S:g})", file=sys.stderr, flush=True)

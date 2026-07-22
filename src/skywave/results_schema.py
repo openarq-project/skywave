@@ -23,6 +23,10 @@ integer -- record the change in the changelog below.
 
   results-schema/1 (2026-07-20): initial versioned contract. The 20-column row
     sweep_runner has emitted since the external-adapter registry work.
+  results-schema/1 + connect_s (2026-07-21): trailing column `connect_s` appended --
+    wall-clock seconds spent in link_connect (blank when the adapter did not report
+    it, e.g. a fail_connect row or a pre-connect_s adapter). Append = no bump per
+    the policy above; readers detect presence via the manifest's column list.
 """
 import csv
 import json
@@ -37,6 +41,7 @@ COLUMNS = [
     "watterson", "payload", "rep",
     "got", "total", "intact", "goodput", "peak_bps", "sn_med",
     "elapsed", "status", "rc", "log", "rig_gen",
+    "connect_s",
 ]
 
 # Per-column caster for the READER side (read_corpus). Everything is stored as text in
@@ -47,7 +52,7 @@ COLUMN_TYPES = {
     "txgain": float, "watterson": str, "payload": int, "rep": int,
     "got": int, "total": int, "intact": str, "goodput": float, "peak_bps": int,
     "sn_med": float, "elapsed": float, "status": str, "rc": int, "log": str,
-    "rig_gen": int,
+    "rig_gen": int, "connect_s": float,
 }
 
 

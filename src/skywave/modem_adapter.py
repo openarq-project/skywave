@@ -96,12 +96,19 @@ class AdapterResult:
     goodput: float
     peak_bitrate: int = 0
     sn_med: float = -99.0
+    # Wall-clock spent in link_connect() (handshake incl. its retries). `seconds` starts
+    # AFTER the link is up, so without this the corpus cannot show connect robustness --
+    # a headline separator between modems. -1.0 = not measured (a hand-rolled adapter
+    # that predates the field); the base class always fills it.
+    connect_s: float = -1.0
 
     def result_line(self) -> str:
         # EXACT tokens sweep_runner's RES_* regexes match; do not reorder/rename casually.
+        # Tokens are append-only: connect= was added 2026-07-21 (older parsers skip it).
         return (f"RESULT: {self.got}/{self.total} B in {self.seconds:.1f}s "
                 f"intact={self.intact} goodput={self.goodput:.1f} B/s "
-                f"| peak_bitrate={self.peak_bitrate}bps | SN_med={self.sn_med:.1f}")
+                f"| peak_bitrate={self.peak_bitrate}bps | SN_med={self.sn_med:.1f} "
+                f"| connect={self.connect_s:.1f}s")
 
     def as_dict(self) -> dict:
         d = {"schema": RESULT_SCHEMA}
@@ -213,9 +220,11 @@ class ModemAdapter(abc.ABC):
             if not self.wait_ready(time.time() + self.ready_timeout_s):
                 self.fail_connect("stations not listening")
                 return 1
+            tc0 = time.time()
             if not self.link_connect(time.time() + self.connect_timeout_s):
                 self.fail_connect(f"no CONNECT sigma={cfg.sigma}")
                 return 1
+            connect_s = round(time.time() - tc0, 1)
             payload = self.make_payload()
             t0 = time.time()
             recv = bytes(self.transfer(payload, t0 + cfg.timeout_s))
@@ -224,7 +233,7 @@ class ModemAdapter(abc.ABC):
             intact = recv[:cfg.payload_bytes] == payload
             goodput = got / dt if dt > 0 else 0.0
             res = AdapterResult(got, cfg.payload_bytes, dt, intact, goodput,
-                                self.peak_bitrate(), self.sn_med())
+                                self.peak_bitrate(), self.sn_med(), connect_s)
             print(res.result_line(), flush=True)
             print("RESULT_JSON " + json.dumps(res.as_dict()), flush=True)
             return 0 if (got >= cfg.payload_bytes and intact) else 2

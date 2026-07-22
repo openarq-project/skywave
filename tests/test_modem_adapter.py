@@ -33,6 +33,7 @@ def _parse_like_sweep_runner(txt):
     assert m, "no RESULT token in adapter output"
     seg = txt[m.start():m.start() + 400]
     got, tot = sweep_runner.RES_BYTES.search(seg).groups()
+    mc = sweep_runner.RES_CONN.search(seg)
     return {
         "got": int(got), "total": int(tot),
         "in_s": float(sweep_runner.RES_IN.search(seg).group(1)),
@@ -40,6 +41,7 @@ def _parse_like_sweep_runner(txt):
         "goodput": float(sweep_runner.RES_GP.search(seg).group(1)),
         "peak": int(sweep_runner.RES_PEAK.search(seg).group(1)),
         "sn": float(sweep_runner.RES_SN.search(seg).group(1)),
+        "connect": float(mc.group(1)) if mc else None,
     }
 
 
@@ -68,6 +70,7 @@ def test_result_line_round_trips_through_sweep_runner():
     assert p["got"] == 4096 and p["total"] == 4096
     assert p["intact"].lower() in ("true", "1")           # sweep_runner's ok test
     assert p["goodput"] > 0 and p["peak"] == 600 and p["sn"] == 12.0
+    assert p["connect"] is not None and p["connect"] >= 0.0   # base timed link_connect
     assert rc == 0                                          # base: intact -> exit 0
 
 
@@ -78,7 +81,8 @@ def test_result_json_forward_contract():
     assert d["schema"] == "modem-adapter-result/1"
     assert d["got"] == 2048 and d["total"] == 2048 and d["intact"] is True
     assert set(d) >= {"schema", "got", "total", "seconds", "intact", "goodput",
-                      "peak_bitrate", "sn_med"}
+                      "peak_bitrate", "sn_med", "connect_s"}
+    assert d["connect_s"] >= 0.0
 
 
 def test_partial_transfer_classifies_partial():
@@ -114,6 +118,16 @@ def test_seeded_payload_deterministic():
 def test_result_line_exact_format():
     """Guard the literal token grammar the framework depends on."""
     line = AdapterResult(got=100, total=100, seconds=2.5, intact=True,
-                         goodput=40.0, peak_bitrate=600, sn_med=12.0).result_line()
+                         goodput=40.0, peak_bitrate=600, sn_med=12.0,
+                         connect_s=3.2).result_line()
     assert line == ("RESULT: 100/100 B in 2.5s intact=True goodput=40.0 B/s "
-                    "| peak_bitrate=600bps | SN_med=12.0")
+                    "| peak_bitrate=600bps | SN_med=12.0 | connect=3.2s")
+
+
+def test_result_line_unmeasured_connect_not_parsed():
+    """A hand-rolled adapter that predates connect_s emits -1.0; run_cell must leave the
+    connect_s column blank (RES_CONN never matches a negative — the sentinel token is
+    `connect=-1.0s` and the regex requires the number to start with a digit)."""
+    line = AdapterResult(got=1, total=1, seconds=1.0, intact=True, goodput=1.0).result_line()
+    assert "connect=-1.0s" in line
+    assert sweep_runner.RES_CONN.search(line) is None

@@ -13,6 +13,15 @@ and fade realizations). An optional per-modem level calibration
 1.0. The per-row snr3k comes from the sim's measured act_rms (NP_STATS), falling back to a
 gain-scaled nominal.
 
+Cell spec (<cells.json>): a JSON array of cells. Fields per cell: "sigma" (required),
+"watterson" (preset name, default "off"), "payload" (bytes, default 4096), "timeout"
+(transfer deadline s, default 120), "reps" (default 1), "fade_delay_ms"+"fade_doppler_hz"
+(custom fade pair overriding the preset), "env" ({SIM_* only} extra channel knobs --
+asymmetric SIM_SIGMA_AB/BA, SIM_TR_JITTER_MS, SIM_QRM_*, a SIM_TR_UNKEY_MS override, ...;
+non-SIM_ keys are rejected at load so a spec can't override runner-owned SEED/TXGAIN),
+and "label" (short name folded into the log/npstats basename so cells differing only by
+"env" don't clobber each other's artifacts).
+
 Usage: skywave-sweep <modem> <cells.json> <out.csv> [tag]
        skywave-sweep --calibrate-pep <modem> [target_dbfs] [payload] [timeout]
          (measure the modem's clean TX peak and write results/<modem>_txgain.txt so it
@@ -130,6 +139,7 @@ RES_INTACT= re.compile(r"intact=(\w+)")
 RES_GP    = re.compile(r"goodput=([\d.]+)")
 RES_PEAK  = re.compile(r"peak_bitrate=(\d+)")
 RES_SN    = re.compile(r"SN_med=(-?[\d.]+)")
+RES_CONN  = re.compile(r"connect=([\d.]+)s")
 
 
 def snr3k_nominal(sigma, gain=1.0):
@@ -277,11 +287,21 @@ def run_cell(modem, cell, rep, writer, fcsv, tag):
     if "fade_doppler_hz" in cell:
         env["SIM_FADE_DOPPLER_HZ"] = str(cell["fade_doppler_hz"])
     env["SEED"] = str(1234 + rep * 7)
+    # Per-cell channel env (SIM_* only; validated in main): impairments beyond the
+    # first-class fields -- asymmetric SIM_SIGMA_AB/BA, SIM_TR_JITTER_MS, SIM_QRM_*,
+    # a SIM_TR_UNKEY_MS override, ... Applied AFTER the runner defaults (so a cell
+    # may override them) and BEFORE the adapter's extra_env (which stays last).
+    env.update({k: str(v) for k, v in cell.get("env", {}).items()})
     # equal-PEP drive unless the launcher pinned TXGAIN itself (campaign_pep
     # does) or EQUAL_GAIN=1 requests the historical baseline.
     if "TXGAIN" not in os.environ:
         env["TXGAIN"] = modem_txgain(modem)
-    base = f"{tag}_{modem}_s{sigma}_{watt}_p{payload}_r{rep}"
+    # Optional cell label, folded into the log/npstats basename: two cells that differ
+    # only by `env` (e.g. moderate s4000 with and without T/R jitter) would otherwise
+    # write the SAME files and silently clobber each other's logs and stats.
+    label = re.sub(r"[^A-Za-z0-9._-]", "", str(cell.get("label", "")))
+    base = f"{tag}_{modem}_" + (f"{label}_" if label else "") + \
+           f"s{sigma}_{watt}_p{payload}_r{rep}"
     log = os.path.join(LOGDIR, base + ".log")
     # Signal stats always on: the measured act_rms feeds the per-row snr3k.
     npstats = (os.path.join(os.environ["NP_STATS_DIR"], f"{modem}_s{sigma}_r{rep}")
@@ -300,6 +320,7 @@ def run_cell(modem, cell, rep, writer, fcsv, tag):
         el = round(time.time() - t0, 1)
         txt = open(log, errors="replace").read()
         got = tot = 0; dt = el; intact = "false"; gp = 0.0; peak = 0; sn = -99.0
+        conn = ""    # blank = not reported (fail_connect row, or a pre-connect_s adapter)
         mres = re.search(r"\bRESULT\b", txt)
         if mres:
             seg = txt[mres.start():mres.start() + 400]
@@ -310,6 +331,9 @@ def run_cell(modem, cell, rep, writer, fcsv, tag):
             mg = RES_GP.search(seg);     gp = float(mg.group(1)) if mg else 0.0
             mp = RES_PEAK.search(seg);   peak = int(mp.group(1)) if mp else 0
             ms = RES_SN.search(seg);     sn = float(ms.group(1)) if ms else -99.0
+            mc = RES_CONN.search(seg)
+            if mc and float(mc.group(1)) >= 0:
+                conn = float(mc.group(1))
             if got >= (tot or payload) and intact.lower() in ("true", "1"):
                 status = "ok"
             elif got > 0:
@@ -341,9 +365,11 @@ def run_cell(modem, cell, rep, writer, fcsv, tag):
            "got": got, "total": tot or payload, "intact": intact,
            "goodput": round(gp, 2), "peak_bps": peak, "sn_med": sn,
            "elapsed": el, "status": status, "rc": p.returncode,
-           "log": os.path.basename(log), "rig_gen": RIG_GEN}
+           "log": os.path.basename(log), "rig_gen": RIG_GEN,
+           "connect_s": conn}
     writer.writerow(row); fcsv.flush()
-    print(f"[{modem}] s={sigma}({row['snr3k']}dB) {watt} p={payload} r{rep}: "
+    lbl = f" [{label}]" if label else ""
+    print(f"[{modem}]{lbl} s={sigma}({row['snr3k']}dB) {watt} p={payload} r{rep}: "
           f"{status:12} gp={gp:6.1f} B/s  ({el:.0f}s)", flush=True)
     return row
 
@@ -377,6 +403,17 @@ def main():
               f"run `sweep_runner.py --calibrate-pep {modem}` for a fair cross-modem comparison",
               flush=True)
     cells = json.load(open(spec))
+    # Fail fast on a malformed spec BEFORE any cell runs -- a bad env key surfacing at
+    # cell 40 of an overnight campaign wastes the night. Cell env is restricted to
+    # SIM_* so a spec cannot silently override provenance-critical vars (SEED, TXGAIN,
+    # NP_STATS); those stay owned by the runner.
+    for idx, c in enumerate(cells):
+        if "sigma" not in c:
+            raise SystemExit(f"sweep_runner: cell {idx} in {spec} missing 'sigma'")
+        bad = [k for k in c.get("env", {}) if not k.startswith("SIM_")]
+        if bad:
+            raise SystemExit(f"sweep_runner: cell {idx} in {spec}: env keys must start "
+                             f"with SIM_ (got {', '.join(bad)})")
     # Column order is owned by results_schema (the versioned corpus contract, B4) so a
     # rename can't silently desync the writer from downstream readers.
     cols = COLUMNS

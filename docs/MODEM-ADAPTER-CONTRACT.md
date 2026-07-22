@@ -70,18 +70,21 @@ relays PTT to the channel (`bench_pipes.fwd_ptt`) and scans telemetry. `station`
 chars applies these regexes (do not reorder/rename the tokens casually):
 
 ```
-RESULT: <got>/<total> B in <secs>s intact=<bool> goodput=<B/s> B/s | peak_bitrate=<bps>bps | SN_med=<dB>
-        └RES_BYTES┘        └RES_IN┘ └─RES_INTACT─┘ └───RES_GP───┘      └──RES_PEAK──┘        └RES_SN┘
+RESULT: <got>/<total> B in <secs>s intact=<bool> goodput=<B/s> B/s | peak_bitrate=<bps>bps | SN_med=<dB> | connect=<secs>s
+        └RES_BYTES┘        └RES_IN┘ └─RES_INTACT─┘ └───RES_GP───┘      └──RES_PEAK──┘        └RES_SN┘     └─RES_CONN──┘
 ```
 
-`AdapterResult.result_line()` produces exactly this. Classification (sweep_runner):
-`got≥total and intact` → **ok**; `got>0` → **partial**; else → **fail**. A connect failure
-prints the **`NOCONN`** token (via `fail_connect()`) and writes no RESULT → **fail_connect**
-(sweep_runner retries it once).
+`AdapterResult.result_line()` produces exactly this. Tokens are append-only; `connect=`
+(wall-clock spent in `link_connect`, timed by the base class) was appended 2026-07-21 and
+feeds the corpus `connect_s` column — `-1.0` (unmeasured, from a pre-`connect_s` adapter)
+deliberately fails the RES_CONN parse and leaves the column blank. Classification
+(sweep_runner): `got≥total and intact` → **ok**; `got>0` → **partial**; else → **fail**.
+A connect failure prints the **`NOCONN`** token (via `fail_connect()`) and writes no
+RESULT → **fail_connect** (sweep_runner retries it once).
 
 **Structured forward contract** — `RESULT_JSON {…}`, schema `modem-adapter-result/1`:
-`{schema, got, total, seconds, intact, goodput, peak_bitrate, sn_med}`. Downstream tooling
-should prefer this; the RESULT line stays for the current parser.
+`{schema, got, total, seconds, intact, goodput, peak_bitrate, sn_med, connect_s}`.
+Downstream tooling should prefer this; the RESULT line stays for the current parser.
 
 **Exit code**: `0` intact delivery · `2` partial/failed transfer · `1` connect failure.
 

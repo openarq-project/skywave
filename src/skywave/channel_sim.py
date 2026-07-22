@@ -27,6 +27,11 @@ Env:
   SEED     base RNG seed; per-direction seeds = SEED+11 (A->B), SEED+22 (B->A)      [1234]
   NP_STATS if set, write per-direction signal stats JSON to <path>.11 / <path>.22
   SIM_BLOCK    pipe block size in frames/channel                                    [1024]
+  SIM_FS       cable sample rate in Hz. 48000 (default) is the validated soundcard
+               rate; 8000 runs the cable at a modem's native rate for device-free
+               sock transports (e.g. mercury -x sock, 8 kHz mono, no resampler).
+               All channel physics (rig BPF, Watterson, rig effects, noise BW,
+               link delay) re-derive from FS.                                      [48000]
   SIM_VERBOSE  if "1", print per-direction block-time health (p99/worst) on exit
 
 The block loop is allocation-free in the core path incl. link delay + QRM (preallocated numpy buffers, rng.standard_normal(out=)); the optional fx AGC/skew/BPF process() internals still allocate per block (SIM_VERBOSE p99/worst block-time is the canary)
@@ -71,7 +76,8 @@ try:
 except ImportError:  # run outside the skywave source dir
     RIG_GEN = -1
 
-FS = 48000
+# FS is read below, AFTER the profiles apply (so a channel/transport profile can
+# set SIM_FS like any other SIM_* knob).
 # SIM_PROFILE=<file.toml|.json> pre-populates the SIM_* channel knobs
 # from a declarative channel_profile BEFORE the reads below. setdefault semantics: any
 # SIM_* already in the environment (campaign/operator) OVERRIDES the profile (explicit env wins).
@@ -83,6 +89,11 @@ _PROFILE_NAME = _channel_profile.apply_to_environ()
 # semantics (explicit env wins). Portable, aloop-free selection in one shareable file.
 from skywave import transport_profile as _transport_profile
 _TRANSPORT_PROFILE_NAME = _transport_profile.apply_to_environ()
+# Cable sample rate. 48 kHz is the validated soundcard default; SIM_FS=8000 runs
+# the cable at a modem's native rate for device-free sock transports (see the
+# module docstring). Everything downstream (rig BPF, Watterson, rig effects,
+# noise, link delay, virtual time) derives from FS.
+FS = int(os.environ.get("SIM_FS", "48000").strip() or "48000")
 # Cable channel count. Default 2 (the validated setup for VARA/Mercury/ARDOP,
 # which open via plughw and adapt). FreeDATA opens the RAW snd-aloop hw device at mono and
 # cannot adapt, so its harness sets SIM_NCH=1 (a mono cable matches FreeDATA's native mono

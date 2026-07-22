@@ -27,6 +27,11 @@ Env:
   SEED     base RNG seed; per-direction seeds = SEED+11 (A->B), SEED+22 (B->A)      [1234]
   NP_STATS if set, write per-direction signal stats JSON to <path>.11 / <path>.22
   SIM_BLOCK    pipe block size in frames/channel                                    [1024]
+  SIM_FS       cable sample rate in Hz. 48000 (default) is the validated soundcard
+               rate; 8000 runs the cable at a modem's native rate for device-free
+               sock transports (e.g. mercury -x sock, 8 kHz mono, no resampler).
+               All channel physics (rig BPF, Watterson, rig effects, noise BW,
+               link delay) re-derive from FS.                                      [48000]
   SIM_VERBOSE  if "1", print per-direction block-time health (p99/worst) on exit
 
 The block loop is allocation-free in the core path incl. link delay + QRM (preallocated numpy buffers, rng.standard_normal(out=)); the optional fx AGC/skew/BPF process() internals still allocate per block (SIM_VERBOSE p99/worst block-time is the canary)
@@ -71,7 +76,8 @@ try:
 except ImportError:  # run outside the skywave source dir
     RIG_GEN = -1
 
-FS = 48000
+# FS is read below, AFTER the profiles apply (so a channel/transport profile can
+# set SIM_FS like any other SIM_* knob).
 # SIM_PROFILE=<file.toml|.json> pre-populates the SIM_* channel knobs
 # from a declarative channel_profile BEFORE the reads below. setdefault semantics: any
 # SIM_* already in the environment (campaign/operator) OVERRIDES the profile (explicit env wins).
@@ -83,6 +89,11 @@ _PROFILE_NAME = _channel_profile.apply_to_environ()
 # semantics (explicit env wins). Portable, aloop-free selection in one shareable file.
 from skywave import transport_profile as _transport_profile
 _TRANSPORT_PROFILE_NAME = _transport_profile.apply_to_environ()
+# Cable sample rate. 48 kHz is the validated soundcard default; SIM_FS=8000 runs
+# the cable at a modem's native rate for device-free sock transports (see the
+# module docstring). Everything downstream (rig BPF, Watterson, rig effects,
+# noise, link delay, virtual time) derives from FS.
+FS = int(os.environ.get("SIM_FS", "48000").strip() or "48000")
 # Cable channel count. Default 2 (the validated setup for VARA/Mercury/ARDOP,
 # which open via plughw and adapt). FreeDATA opens the RAW snd-aloop hw device at mono and
 # cannot adapt, so its harness sets SIM_NCH=1 (a mono cable matches FreeDATA's native mono
@@ -414,6 +425,15 @@ _SUN_PATH_MAX = 108 if sys.platform.startswith("linux") else 104
 # marker; 0 = unbounded (the driver's wall timeout is the hang backstop).
 SIM_CLOCK = (os.environ.get("SIM_CLOCK", "real_time").strip().lower() or "real_time")
 MAX_VIRTUAL_S = float(os.environ.get("SIM_MAX_VIRTUAL_S", "0").strip() or "0")
+# SIM_VIRT_MAX_RATIO: cap the virtual clock at N x wall time (0 = unlimited,
+# the default). For a modem whose protocol timers are virtual but whose
+# internal thread handoffs are wall-scheduled (mercury: cond-waits between the
+# ARQ loop, TX worker, and demod), an unbounded pace amplifies every wall
+# scheduling delay into virtual seconds — at 100x, a 5 ms handoff is half a
+# second of signal time, larger than the modem's own channel guards. Capping
+# keeps wall latencies negligible in virtual terms while still running far
+# faster than real time. Sans-io stations (armstrong) don't need it.
+VIRT_MAX_RATIO = float(os.environ.get("SIM_VIRT_MAX_RATIO", "0").strip() or "0")
 # Virtual now (seconds) for stats in lockstep mode; module-level so write_stats
 # can report it (drivers score virtual goodput off this).
 VIRT_NOW_S = 0.0
@@ -464,19 +484,30 @@ def write_all(fd, buf):
 class PttState:
     """External per-station PTT (SIM_PTT mode): set by the stdin listener from the harness's
     relay of each modem's host PTT ON/OFF, read by `_update_key` as the `active` source in
-    place of the VOX RMS threshold. Bool attr read/write is atomic under the GIL."""
+    place of the VOX RMS threshold. Bool attr read/write is atomic under the GIL.
+
+    inband_a/inband_b: latched once a station reports real in-band PTT on a sock
+    frame. From then on the stdin relay is IGNORED for that station: the relay
+    rides the wall-paced host protocol, so under a fast virtual clock its lines
+    arrive many virtual seconds stale and would fight the block-exact in-band
+    edges (observed: stale re-keys breaking the half-duplex data phase)."""
 
     def __init__(self):
         self.a = False
         self.b = False
+        self.inband_a = False
+        self.inband_b = False
 
 
 def ptt_listener(ptt):
     """Read 'a 1'/'a 0'/'b 1'/'b 0' lines from stdin (written by the harness) and update the
-    shared PttState. Exits on EOF (harness closed the pipe). Run as a daemon thread."""
+    shared PttState. Exits on EOF (harness closed the pipe). Run as a daemon thread.
+    Lines for a station that reports in-band PTT are dropped (see PttState)."""
     for line in sys.stdin:
         p = line.split()
         if len(p) >= 2 and p[0] in ("a", "b"):
+            if getattr(ptt, "inband_" + p[0], False):
+                continue
             setattr(ptt, p[0], p[1] == "1")
 
 
@@ -976,6 +1007,7 @@ class SockLink(Link):
         # shim): leave PttState to the stdin listener, exactly as before.
         if ptt_v != sock_frames.PTT_UNKNOWN and self.ptt is not None:
             setattr(self.ptt, self.src_name, ptt_v == 1)
+            setattr(self.ptt, "inband_" + self.src_name, True)
         return True
 
     def write_block(self):
@@ -1055,9 +1087,31 @@ def run_lockstep(ab, ba, ptt, stop):
     silence = bytes(NBYTES)
     out_a, out_b = silence, silence      # next RX block for each station
     max_v_ms = int(MAX_VIRTUAL_S * 1000) if MAX_VIRTUAL_S > 0 else None
+    wall_t0 = time.monotonic()
+    # Signal-time status file: <SIM_SOCK_DIR>/virt_now_ms, refreshed every
+    # ~500 ms of virtual time (atomic rename). Harnesses read it to time
+    # transfers in SIGNAL seconds, so goodput is pace-invariant (real-time
+    # equivalent) instead of silently scaling with the virtual pace.
+    virt_status = os.path.join(SOCK_DIR, "virt_now_ms")
+    last_status_ms = -10**9
     k = 0
     while not stop.is_set():
         vnow_ms = ((k + 1) * BLOCK * 1000) // FS     # block END time, exact
+        # Pace cap (SIM_VIRT_MAX_RATIO): never let signal time run more than
+        # RATIO x wall. Sleeping only ever slows the sim down — determinism
+        # (no starvation, no missed real-time deadline) is unaffected.
+        if VIRT_MAX_RATIO > 0:
+            ahead_s = (vnow_ms / 1000.0) / VIRT_MAX_RATIO - (time.monotonic() - wall_t0)
+            if ahead_s > 0:
+                time.sleep(ahead_s)
+        if vnow_ms - last_status_ms >= 500:
+            try:
+                with open(virt_status + ".tmp", "w") as f:
+                    f.write(str(vnow_ms))
+                os.replace(virt_status + ".tmp", virt_status)
+                last_status_ms = vnow_ms
+            except OSError:
+                pass                     # status is best-effort, never fatal
         if max_v_ms is not None and vnow_ms > max_v_ms:
             print(f"channel_sim: VIRTUAL-TIMEOUT at {vnow_ms / 1000.0:.1f}s "
                   f"(SIM_MAX_VIRTUAL_S={MAX_VIRTUAL_S:g})", file=sys.stderr, flush=True)
@@ -1084,6 +1138,7 @@ def run_lockstep(ab, ba, ptt, stop):
                 break
             if hdr[1] != sock_frames.PTT_UNKNOWN:
                 setattr(ptt, L.src_name, hdr[1] == 1)
+                setattr(ptt, "inband_" + L.src_name, True)
         if died:
             break
         # Keying for BOTH directions first, then both deliver gates.

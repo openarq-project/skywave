@@ -196,6 +196,14 @@ class ModemAdapter(abc.ABC):
         bytes). Real adapters may override (e.g. os.urandom for a non-reproducible run)."""
         return np.random.default_rng(self.cfg.seed).bytes(self.cfg.payload_bytes)
 
+    def bench_time(self) -> float:
+        """The timeline `seconds`/`goodput` are measured on (seconds). Default: wall
+        clock, correct for every real-time transport. Virtual-clock adapters override
+        to return SIGNAL time, so the reported numbers are real-time equivalent
+        (pace-invariant): a 10x-paced run and a 1x run of the same link report the
+        same goodput. Only differences of this value are used, never absolutes."""
+        return time.time()
+
     def fail_connect(self, msg: str = ""):
         """Emit the token sweep_runner classifies as `fail_connect` (transient, one retry)."""
         print(f"NOCONN {msg}".strip(), flush=True)
@@ -227,8 +235,9 @@ class ModemAdapter(abc.ABC):
             connect_s = round(time.time() - tc0, 1)
             payload = self.make_payload()
             t0 = time.time()
+            b0 = self.bench_time()
             recv = bytes(self.transfer(payload, t0 + cfg.timeout_s))
-            dt = time.time() - t0
+            dt = self.bench_time() - b0
             got = len(recv)
             intact = recv[:cfg.payload_bytes] == payload
             goodput = got / dt if dt > 0 else 0.0

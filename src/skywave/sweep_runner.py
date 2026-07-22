@@ -366,7 +366,7 @@ def run_cell(modem, cell, rep, writer, fcsv, tag):
            "goodput": round(gp, 2), "peak_bps": peak, "sn_med": sn,
            "elapsed": el, "status": status, "rc": p.returncode,
            "log": os.path.basename(log), "rig_gen": RIG_GEN,
-           "connect_s": conn}
+           "connect_s": conn, "label": label}
     writer.writerow(row); fcsv.flush()
     lbl = f" [{label}]" if label else ""
     print(f"[{modem}]{lbl} s={sigma}({row['snr3k']}dB) {watt} p={payload} r{rep}: "

@@ -27,6 +27,11 @@ integer -- record the change in the changelog below.
     wall-clock seconds spent in link_connect (blank when the adapter did not report
     it, e.g. a fail_connect row or a pre-connect_s adapter). Append = no bump per
     the policy above; readers detect presence via the manifest's column list.
+  results-schema/1 + label (2026-07-21): trailing column `label` appended -- the
+    cell's spec "label" (sanitized), "" when the cell has none. Without it, rows
+    from cells that differ only by their spec `env` (same sigma/watterson/payload)
+    are indistinguishable in the corpus; (sigma, watterson, payload, label) is the
+    full cell identity a scorer should group by.
 """
 import csv
 import json
@@ -41,7 +46,7 @@ COLUMNS = [
     "watterson", "payload", "rep",
     "got", "total", "intact", "goodput", "peak_bps", "sn_med",
     "elapsed", "status", "rc", "log", "rig_gen",
-    "connect_s",
+    "connect_s", "label",
 ]
 
 # Per-column caster for the READER side (read_corpus). Everything is stored as text in
@@ -52,7 +57,7 @@ COLUMN_TYPES = {
     "txgain": float, "watterson": str, "payload": int, "rep": int,
     "got": int, "total": int, "intact": str, "goodput": float, "peak_bps": int,
     "sn_med": float, "elapsed": float, "status": str, "rc": int, "log": str,
-    "rig_gen": int, "connect_s": float,
+    "rig_gen": int, "connect_s": float, "label": str,
 }
 
 

@@ -65,8 +65,10 @@ def test_cell_env_and_label_reach_the_row(tmp_path, monkeypatch):
             "env": {"SIM_TR_JITTER_MS": "20"}}
     row = _run_one_cell(tmp_path, monkeypatch, cell)
     assert row["status"] == "ok"
-    # label folded into the log basename (the clobber guard)
+    # label folded into the log basename (the clobber guard) AND recorded as its own
+    # column -- (sigma, watterson, payload, label) is the full cell identity
     assert "jit20" in row["log"]
+    assert row["label"] == "jit20"
     # the base class timed link_connect; run_cell parsed it into the schema column
     assert isinstance(row["connect_s"], float) and row["connect_s"] >= 0.0
 

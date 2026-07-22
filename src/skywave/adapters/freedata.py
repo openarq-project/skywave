@@ -20,6 +20,17 @@ HOW FreeDATA differs from the TCP-TNC adapters (mercury/vara):
     adapter needs websocket-client. Point $ADAPTER_PY at that venv's python (sweep_runner's
     adapter_argv launches the adapter under it); the server launch inherits it (or set
     $FREEDATA_PY). $FREEDATA_DIR locates the FreeDATA checkout (default ~/tools/FreeDATA).
+  * A PATCHED CHECKOUT IS REQUIRED -- stock FreeDATA is DEAF on the snd-aloop cable and
+    fails 100% of runs with zero TX audio ever reaching the sim (act_rms=0, a fixed
+    ~408 ms-period `input overflow` from the moment the capture stream opens, idle-present
+    and load-independent). Root cause: the RX `sd.InputStream(blocksize=4800)` is a
+    capture-config artifact on the snd-aloop virtual device (real CM108 hardware is fine
+    at 4800). The checkout must carry, on top of upstream `develop`: (1) RX blocksize=0 +
+    the RT-safe callback split (`perf/rx-audio-latency-rt-safe`), (2) the
+    `POST /modem/send_arq_raw` API fixes, and (3) the IRS success-event restoration
+    (`arq-transfer-inbound` terminal event with `data=` -- what `transfer` decodes).
+    All three ship together on the maintained fix branch (2026-07-22:
+    `fix/rx-audio-rt-safe-plus-api` @ d95fbcb9 on the bench boxes).
 
 PARTIAL BYTES: the raw-ARQ path exposes only a COUNT for a non-completing run (the actual
 payload bytes arrive only with the terminal event). That count is surfaced as zero-padding

@@ -93,7 +93,8 @@ class MercurySockAdapter(MercuryAdapter):
     def _launch(self, station, port, bcast, log):
         env = dict(os.environ,
                    MERCURY_AUDIO_SOCK=os.path.join(self.sockdir, f"{station}.sock"))
-        p = sp.Popen([self.merc, "-x", "sock",
+        p = sp.Popen([self.merc, "-C", self._bench_ini(),
+                      "-x", "sock",
                       "-p", str(port), "-b", str(bcast), "-m", "1"],
                      env=env, stdout=open(log, "wb"), stderr=sp.STDOUT)
         self._stations.append(p)

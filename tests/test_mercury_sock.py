@@ -135,7 +135,8 @@ def test_adapter_station_launch(monkeypatch, sock_dir):
     ad.start_stations()
     assert len(calls) == 2
     for (argv, env), station, port in zip(calls, ("a", "b"), (8300, 8310)):
-        assert argv[1:3] == ["-x", "sock"]
+        x = argv.index("-x")
+        assert argv[x:x + 2] == ["-x", "sock"]
         assert str(port) in argv
         assert env["MERCURY_AUDIO_SOCK"] == os.path.join(sock_dir, f"{station}.sock")
     assert len(ad._stations) == 2

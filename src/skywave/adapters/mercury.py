@@ -30,9 +30,25 @@ class MercuryAdapter(ModemAdapter):
     def __init__(self, cfg):
         super().__init__(cfg)
         self.merc = os.environ.get("MERCURY_BIN", "").strip() or "mercury"
+        # PTT isolation, same hazard class as armstrong's 2026-07-23 incident:
+        # mercury resolves its default "mercury.ini" RELATIVE to the invocation
+        # CWD, where a stray file's radio_model could point hamlib at a real
+        # rig. Every launch passes -C to a skywave-written ini pinning
+        # radio_model = -1 (no radio); see tests/test_ptt_isolation.py.
+        self.cfgdir = f"/tmp/skywave-merccfg-{os.getpid()}"
+        os.makedirs(self.cfgdir, exist_ok=True)
         self.a = self.b = self.adat = self.bdat = None
         self.nm = {}
         self.buf = {}
+
+    def _bench_ini(self):
+        """-C value for every mercury launch (the PTT-isolation invariant)."""
+        path = os.path.join(self.cfgdir, "mercury_bench.ini")
+        if not os.path.exists(path):
+            with open(path, "w") as f:
+                f.write("; skywave bench config: no hamlib radio, ever\n"
+                        "[main]\nradio_model = -1\n")
+        return path
 
     # ---- hooks ----
     def preclean_patterns(self):
@@ -43,7 +59,8 @@ class MercuryAdapter(ModemAdapter):
         self._launch("4,0", "5,0", self.B_PORT, 8110, "/tmp/mpB.log")   # B caller/sender
 
     def _launch(self, tx, rx, port, bcast, log):
-        p = sp.Popen([self.merc, "-x", "alsa", "-o", f"plughw:{tx}", "-i", f"plughw:{rx}",
+        p = sp.Popen([self.merc, "-C", self._bench_ini(),
+                      "-x", "alsa", "-o", f"plughw:{tx}", "-i", f"plughw:{rx}",
                       "-p", str(port), "-b", str(bcast)],
                      stdout=open(log, "wb"), stderr=sp.STDOUT)
         self._stations.append(p)

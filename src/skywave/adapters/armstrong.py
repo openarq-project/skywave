@@ -56,6 +56,18 @@ class ArmstrongAdapter(ModemAdapter):
                         or f"/tmp/skywave-armsock-{os.getpid()}")
         if self.sock:
             os.makedirs(self.sockdir, exist_ok=True)
+        # PTT isolation (2026-07-23 incident): every launch passes --config
+        # into this skywave-owned dir so armstrong can NEVER fall back to the
+        # box's platform operator config (~/.config/armstrong, ~/Library/
+        # Application Support/...). A "virtual" sock smoke inherited exactly
+        # that config once -- active profile ptt.method="rigctld" wired to a
+        # live rigctld -- and keyed a real HF rig over the air: sock audio
+        # replaces only the AUDIO transport, PTT still comes from the config.
+        # A fresh file here is inert by construction (armstrong writes
+        # commented defaults with ptt method "none" on first run); see
+        # tests/test_ptt_isolation.py for the regression pins.
+        self.cfgdir = self.sockdir if self.sock else f"/tmp/skywave-armcfg-{os.getpid()}"
+        os.makedirs(self.cfgdir, exist_ok=True)
         self.a = self.b = self.adat = self.bdat = None
         self.nm = {}
         self.buf = {}
@@ -118,10 +130,16 @@ class ArmstrongAdapter(ModemAdapter):
             self._launch_alsa("W1CAL", self.A_PORT, self.A_TX, self.A_RX, "/tmp/armA.log")
             self._launch_alsa("W1ANS", self.B_PORT, self.B_TX, self.B_RX, "/tmp/armB.log")
 
+    def _bench_config(self, port):
+        """Per-station --config path in skywave's own dir, never the platform
+        default (the PTT-isolation invariant -- see __init__)."""
+        return os.path.join(self.cfgdir, f"armstrong_bench_{port}.toml")
+
     def _launch_alsa(self, call, port, tx, rx, log):
         conf = os.path.join(os.path.dirname(os.path.abspath(__file__)), "armstrong_aloop.conf")
         env = dict(os.environ, RUST_LOG="info", ARM_FORCE_48K="1", ALSA_CONFIG_PATH=conf)
-        p = sp.Popen([self.arm, "--audio", "cpal", "--tx-device", tx, "--rx-device", rx,
+        p = sp.Popen([self.arm, "--config", self._bench_config(port),
+                      "--audio", "cpal", "--tx-device", tx, "--rx-device", rx,
                       "--callsign", call, "--tnc-port", str(port),
                       "--host-sock", f"/tmp/armp_{port}.sock"] + self._no_web_flag(),
                      env=env, stdout=open(log, "wb"), stderr=sp.STDOUT)
@@ -130,7 +148,8 @@ class ArmstrongAdapter(ModemAdapter):
     def _launch_sock(self, call, port, station, log):
         env = dict(os.environ, RUST_LOG="info",
                    ARM_AUDIO_SOCK=os.path.join(self.sockdir, f"{station}.sock"))
-        p = sp.Popen([self.arm, "--audio", "sock", "--callsign", call,
+        p = sp.Popen([self.arm, "--config", self._bench_config(port),
+                      "--audio", "sock", "--callsign", call,
                       "--tnc-port", str(port),
                       "--host-sock", f"/tmp/armp_{port}.sock"] + self._no_web_flag(),
                      env=env, stdout=open(log, "wb"), stderr=sp.STDOUT)

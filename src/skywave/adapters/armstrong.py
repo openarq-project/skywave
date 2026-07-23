@@ -49,8 +49,9 @@ class ArmstrongAdapter(ModemAdapter):
         # stepping than the Linux benches, where 2 s was safe). Keep it brief in virt_time;
         # the real-time/ALSA rig keeps the full 2 s so the rate controller settles before
         # the first burst. Tunable via ARM_SETTLE_S for an unusually slow virt_time host.
-        _virt = self.sock and os.environ.get("SIM_CLOCK", "virt_time").strip() == "virt_time"
-        self.settle_s = float(os.environ.get("ARM_SETTLE_S", "0.3" if _virt else "2.0"))
+        self._virt = (self.sock and
+                      os.environ.get("SIM_CLOCK", "virt_time").strip() == "virt_time")
+        self.settle_s = float(os.environ.get("ARM_SETTLE_S", "0.3" if self._virt else "2.0"))
         self.sockdir = (os.environ.get("SIM_SOCK_DIR", "").strip()
                         or f"/tmp/skywave-armsock-{os.getpid()}")
         if self.sock:
@@ -59,6 +60,22 @@ class ArmstrongAdapter(ModemAdapter):
         self.nm = {}
         self.buf = {}
         self._no_web = None
+
+    def bench_time(self):
+        """SIGNAL time from the sim's status file (<sockdir>/virt_now_ms) on the
+        sock/virt_time rig -- the same contract as mercury_sock, so reported
+        seconds/goodput are real-time equivalent at any virtual pace. Without
+        this override the virtval-2026-07-23 campaign reported wall clock,
+        inflating armstrong's virtual goodput +52/+61%. The sim writes the file
+        every ~500 ms of signal time from block 0; wall clock is only a startup
+        fallback. The ALSA rig (and sock under SIM_CLOCK=real_time) stays wall."""
+        if not self._virt:
+            return time.time()
+        try:
+            with open(os.path.join(self.sockdir, "virt_now_ms")) as f:
+                return int(f.read()) / 1000.0
+        except (OSError, ValueError):
+            return time.time()
 
     # ---- channel: default ALSA aloop rig; sock transport is opt-in ----
     def launch_channel(self):

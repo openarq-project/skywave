@@ -81,8 +81,12 @@ def test_result_json_forward_contract():
     assert d["schema"] == "modem-adapter-result/1"
     assert d["got"] == 2048 and d["total"] == 2048 and d["intact"] is True
     assert set(d) >= {"schema", "got", "total", "seconds", "intact", "goodput",
-                      "peak_bitrate", "sn_med", "connect_s"}
+                      "peak_bitrate", "sn_med", "connect_s", "wall_s"}
     assert d["connect_s"] >= 0.0
+    # wall_s: the transfer window in WALL seconds, measured by the base alongside the
+    # bench_time() window. On a real-time adapter the two agree; on a virtual-clock
+    # adapter wall_s is the compressed wall duration (speedup = seconds / wall_s).
+    assert d["wall_s"] >= 0.0
 
 
 def test_partial_transfer_classifies_partial():
@@ -116,18 +120,22 @@ def test_seeded_payload_deterministic():
 
 
 def test_result_line_exact_format():
-    """Guard the literal token grammar the framework depends on."""
+    """Guard the literal token grammar the framework depends on. Tokens are
+    append-only: connect= added 2026-07-21, wall= added 2026-07-23."""
     line = AdapterResult(got=100, total=100, seconds=2.5, intact=True,
                          goodput=40.0, peak_bitrate=600, sn_med=12.0,
-                         connect_s=3.2).result_line()
+                         connect_s=3.2, wall_s=1.1).result_line()
     assert line == ("RESULT: 100/100 B in 2.5s intact=True goodput=40.0 B/s "
-                    "| peak_bitrate=600bps | SN_med=12.0 | connect=3.2s")
+                    "| peak_bitrate=600bps | SN_med=12.0 | connect=3.2s "
+                    "| wall=1.1s")
 
 
 def test_result_line_unmeasured_connect_not_parsed():
-    """A hand-rolled adapter that predates connect_s emits -1.0; run_cell must leave the
-    connect_s column blank (RES_CONN never matches a negative — the sentinel token is
-    `connect=-1.0s` and the regex requires the number to start with a digit)."""
+    """A hand-rolled adapter that predates connect_s/wall_s emits -1.0; run_cell must
+    leave those columns blank (the regexes never match a negative — the sentinel tokens
+    are `connect=-1.0s`/`wall=-1.0s` and each regex requires a leading digit)."""
     line = AdapterResult(got=1, total=1, seconds=1.0, intact=True, goodput=1.0).result_line()
     assert "connect=-1.0s" in line
     assert sweep_runner.RES_CONN.search(line) is None
+    assert "wall=-1.0s" in line
+    assert sweep_runner.RES_WALL.search(line) is None

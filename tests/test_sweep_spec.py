@@ -86,3 +86,71 @@ def test_label_is_sanitized(tmp_path, monkeypatch):
     row = _run_one_cell(tmp_path, monkeypatch, cell)
     assert "/" not in row["log"] and " " not in row["log"] and "$" not in row["log"]
     assert "ab..xy" in row["log"]
+
+
+# ---- signal-time budget parity (SIM_MAX_VIRTUAL_S) ------------------------------
+# Without it, a virtual-clock leg's WALL timeout buys timeout x speedup of SIGNAL
+# time, and every marginal cell flips optimistic (partial->ok) vs the real-time
+# corpus -- the virtval-2026-07-23 deep-AWGN artifact. run_cell must bound every
+# cell at its own timeout in VIRTUAL seconds (inert on real-time paths: only the
+# lockstep sock loop reads SIM_MAX_VIRTUAL_S).
+
+def _run_cell_captured_env(tmp_path, monkeypatch, cell):
+    """Drive run_cell with a stubbed subprocess; return the env it launched with."""
+    monkeypatch.setattr(sweep_runner, "LOGDIR", str(tmp_path))
+    seen = {}
+
+    def fake_run(argv, cwd=None, env=None, stdout=None, stderr=None, **kw):
+        if argv and argv[0] == "pkill":
+            class P:
+                returncode = 1
+            return P()
+        seen.clear()
+        seen.update(env or {})
+        stdout.write(b"RESULT: 512/512 B in 1.0s intact=True goodput=512.0 B/s "
+                     b"| peak_bitrate=0bps | SN_med=-99.0 | connect=0.1s | wall=1.0s\n")
+
+        class P:
+            returncode = 0
+        return P()
+
+    monkeypatch.setattr(sweep_runner.sp, "run", fake_run)
+    out = tmp_path / "row.csv"
+    with open(out, "w", newline="") as f:
+        w = csv.DictWriter(f, fieldnames=COLUMNS)
+        w.writeheader()
+        row = sweep_runner.run_cell("loopback", cell, 0, w, f, "spec")
+    return seen, row
+
+
+def test_virtual_budget_defaults_to_cell_timeout(tmp_path, monkeypatch):
+    monkeypatch.delenv("SIM_MAX_VIRTUAL_S", raising=False)
+    env, _ = _run_cell_captured_env(tmp_path, monkeypatch,
+                                    {"sigma": 0, "payload": 512, "timeout": 30})
+    assert env["SIM_MAX_VIRTUAL_S"] == "30"
+
+
+def test_virtual_budget_operator_env_wins(tmp_path, monkeypatch):
+    monkeypatch.setenv("SIM_MAX_VIRTUAL_S", "900")
+    env, _ = _run_cell_captured_env(tmp_path, monkeypatch,
+                                    {"sigma": 0, "payload": 512, "timeout": 30})
+    assert env["SIM_MAX_VIRTUAL_S"] == "900"
+
+
+def test_virtual_budget_cell_env_wins(tmp_path, monkeypatch):
+    monkeypatch.delenv("SIM_MAX_VIRTUAL_S", raising=False)
+    env, _ = _run_cell_captured_env(tmp_path, monkeypatch,
+                                    {"sigma": 0, "payload": 512, "timeout": 30,
+                                     "env": {"SIM_MAX_VIRTUAL_S": "7"}})
+    assert env["SIM_MAX_VIRTUAL_S"] == "7"
+
+
+def test_wall_s_reaches_the_row(tmp_path, monkeypatch):
+    """The RESULT wall= token lands in the corpus row; absent token -> blank column."""
+    _, row = _run_cell_captured_env(tmp_path, monkeypatch,
+                                    {"sigma": 0, "payload": 512, "timeout": 30})
+    assert row["wall_s"] == 1.0
+    # end-to-end through the real loopback adapter: the base class measures wall_s
+    row2 = _run_one_cell(tmp_path, monkeypatch,
+                         {"sigma": 0, "payload": 512, "timeout": 30})
+    assert isinstance(row2["wall_s"], float) and row2["wall_s"] >= 0.0

@@ -32,6 +32,13 @@ integer -- record the change in the changelog below.
     from cells that differ only by their spec `env` (same sigma/watterson/payload)
     are indistinguishable in the corpus; (sigma, watterson, payload, label) is the
     full cell identity a scorer should group by.
+  results-schema/1 + wall_s (2026-07-23): trailing column `wall_s` appended -- the
+    transfer window in WALL seconds as measured by the adapter base class, "" when
+    not reported (fail rows, pre-wall_s adapters). On real-time adapters it agrees
+    with the RESULT's signal-time `in Xs`; on virtual-clock adapters it is the
+    compressed wall duration, so speedup = (got/goodput) / wall_s. Added after the
+    virtval-2026-07-23 campaign, where `elapsed` (wall, whole invocation) vs
+    signal-time goodput ambiguity complicated the fidelity analysis.
 """
 import csv
 import json
@@ -46,7 +53,7 @@ COLUMNS = [
     "watterson", "payload", "rep",
     "got", "total", "intact", "goodput", "peak_bps", "sn_med",
     "elapsed", "status", "rc", "log", "rig_gen",
-    "connect_s", "label",
+    "connect_s", "label", "wall_s",
 ]
 
 # Per-column caster for the READER side (read_corpus). Everything is stored as text in
@@ -57,7 +64,7 @@ COLUMN_TYPES = {
     "txgain": float, "watterson": str, "payload": int, "rep": int,
     "got": int, "total": int, "intact": str, "goodput": float, "peak_bps": int,
     "sn_med": float, "elapsed": float, "status": str, "rc": int, "log": str,
-    "rig_gen": int, "connect_s": float, "label": str,
+    "rig_gen": int, "connect_s": float, "label": str, "wall_s": float,
 }
 
 

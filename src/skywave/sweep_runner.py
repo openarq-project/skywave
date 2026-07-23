@@ -143,6 +143,7 @@ RES_GP    = re.compile(r"goodput=([\d.]+)")
 RES_PEAK  = re.compile(r"peak_bitrate=(\d+)")
 RES_SN    = re.compile(r"SN_med=(-?[\d.]+)")
 RES_CONN  = re.compile(r"connect=([\d.]+)s")
+RES_WALL  = re.compile(r"wall=([\d.]+)s")
 
 
 def snr3k_nominal(sigma, gain=1.0):
@@ -290,6 +291,13 @@ def run_cell(modem, cell, rep, writer, fcsv, tag):
     if "fade_doppler_hz" in cell:
         env["SIM_FADE_DOPPLER_HZ"] = str(cell["fade_doppler_hz"])
     env["SEED"] = str(1234 + rep * 7)
+    # Signal-time budget parity: bound the run at the cell timeout in VIRTUAL seconds.
+    # Only the lockstep sock loop reads SIM_MAX_VIRTUAL_S, so this is inert on the
+    # real-time rig -- but on a virtual-clock transport the WALL timeout alone buys
+    # timeout x speedup of signal time, and every marginal cell flips optimistic
+    # (partial->ok) vs a real-time corpus (the virtval-2026-07-23 deep-AWGN artifact).
+    # setdefault: an explicit operator export wins; a cell env (applied below) too.
+    env.setdefault("SIM_MAX_VIRTUAL_S", str(tmo))
     # Per-cell channel env (SIM_* only; validated in main): impairments beyond the
     # first-class fields -- asymmetric SIM_SIGMA_AB/BA, SIM_TR_JITTER_MS, SIM_QRM_*,
     # a SIM_TR_UNKEY_MS override, ... Applied AFTER the runner defaults (so a cell
@@ -324,6 +332,7 @@ def run_cell(modem, cell, rep, writer, fcsv, tag):
         txt = open(log, errors="replace").read()
         got = tot = 0; dt = el; intact = "false"; gp = 0.0; peak = 0; sn = -99.0
         conn = ""    # blank = not reported (fail_connect row, or a pre-connect_s adapter)
+        wall = ""    # blank = not reported (fail row, or a pre-wall_s adapter)
         mres = re.search(r"\bRESULT\b", txt)
         if mres:
             seg = txt[mres.start():mres.start() + 400]
@@ -337,6 +346,9 @@ def run_cell(modem, cell, rep, writer, fcsv, tag):
             mc = RES_CONN.search(seg)
             if mc and float(mc.group(1)) >= 0:
                 conn = float(mc.group(1))
+            mw = RES_WALL.search(seg)
+            if mw and float(mw.group(1)) >= 0:
+                wall = float(mw.group(1))
             if got >= (tot or payload) and intact.lower() in ("true", "1"):
                 status = "ok"
             elif got > 0:
@@ -369,7 +381,7 @@ def run_cell(modem, cell, rep, writer, fcsv, tag):
            "goodput": round(gp, 2), "peak_bps": peak, "sn_med": sn,
            "elapsed": el, "status": status, "rc": p.returncode,
            "log": os.path.basename(log), "rig_gen": RIG_GEN,
-           "connect_s": conn, "label": label}
+           "connect_s": conn, "label": label, "wall_s": wall}
     writer.writerow(row); fcsv.flush()
     lbl = f" [{label}]" if label else ""
     print(f"[{modem}]{lbl} s={sigma}({row['snr3k']}dB) {watt} p={payload} r{rep}: "

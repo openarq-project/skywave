@@ -101,14 +101,22 @@ class AdapterResult:
     # a headline separator between modems. -1.0 = not measured (a hand-rolled adapter
     # that predates the field); the base class always fills it.
     connect_s: float = -1.0
+    # The transfer window in WALL seconds, measured alongside the bench_time() window.
+    # On a real-time adapter the two agree; on a virtual-clock adapter (bench_time()
+    # returns signal time) wall_s is the compressed wall duration, so the corpus
+    # carries the speedup measurement (seconds / wall_s) per run instead of it being
+    # reconstructed from tee timestamps. -1.0 = not measured (pre-wall_s adapter);
+    # the base class always fills it.
+    wall_s: float = -1.0
 
     def result_line(self) -> str:
         # EXACT tokens sweep_runner's RES_* regexes match; do not reorder/rename casually.
-        # Tokens are append-only: connect= was added 2026-07-21 (older parsers skip it).
+        # Tokens are append-only: connect= added 2026-07-21, wall= added 2026-07-23
+        # (older parsers skip unknown trailing tokens).
         return (f"RESULT: {self.got}/{self.total} B in {self.seconds:.1f}s "
                 f"intact={self.intact} goodput={self.goodput:.1f} B/s "
                 f"| peak_bitrate={self.peak_bitrate}bps | SN_med={self.sn_med:.1f} "
-                f"| connect={self.connect_s:.1f}s")
+                f"| connect={self.connect_s:.1f}s | wall={self.wall_s:.1f}s")
 
     def as_dict(self) -> dict:
         d = {"schema": RESULT_SCHEMA}
@@ -238,11 +246,13 @@ class ModemAdapter(abc.ABC):
             b0 = self.bench_time()
             recv = bytes(self.transfer(payload, t0 + cfg.timeout_s))
             dt = self.bench_time() - b0
+            wall_dt = time.time() - t0
             got = len(recv)
             intact = recv[:cfg.payload_bytes] == payload
             goodput = got / dt if dt > 0 else 0.0
             res = AdapterResult(got, cfg.payload_bytes, dt, intact, goodput,
-                                self.peak_bitrate(), self.sn_med(), connect_s)
+                                self.peak_bitrate(), self.sn_med(), connect_s,
+                                round(wall_dt, 1))
             print(res.result_line(), flush=True)
             print("RESULT_JSON " + json.dumps(res.as_dict()), flush=True)
             return 0 if (got >= cfg.payload_bytes and intact) else 2

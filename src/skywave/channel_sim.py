@@ -32,6 +32,8 @@ Env:
            (SIGMA is then the raw per-sample std at the cable rate)         [48000]
   SEED     base RNG seed; per-direction seeds = SEED+11 (A->B), SEED+22 (B->A)      [1234]
   NP_STATS if set, write per-direction signal stats JSON to <path>.11 / <path>.22
+           (incl. key_duty aggregate airtime and key_bursts, the keyed-burst /
+           T-R-switch count for per-run turnaround accounting)
   SIM_BLOCK    pipe block size in frames/channel                                    [1024]
   SIM_FS       cable sample rate in Hz. 48000 (default) is the validated soundcard
                rate; 8000 runs the cable at a modem's native rate for device-free
@@ -635,6 +637,7 @@ class Link:
         self.rx_recover = 0           # blocks until RX ready after key-off (SIM_TR_UNKEY_MS)
         self.rf_up = False            # RF actually transmitting (keyed AND past key settle)
         self.keyed_blocks = 0         # count of keyed blocks -> key duty (VOX validation)
+        self.key_bursts = 0           # count of keyed rising edges -> TX bursts / T-R switches
         self._prev_keyed = False
         self.keylog = open(KEYLOG + "." + src_name, "w", buffering=1) if KEYLOG else None
         self.txdump = open(TXDUMP + "." + src_name, "wb") if TXDUMP else None
@@ -895,6 +898,8 @@ class Link:
         # SIM_PTT: `active` comes from the modem's real PTT (no leading-edge clip); else VOX RMS.
         self.active = getattr(self.ptt, self.src_name) if SIM_PTT else rms > KEY_THRESH
         if self.active:
+            if not self.keyed:
+                self.key_bursts += 1  # keyed rising edge: one burst (hangtime bridges gaps)
             self.keyed = True
             self.hang = HANG_BLOCKS
         elif self.hang > 0:
@@ -979,7 +984,8 @@ class Link:
                  "papr_db": (20.0 * np.log10(self.peak / act_rms) if act_rms > 0 else 0.0),
                  "papr_robust_db": (20.0 * np.log10(rpeak / act_rms) if act_rms > 0 else 0.0),
                  "half_duplex": HALF_DUPLEX, "keyed_now": self.keyed, "rig_gen": RIG_GEN,
-                 "key_duty": (self.keyed_blocks / self.nblocks if self.nblocks else 0.0)}
+                 "key_duty": (self.keyed_blocks / self.nblocks if self.nblocks else 0.0),
+                 "key_bursts": int(self.key_bursts)}
         if SIM_CLOCK == "virt_time":
             stats["virtual_s"] = VIRT_NOW_S    # drivers score virtual goodput off this
         with open(tmp, "w") as f:

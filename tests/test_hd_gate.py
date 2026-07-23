@@ -137,3 +137,53 @@ def test_keylog_written_under_sim_ptt(tmp_path):
         ts = float(ln.split()[0])
         assert abs(ts - t0) < 60.0, "keylog timestamps must be wall-anchored epoch"
     assert lines[0].split()[1] == "1" and lines[-1].split()[1] == "0"
+
+
+def test_key_bursts_counts_bursts_not_blocks():
+    """key_bursts counts keyed RISING edges (TX bursts / T-R switches): a gap
+    shorter than the hangtime is bridged (same burst); a gap past the tail
+    starts a new one. Motivated by the 2026-07-23 qrm-cw forensics: npstats
+    carried key_duty (aggregate airtime) but no burst count, so ARQ-cycle
+    excursions had to be inferred from keyed-seconds quantization."""
+    cs = load_sim(SIM_HALF_DUPLEX=1, SIM_PTT=1)
+    ab, ba, keys, ptt = hd_pair(cs)
+    silence = np.zeros(cs.NSAMP, dtype="<i2")
+    tone = tone_block(cs)
+    assert ab.key_bursts == 0
+    ptt.a = True
+    for _ in range(3):
+        feed(ab, tone)                        # burst 1: three keyed blocks, ONE burst
+    ptt.a = False
+    feed(ab, silence)                         # intra-burst gap << hangtime: bridged
+    ptt.a = True
+    for _ in range(2):
+        feed(ab, tone)                        # still burst 1
+    assert ab.key_bursts == 1
+    ptt.a = False
+    for _ in range(cs.HANG_BLOCKS + 1):
+        feed(ab, silence)                     # tail expires -> unkeyed
+    assert not ab.keyed
+    ptt.a = True
+    feed(ab, tone)                            # burst 2
+    assert ab.key_bursts == 2
+    assert ba.key_bursts == 0                 # per-direction, not shared
+
+
+def test_key_bursts_in_npstats(tmp_path):
+    """write_stats emits key_bursts alongside key_duty."""
+    import json
+    cs = load_sim(SIM_HALF_DUPLEX=1, SIM_PTT=1)
+    keys, ptt = cs.Keys(), cs.PttState()
+    ab = make_link(cs, "a", "b", keys=keys, ptt=ptt,
+                   stats_path=str(tmp_path / "np.11"))
+    ba = make_link(cs, "b", "a", keys=keys, ptt=ptt)
+    silence = np.zeros(cs.NSAMP, dtype="<i2")
+    feed(ba, silence)                         # publish b idle (rx_ready)
+    ptt.a = True
+    feed(ab, tone_block(cs))
+    ab.nblocks += 1                           # feed() drives process() directly; the
+                                              # run loop owns this counter (key_duty denom)
+    ab.write_stats()
+    stats = json.load(open(str(tmp_path / "np.11")))
+    assert stats["key_bursts"] == 1
+    assert stats["key_duty"] > 0

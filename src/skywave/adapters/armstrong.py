@@ -100,6 +100,14 @@ class ArmstrongAdapter(ModemAdapter):
                 "SIM_TRANSPORT": "sock",
                 "SIM_CLOCK": os.environ.get("SIM_CLOCK", "virt_time"),
                 "SIM_SOCK_DIR": self.sockdir,
+                # Armstrong's protocol timers run on WALL clock under sock
+                # audio (armstrong TODO P3), so an uncapped virtual clock on a
+                # fast host races ahead of the wall-paced handshake and the
+                # SIM_MAX_VIRTUAL_S budget expires before the first burst is
+                # keyed (observed on an M5: act_rms=0 for 60 virtual s, every
+                # connect dead). Cap the pace like mercury_sock does; 3 is
+                # confirmed sufficient on the fastest box. Export overrides.
+                "SIM_VIRT_MAX_RATIO": os.environ.get("SIM_VIRT_MAX_RATIO", "3"),
             })
         else:
             self._sim = bench_pipes.launch_channel_sim()      # the 4-card ALSA aloop rig

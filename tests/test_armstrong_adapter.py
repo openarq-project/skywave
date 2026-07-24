@@ -87,3 +87,25 @@ def test_host_sock_flag_probed_from_help(monkeypatch, sock_dir, help_text, expec
     if expected:
         paths = [a[a.index("--host-sock") + 1] for a in argvs]
         assert paths[0] != paths[1], "stations must not share a host socket"
+
+
+def test_sock_channel_sim_gets_default_pace_cap(monkeypatch, sock_dir):
+    """The Mac connect stall (2026-07-24): armstrong's protocol timers run on
+    WALL clock under sock audio, so with the sim's virtual clock uncapped
+    (SIM_VIRT_MAX_RATIO default 0) a fast host races virtual time far ahead
+    of the wall-clocked handshake and the SIM_MAX_VIRTUAL_S budget expires
+    before the first burst is keyed (observed: act_rms=0 for 60 virtual s).
+    mercury_sock has pinned its own cap since 496b424; armstrong's sock cells
+    must do the same. 3 was confirmed sufficient on the fastest box (ratio=1
+    and =3 both connect cleanly). An explicit export still wins."""
+    envs = []
+    monkeypatch.setattr(
+        "skywave.adapters.armstrong.bench_pipes.launch_channel_sim",
+        lambda extra_env=None: envs.append(dict(extra_env or {})) or object())
+    ad = _mk_adapter(monkeypatch, sock_dir)               # sock transport
+    monkeypatch.delenv("SIM_VIRT_MAX_RATIO", raising=False)
+    ad.launch_channel()
+    assert envs[-1].get("SIM_VIRT_MAX_RATIO") == "3", envs[-1]
+    monkeypatch.setenv("SIM_VIRT_MAX_RATIO", "1")         # explicit export wins
+    ad.launch_channel()
+    assert envs[-1].get("SIM_VIRT_MAX_RATIO") == "1", envs[-1]

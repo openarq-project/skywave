@@ -195,19 +195,28 @@ class ArmstrongAdapter(ModemAdapter):
         self._pump(time.time() + 1)
         self._snd(self.b, "LISTEN ON"); time.sleep(0.5)
         for attempt in range(1, 4):
-            self._snd(self.a, "CONNECT W1CAL W1ANS")
-            if self._pump(min(deadline, time.time() + 60),
-                          stop=lambda t: t.startswith("CONNECTED")):
-                # let the rate controller settle before data, but keep pumping so PTT
-                # and telemetry keep flowing (a hard sleep squelches the first burst).
-                # settle_s is short in virt_time so it can't race past keepalive-loss.
-                self._pump(time.time() + self.settle_s)
-                self.adat = socket.create_connection(("127.0.0.1", self.A_PORT + 1))       # A sender
-                self.bdat = socket.create_connection(("127.0.0.1", self.B_PORT + 1)); self.bdat.setblocking(False)
-                return True
-            print(f"  (connect {attempt}/3 failed; retry)", flush=True)
-            self._snd(self.a, "ABORT"); time.sleep(3)
-            self._snd(self.b, "LISTEN ON"); time.sleep(0.5)
+            # A station can die mid-attempt (observed 2026-07-24 on the Mac
+            # sock rig: the sim's VIRTUAL-TIMEOUT closed the cable and the
+            # stations exited, leaving this control socket broken). Retrying
+            # on a dead socket cannot recover -- fail the CELL cleanly instead
+            # of killing the whole sweep with an uncaught BrokenPipeError.
+            try:
+                self._snd(self.a, "CONNECT W1CAL W1ANS")
+                if self._pump(min(deadline, time.time() + 60),
+                              stop=lambda t: t.startswith("CONNECTED")):
+                    # let the rate controller settle before data, but keep pumping so PTT
+                    # and telemetry keep flowing (a hard sleep squelches the first burst).
+                    # settle_s is short in virt_time so it can't race past keepalive-loss.
+                    self._pump(time.time() + self.settle_s)
+                    self.adat = socket.create_connection(("127.0.0.1", self.A_PORT + 1))       # A sender
+                    self.bdat = socket.create_connection(("127.0.0.1", self.B_PORT + 1)); self.bdat.setblocking(False)
+                    return True
+                print(f"  (connect {attempt}/3 failed; retry)", flush=True)
+                self._snd(self.a, "ABORT"); time.sleep(3)
+                self._snd(self.b, "LISTEN ON"); time.sleep(0.5)
+            except OSError as e:
+                print(f"  (connect {attempt}/3: control socket died: {e})", flush=True)
+                return False
         return False
 
     def transfer(self, payload, deadline):
@@ -270,7 +279,13 @@ class ArmstrongAdapter(ModemAdapter):
                 except OSError:
                     continue
                 if not d:
-                    continue
+                    # recv EOF: the station closed its control socket (it
+                    # exited or crashed). Pumping on would spin silently until
+                    # the wall deadline -- observed masking a station death
+                    # for a full 60 s. End the pump; the caller treats it as
+                    # a failed wait.
+                    print(f"  ({self.nm[s]}: control socket EOF)", flush=True)
+                    return False
                 self.buf[s] += d
                 while b"\r" in self.buf[s]:
                     ln, self.buf[s] = self.buf[s].split(b"\r", 1)

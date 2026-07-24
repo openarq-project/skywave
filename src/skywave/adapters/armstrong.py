@@ -72,6 +72,7 @@ class ArmstrongAdapter(ModemAdapter):
         self.nm = {}
         self.buf = {}
         self._no_web = None
+        self._host_sock = None
 
     def bench_time(self):
         """SIGNAL time from the sim's status file (<sockdir>/virt_now_ms) on the
@@ -130,6 +131,21 @@ class ArmstrongAdapter(ModemAdapter):
             self._launch_alsa("W1CAL", self.A_PORT, self.A_TX, self.A_RX, "/tmp/armA.log")
             self._launch_alsa("W1ANS", self.B_PORT, self.B_TX, self.B_RX, "/tmp/armB.log")
 
+    def _host_sock_flags(self, port):
+        # Older armstrong builds (pre-e4e158d) bind a host-API unix socket at a
+        # FIXED default path (/tmp/armstrong.sock), so the pair's second station
+        # dies on the bind race without a per-station path. Newer builds retired
+        # the flag (the host plane rides the web API, which --no-web already
+        # disables) and reject unknown argv at parse. Probe via --help, same as
+        # --no-web, so one skywave drives both generations.
+        if self._host_sock is None:
+            try:
+                h = sp.run([self.arm, "--help"], capture_output=True, timeout=15)
+                self._host_sock = b"--host-sock" in h.stdout + h.stderr
+            except Exception:
+                self._host_sock = False
+        return ["--host-sock", f"/tmp/armp_{port}.sock"] if self._host_sock else []
+
     def _bench_config(self, port):
         """Per-station --config path in skywave's own dir, never the platform
         default (the PTT-isolation invariant -- see __init__)."""
@@ -140,8 +156,8 @@ class ArmstrongAdapter(ModemAdapter):
         env = dict(os.environ, RUST_LOG="info", ARM_FORCE_48K="1", ALSA_CONFIG_PATH=conf)
         p = sp.Popen([self.arm, "--config", self._bench_config(port),
                       "--audio", "cpal", "--tx-device", tx, "--rx-device", rx,
-                      "--callsign", call, "--tnc-port", str(port),
-                      "--host-sock", f"/tmp/armp_{port}.sock"] + self._no_web_flag(),
+                      "--callsign", call, "--tnc-port", str(port)]
+                     + self._host_sock_flags(port) + self._no_web_flag(),
                      env=env, stdout=open(log, "wb"), stderr=sp.STDOUT)
         self._stations.append(p)
 
@@ -150,8 +166,8 @@ class ArmstrongAdapter(ModemAdapter):
                    ARM_AUDIO_SOCK=os.path.join(self.sockdir, f"{station}.sock"))
         p = sp.Popen([self.arm, "--config", self._bench_config(port),
                       "--audio", "sock", "--callsign", call,
-                      "--tnc-port", str(port),
-                      "--host-sock", f"/tmp/armp_{port}.sock"] + self._no_web_flag(),
+                      "--tnc-port", str(port)]
+                     + self._host_sock_flags(port) + self._no_web_flag(),
                      env=env, stdout=open(log, "wb"), stderr=sp.STDOUT)
         self._stations.append(p)
 

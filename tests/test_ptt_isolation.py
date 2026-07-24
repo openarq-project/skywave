@@ -86,7 +86,8 @@ def _flag_value(argv, flag):
 @pytest.mark.parametrize("transport", ["sock", ""])
 def test_armstrong_argv_carries_bench_config(monkeypatch, sock_dir, transport):
     ad = _adapter(monkeypatch, ArmstrongAdapter, sock_dir, transport)
-    ad._no_web = ["--no-web"]        # skip the --help probe (no binary here)
+    ad._no_web = ["--no-web"]        # skip the --help probes (no binary here;
+    ad._host_sock = False            # the probe flags have their own tests)
     argvs = []
     monkeypatch.setattr("skywave.adapters.armstrong.sp.Popen", _capture_popen(argvs))
     ad.start_stations()

@@ -11,6 +11,8 @@ Run:  cd skywave && python3 -m pytest tests/test_armstrong_adapter.py -q
 import os
 import time
 
+import pytest
+
 from skywave.modem_adapter import AdapterConfig
 from skywave.adapters.armstrong import ArmstrongAdapter
 
@@ -45,3 +47,43 @@ def test_bench_time_stays_wall_clock_on_alsa_rig(monkeypatch, sock_dir):
     ad = _mk_adapter(monkeypatch, sock_dir, transport="")
     w0 = time.time()
     assert abs(ad.bench_time() - w0) < 2.0
+
+
+class _FakeProc:
+    def poll(self):
+        return None
+
+
+def _fake_run(help_bytes):
+    def fake_run(argv, **kw):
+        class R:
+            stdout = help_bytes
+            stderr = b""
+            returncode = 0
+        return R()
+    return fake_run
+
+
+@pytest.mark.parametrize("help_text,expected", [
+    (b"... --host-sock <HOST_SOCK> ... --no-web ...", True),   # pre-e4e158d build
+    (b"... --no-web ...", False),                              # flag retired upstream
+])
+def test_host_sock_flag_probed_from_help(monkeypatch, sock_dir, help_text, expected):
+    """Older armstrong builds bind a host-API unix socket at a FIXED default
+    path, so a two-station pair needs per-station --host-sock paths; newer
+    builds retired the flag (the host plane rides the web API, which --no-web
+    already disables) and REJECT unknown argv at parse. The adapter must key
+    the flag off --help, same as --no-web, so one skywave drives both
+    generations."""
+    ad = _mk_adapter(monkeypatch, sock_dir)
+    argvs = []
+    monkeypatch.setattr("skywave.adapters.armstrong.sp.run", _fake_run(help_text))
+    monkeypatch.setattr("skywave.adapters.armstrong.sp.Popen",
+                        lambda argv, **kw: argvs.append(list(argv)) or _FakeProc())
+    ad.start_stations()
+    assert len(argvs) == 2
+    for argv in argvs:
+        assert ("--host-sock" in argv) == expected, argv
+    if expected:
+        paths = [a[a.index("--host-sock") + 1] for a in argvs]
+        assert paths[0] != paths[1], "stations must not share a host socket"

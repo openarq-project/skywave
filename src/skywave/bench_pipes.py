@@ -40,6 +40,14 @@ def launch_channel_sim(extra_env=None):
     # block forever waiting for EOF, surfacing as "exit 1, empty output" on a run that
     # actually completed. A log file preserves SIM_KEYLOG/diagnostics while breaking the
     # inherited-pipe leak. Overridable via SIM_LOG.
+    #
+    # The default is a SINGLE path truncated at every launch, so back-to-back cells
+    # overwrite each other and only the last survives. That is fine for a one-off manual
+    # run (the caller wants "the log"), but it silently destroys per-cell evidence across
+    # a campaign -- notably the fade-schedule transition timestamps, which are the ground
+    # truth for scoring mode-switch latency. sweep_runner therefore sets SIM_LOG per cell
+    # (and calibrate_pep per ladder condition); any other campaign driver launching cells
+    # in a loop should do the same rather than inherit this default.
     simlog = open(env.get("SIM_LOG", "/tmp/channel_sim.log"), "wb")
     p = sp.Popen([sys.executable, "-u", SIM], env=env, stdin=stdin,
                  stdout=simlog, stderr=sp.STDOUT, preexec_fn=os.setsid)

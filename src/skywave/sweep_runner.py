@@ -221,6 +221,9 @@ def calibrate_pep(modem, target_dbfs=-1.0, payload=1500, timeout=70, conditions=
                    SIM_WATTERSON=watt)
         env.setdefault("SIM_HALF_DUPLEX", "1")
         env.setdefault("SIM_PTT", "1")
+        # Per-condition sim log, same reason as run_cell's: the ladder walks several
+        # channels and a single shared file keeps only the last one's banner.
+        env.setdefault("SIM_LOG", stats + ".sim.log")
         env.update(cfg["extra_env"])
         print(f"measuring {modem} TX peak ({label}, payload={payload} B) ...", flush=True)
         kill = int(timeout) + cfg["kill_pad"]
@@ -382,6 +385,20 @@ def run_cell(modem, cell, rep, writer, fcsv, tag):
                if os.environ.get("NP_STATS_DIR")
                else os.path.join(LOGDIR, base + ".npstats"))
     env["NP_STATS"] = npstats
+    # Per-cell channel_sim diagnostics, parked beside the cell's own log. The sim's
+    # stdout/stderr is the only record of what the CHANNEL did as opposed to what the
+    # modem did: the startup banner naming the resolved fade/rig/fx, SIM_KEYLOG, and the
+    # fade-schedule transition timestamps that are the ground truth for scoring
+    # mode-switch latency. bench_pipes defaults it to ONE /tmp/channel_sim.log and
+    # truncates at every launch, so a whole campaign kept only its last cell's -- the
+    # virtval-2026-07 scheduled-fade cells were unauditable for exactly that reason.
+    # setdefault: an explicit operator export wins, and so does a cell `env` (applied
+    # above), matching the SIM_MAX_VIRTUAL_S doctrine.
+    # Expect an EMPTY file for a cell that never got a live transport: on the sock path
+    # the sim blocks in _sock_rig() accepting both stations, and the banner prints after
+    # that -- so a fail_connect cell logs nothing. Absence of a banner is a connect
+    # failure, not a missing fade.
+    env.setdefault("SIM_LOG", os.path.join(LOGDIR, base + ".sim.log"))
     env.update(cfg["extra_env"])
     kill = int(tmo) + cfg["kill_pad"]
     attempts = 2  # one extra try, consumed ONLY on a connect-type failure (Mercury HD race)

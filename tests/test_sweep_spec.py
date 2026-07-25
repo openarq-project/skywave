@@ -279,6 +279,70 @@ def test_non_numeric_fade_fails_fast(tmp_path, monkeypatch, cell):
     assert not out.exists()
 
 
+# ---- per-cell channel_sim log (SIM_LOG) -----------------------------------------
+# bench_pipes defaults SIM_LOG to ONE /tmp/channel_sim.log and opens it "wb", so every
+# cell truncates the previous cell's. The sim's stderr is the only record of what the
+# CHANNEL did -- the resolved-fade banner, SIM_KEYLOG, and the fade-schedule transition
+# timestamps that score mode-switch latency -- so a campaign kept only its last cell's.
+
+def test_sim_log_is_per_cell(tmp_path, monkeypatch):
+    monkeypatch.delenv("SIM_LOG", raising=False)
+    env, row = _run_cell_captured_env(tmp_path, monkeypatch,
+                                      {"sigma": 0, "payload": 512, "timeout": 30})
+    # beside the cell's own log, sharing its basename so the pair is obvious on disk
+    assert env["SIM_LOG"] == str(tmp_path / row["log"].replace(".log", ".sim.log"))
+    assert env["SIM_LOG"] != "/tmp/channel_sim.log"
+
+
+def test_sim_log_differs_per_rep_and_per_cell(tmp_path, monkeypatch):
+    # the whole point: two cells (or reps) must not share one truncated file
+    monkeypatch.delenv("SIM_LOG", raising=False)
+    seen = set()
+    for rep in range(2):
+        monkeypatch.setattr(sweep_runner, "LOGDIR", str(tmp_path))
+        out = tmp_path / f"r{rep}.csv"
+        with open(out, "w", newline="") as f:
+            w = csv.DictWriter(f, fieldnames=COLUMNS)
+            w.writeheader()
+            captured = {}
+
+            def fake_run(argv, cwd=None, env=None, stdout=None, stderr=None, **kw):
+                if argv and argv[0] == "pkill":
+                    return type("P", (), {"returncode": 1})()
+                captured.update(env or {})
+                stdout.write(b"RESULT: 512/512 B in 1.0s intact=True goodput=512.0 B/s\n")
+                return type("P", (), {"returncode": 0})()
+
+            monkeypatch.setattr(sweep_runner.sp, "run", fake_run)
+            sweep_runner.run_cell("loopback", {"sigma": 0, "payload": 512, "timeout": 30},
+                                  rep, w, f, "spec")
+        seen.add(captured["SIM_LOG"])
+    assert len(seen) == 2, f"reps shared a sim log: {seen}"
+    # and a differing cell axis separates them too
+    env_a, _ = _run_cell_captured_env(tmp_path, monkeypatch,
+                                      {"sigma": 0, "payload": 512, "timeout": 30,
+                                       "label": "a"})
+    env_b, _ = _run_cell_captured_env(tmp_path, monkeypatch,
+                                      {"sigma": 0, "payload": 512, "timeout": 30,
+                                       "label": "b"})
+    assert env_a["SIM_LOG"] != env_b["SIM_LOG"]
+
+
+def test_sim_log_operator_export_wins(tmp_path, monkeypatch):
+    monkeypatch.setenv("SIM_LOG", "/tmp/pinned.log")
+    env, _ = _run_cell_captured_env(tmp_path, monkeypatch,
+                                    {"sigma": 0, "payload": 512, "timeout": 30})
+    assert env["SIM_LOG"] == "/tmp/pinned.log"
+
+
+def test_sim_log_cell_env_wins(tmp_path, monkeypatch):
+    monkeypatch.delenv("SIM_LOG", raising=False)
+    env, _ = _run_cell_captured_env(tmp_path, monkeypatch,
+                                    {"sigma": 0, "payload": 512, "timeout": 30,
+                                     "env": {"SIM_LOG": "/tmp/from_cell.log"}})
+    assert env["SIM_LOG"] == "/tmp/from_cell.log"
+
+
 def test_wall_s_reaches_the_row(tmp_path, monkeypatch):
     """The RESULT wall= token lands in the corpus row; absent token -> blank column."""
     _, row = _run_cell_captured_env(tmp_path, monkeypatch,

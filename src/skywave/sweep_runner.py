@@ -394,10 +394,12 @@ def run_cell(modem, cell, rep, writer, fcsv, tag):
     # virtval-2026-07 scheduled-fade cells were unauditable for exactly that reason.
     # setdefault: an explicit operator export wins, and so does a cell `env` (applied
     # above), matching the SIM_MAX_VIRTUAL_S doctrine.
-    # Expect an EMPTY file for a cell that never got a live transport: on the sock path
-    # the sim blocks in _sock_rig() accepting both stations, and the banner prints after
-    # that -- so a fail_connect cell logs nothing. Absence of a banner is a connect
-    # failure, not a missing fade.
+    # A fail_connect cell DOES still get a banner: on the sock path _sock_rig() only
+    # waits for the two station PROCESSES to attach their audio sockets, which happens
+    # before any modem link is attempted. Verified 2026-07-25 -- a cell whose station
+    # died at TNC bind still logged "fade=schedule[...]" plus the transport error. The
+    # file is empty only when neither station ever attached at all, since the sim blocks
+    # in _sock_rig() until they do.
     env.setdefault("SIM_LOG", os.path.join(LOGDIR, base + ".sim.log"))
     env.update(cfg["extra_env"])
     kill = int(tmo) + cfg["kill_pad"]

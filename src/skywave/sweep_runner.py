@@ -295,7 +295,10 @@ def run_cell(modem, cell, rep, writer, fcsv, tag):
         # SIM_WATTERSON regardless of its value -- record what was actually applied
         # (CSV-is-ACTUALS, not intentions) or a k3/k4-style cell is indistinguishable
         # from an unfaded one in the results.
-        watt = f"custom:{cell['fade_delay_ms']}ms/{cell['fade_doppler_hz']}Hz"
+        # filename-safe: `watt` feeds directly into the log/npstats basename below,
+        # so no "/" or ":" (a slash silently became a path separator and made every
+        # k3/k4-style cell fail at open() with ENOENT -- caught live 2026-07-25).
+        watt = f"custom_{cell['fade_delay_ms']}ms_{cell['fade_doppler_hz']}Hz"
     env["SEED"] = str(1234 + rep * 7)
     # Signal-time budget parity: bound the run at the cell timeout in VIRTUAL seconds.
     # Only the lockstep sock loop reads SIM_MAX_VIRTUAL_S, so this is inert on the

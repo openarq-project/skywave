@@ -145,6 +145,21 @@ def test_virtual_budget_cell_env_wins(tmp_path, monkeypatch):
     assert env["SIM_MAX_VIRTUAL_S"] == "7"
 
 
+@pytest.mark.parametrize("cell", [
+    {"sigma": 0, "fade_delay_ms": "2/0", "fade_doppler_hz": 1.0},
+    {"sigma": 0, "fade_delay_ms": 2.0, "fade_doppler_hz": "fast"},
+])
+def test_non_numeric_fade_fails_fast(tmp_path, monkeypatch, cell):
+    # channel_sim float()s these; a bad one must die at load, not at cell 40 of an
+    # overnight campaign (the same doctrine as the SIM_ env whitelist above). The "2/0"
+    # case is also a path separator headed for the log basename.
+    spec = _write_spec(tmp_path, [cell])
+    out = tmp_path / "out.csv"
+    with pytest.raises(SystemExit, match="must be a number"):
+        _run_main(monkeypatch, spec, str(out))
+    assert not out.exists()
+
+
 def test_wall_s_reaches_the_row(tmp_path, monkeypatch):
     """The RESULT wall= token lands in the corpus row; absent token -> blank column."""
     _, row = _run_cell_captured_env(tmp_path, monkeypatch,

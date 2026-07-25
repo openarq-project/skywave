@@ -440,6 +440,18 @@ def main():
     for idx, c in enumerate(cells):
         if "sigma" not in c:
             raise SystemExit(f"sweep_runner: cell {idx} in {spec} missing 'sigma'")
+        # A custom-fade value is float()d by channel_sim AND interpolated into the log
+        # basename, so a non-numeric one is two failures waiting to happen (ValueError
+        # in the child; a "/" turning the basename into a path). Reject it here, at
+        # load, rather than at cell 40 of an overnight campaign. "" is the legal unset
+        # sentinel (channel_config uses it for these fields), so it skips the check.
+        for k in ("fade_delay_ms", "fade_doppler_hz"):
+            if str(c.get(k, "")).strip():
+                try:
+                    float(c[k])
+                except (TypeError, ValueError):
+                    raise SystemExit(f"sweep_runner: cell {idx} in {spec}: {k} must be "
+                                     f"a number (got {c[k]!r})")
         bad = [k for k in c.get("env", {}) if not k.startswith("SIM_")]
         if bad:
             raise SystemExit(f"sweep_runner: cell {idx} in {spec}: env keys must start "

@@ -271,6 +271,12 @@ def between_cell_cleanup():
     time.sleep(1.5)
 
 
+def _fnsafe(s):
+    """Strip anything unsafe in a log/npstats basename fragment (path separators
+    above all). Every fragment folded into that basename goes through this."""
+    return re.sub(r"[^A-Za-z0-9._-]", "", str(s))
+
+
 def run_cell(modem, cell, rep, writer, fcsv, tag):
     cfg = resolve_adapter(modem)
     sigma = cell["sigma"]; watt = cell.get("watterson", "off")
@@ -319,7 +325,7 @@ def run_cell(modem, cell, rep, writer, fcsv, tag):
     # Optional cell label, folded into the log/npstats basename: two cells that differ
     # only by `env` (e.g. moderate s4000 with and without T/R jitter) would otherwise
     # write the SAME files and silently clobber each other's logs and stats.
-    label = re.sub(r"[^A-Za-z0-9._-]", "", str(cell.get("label", "")))
+    label = _fnsafe(cell.get("label", ""))
     base = f"{tag}_{modem}_" + (f"{label}_" if label else "") + \
            f"s{sigma}_{watt}_p{payload}_r{rep}"
     log = os.path.join(LOGDIR, base + ".log")

@@ -39,6 +39,20 @@ integer -- record the change in the changelog below.
     compressed wall duration, so speedup = (got/goodput) / wall_s. Added after the
     virtval-2026-07-23 campaign, where `elapsed` (wall, whole invocation) vs
     signal-time goodput ambiguity complicated the fidelity analysis.
+  results-schema/1 + fade actuals (2026-07-25): trailing columns `fade_delay_ms` +
+    `fade_doppler_hz` appended -- the fade channel_sim ACTUALLY applied, "" when no
+    single static pair does (a scheduled fade sweeps through several; "off"). Filled
+    for a named preset too (from watterson.PRESETS), so the pair means the same thing
+    however the fade was requested. Append = no bump per the policy above.
+    In the same change the `watterson` column's VALUE domain widened: it is no longer
+    always a PRESETS name or "off". channel_sim silently overrides SIM_WATTERSON when
+    a delay+doppler pair or SIM_FADE_SCHEDULE is set, so those rows now record
+    "custom_<d>ms_<f>Hz" / "sched_<segs>" instead of naming a fade that never ran.
+    No bump for that either: same name, position, and str type.
+    READER NOTE: treat an unrecognised `watterson` value as a CUSTOM fade, never as
+    unfaded -- a PRESETS.get(name) that falls back to "off"/None recreates the exact
+    corpus lie this change fixed. Prefer the two numeric columns over parsing the
+    descriptor string; its format is a human/filename label, not a contract.
 """
 import csv
 import json
@@ -54,6 +68,7 @@ COLUMNS = [
     "got", "total", "intact", "goodput", "peak_bps", "sn_med",
     "elapsed", "status", "rc", "log", "rig_gen",
     "connect_s", "label", "wall_s",
+    "fade_delay_ms", "fade_doppler_hz",
 ]
 
 # Per-column caster for the READER side (read_corpus). Everything is stored as text in
@@ -65,6 +80,7 @@ COLUMN_TYPES = {
     "got": int, "total": int, "intact": str, "goodput": float, "peak_bps": int,
     "sn_med": float, "elapsed": float, "status": str, "rc": int, "log": str,
     "rig_gen": int, "connect_s": float, "label": str, "wall_s": float,
+    "fade_delay_ms": float, "fade_doppler_hz": float,
 }
 
 

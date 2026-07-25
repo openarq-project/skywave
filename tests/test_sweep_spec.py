@@ -1,12 +1,19 @@
 """Tests for the cell-spec surface of sweep_runner: the per-cell `env` passthrough
-(SIM_*-whitelisted, fail-fast at spec load), the `label` log-name disambiguator, and the
-connect_s column landing in the corpus row.
+(SIM_*-whitelisted, fail-fast at spec load), the `label` log-name disambiguator, the
+custom-fade provenance in the `watterson` column, and the connect_s column landing in
+the corpus row.
 
 The env whitelist is a provenance guard: a spec must be able to carry channel
 impairments (SIM_SIGMA_AB, SIM_TR_JITTER_MS, SIM_QRM_*, ...) but must NOT be able to
 silently override runner-owned vars (SEED, TXGAIN, NP_STATS) — those decide fairness
 and are set per-rep by the runner. The label exists because two cells differing only by
 `env` would otherwise write the same log/npstats basename and clobber each other.
+
+The fade tests guard the same corpus-honesty property from the other side: a
+fade_delay_ms+fade_doppler_hz pair and SIM_FADE_SCHEDULE each silently override
+SIM_WATTERSON inside channel_sim, so the row must name the fade that RAN whichever
+route it arrived by — and because that name is folded into the log basename, it must
+also survive as a filename.
 
 Run:  cd skywave && python3 -m pytest tests/test_sweep_spec.py -q
 """
@@ -143,6 +150,118 @@ def test_virtual_budget_cell_env_wins(tmp_path, monkeypatch):
                                     {"sigma": 0, "payload": 512, "timeout": 30,
                                      "env": {"SIM_MAX_VIRTUAL_S": "7"}})
     assert env["SIM_MAX_VIRTUAL_S"] == "7"
+
+
+# ---- custom-fade provenance (the `watterson` column) ----------------------------
+# A fade_delay_ms+fade_doppler_hz pair overrides SIM_WATTERSON inside channel_sim (its
+# `elif FADE_DOPPLER and FADE_DELAY` beats the named-preset branch), so the row must
+# name what ACTUALLY ran -- and that name is folded into the log basename, so it must
+# stay filename-safe. Both halves have drawn blood: an unnamed custom fade made faded
+# rows indistinguishable from unfaded ones in the corpus, and a "/" in the descriptor
+# made every such cell die at open() with ENOENT mid-campaign.
+
+@pytest.fixture(autouse=True)
+def _no_ambient_fade(monkeypatch):
+    """fade_resolved reads the RESOLVED env, so any exported fade knob would leak into
+    these rows -- scrub every rung of the ladder, not just the pair."""
+    for k in ("SIM_FADE_SCHEDULE", "SIM_FADE_DELAY_MS", "SIM_FADE_DOPPLER_HZ",
+              "SIM_WATTERSON"):
+        monkeypatch.delenv(k, raising=False)
+
+
+def test_custom_fade_is_named_in_the_row(tmp_path, monkeypatch):
+    cell = {"sigma": 0, "payload": 512, "timeout": 30, "watterson": "off",
+            "fade_delay_ms": 2.0, "fade_doppler_hz": 1.0}
+    env, row = _run_cell_captured_env(tmp_path, monkeypatch, cell)
+    assert env["SIM_FADE_DELAY_MS"] == "2.0" and env["SIM_FADE_DOPPLER_HZ"] == "1.0"
+    # the applied fade, NOT the cell's literal watterson="off"
+    assert row["watterson"] == "custom_2.0ms_1.0Hz"
+    assert "custom_2.0ms_1.0Hz" in row["log"]
+
+
+def test_custom_fade_descriptor_is_filename_safe(tmp_path, monkeypatch):
+    # main() rejects this spec at load; run_cell is the belt-and-braces for a direct
+    # caller -- whatever reaches the descriptor must not carry a path separator into
+    # the basename (the ENOENT that killed every k3/k4 cell of a live campaign).
+    cell = {"sigma": 0, "payload": 512, "timeout": 30,
+            "fade_delay_ms": "2/0", "fade_doppler_hz": 1.0}
+    _, row = _run_cell_captured_env(tmp_path, monkeypatch, cell)
+    assert "/" not in row["watterson"] and "/" not in row["log"]
+
+
+def test_empty_fade_fields_keep_the_preset_name(tmp_path, monkeypatch):
+    # "" is channel_config's unset sentinel for these fields: the keys are PRESENT but
+    # channel_sim's `and` gate is false, so the named preset runs. A key-presence test
+    # would write "custom_ms_Hz" here and mislabel a genuinely poor-faded row.
+    cell = {"sigma": 0, "payload": 512, "timeout": 30, "watterson": "poor",
+            "fade_delay_ms": "", "fade_doppler_hz": ""}
+    env, row = _run_cell_captured_env(tmp_path, monkeypatch, cell)
+    assert env["SIM_WATTERSON"] == "poor"
+    assert row["watterson"] == "poor"
+
+
+def test_half_a_custom_fade_keeps_the_preset_name(tmp_path, monkeypatch):
+    # Only one of the pair set: channel_sim falls through to the preset branch.
+    cell = {"sigma": 0, "payload": 512, "timeout": 30, "watterson": "poor",
+            "fade_delay_ms": 2.0}
+    _, row = _run_cell_captured_env(tmp_path, monkeypatch, cell)
+    assert row["watterson"] == "poor"
+
+
+# The descriptor is resolved from the FINAL child env, not the cell dict, because all
+# three fade routes can arrive via the cell `env` passthrough -- and SIM_FADE_SCHEDULE
+# has no first-class cell field, so `env` is its ONLY route. Resolving from the cell
+# recorded a request rather than what ran, which is how every scheduled-fade sweep
+# landed in the corpus labelled "off".
+
+def test_fade_schedule_via_cell_env_is_named(tmp_path, monkeypatch):
+    cell = {"sigma": 0, "payload": 512, "timeout": 30,
+            "env": {"SIM_FADE_SCHEDULE": "good:120,poor:180,good:0"}}
+    env, row = _run_cell_captured_env(tmp_path, monkeypatch, cell)
+    assert env["SIM_FADE_SCHEDULE"] == "good:120,poor:180,good:0"
+    assert row["watterson"] == "sched_good120_poor180_good0"
+    assert "sched_good120_poor180_good0" in row["log"]
+    # a schedule sweeps through several pairs -- no single one describes the cell
+    assert row["fade_delay_ms"] == "" and row["fade_doppler_hz"] == ""
+
+
+def test_preset_via_cell_env_is_named(tmp_path, monkeypatch):
+    cell = {"sigma": 0, "payload": 512, "timeout": 30, "env": {"SIM_WATTERSON": "poor"}}
+    _, row = _run_cell_captured_env(tmp_path, monkeypatch, cell)
+    assert row["watterson"] == "poor"          # not the cell's defaulted "off"
+
+
+def test_custom_pair_via_cell_env_is_named(tmp_path, monkeypatch):
+    cell = {"sigma": 0, "payload": 512, "timeout": 30,
+            "env": {"SIM_FADE_DELAY_MS": "2.0", "SIM_FADE_DOPPLER_HZ": "1.0"}}
+    _, row = _run_cell_captured_env(tmp_path, monkeypatch, cell)
+    assert row["watterson"] == "custom_2.0ms_1.0Hz"
+    assert (row["fade_delay_ms"], row["fade_doppler_hz"]) == (2.0, 1.0)
+
+
+def test_schedule_beats_pair_beats_preset(tmp_path, monkeypatch):
+    # channel_sim's ladder, top rung: a schedule wins over BOTH the explicit pair and
+    # the named preset, so neither may name the row.
+    cell = {"sigma": 0, "payload": 512, "timeout": 30, "watterson": "poor",
+            "fade_delay_ms": 2.0, "fade_doppler_hz": 1.0,
+            "env": {"SIM_FADE_SCHEDULE": "good:0"}}
+    _, row = _run_cell_captured_env(tmp_path, monkeypatch, cell)
+    assert row["watterson"] == "sched_good0"
+
+
+def test_preset_fills_the_numeric_fade_columns(tmp_path, monkeypatch):
+    # the pair means the same thing however the fade was requested, so a scorer can
+    # read delay/doppler off any static-fade row without knowing PRESETS
+    cell = {"sigma": 0, "payload": 512, "timeout": 30, "watterson": "poor"}
+    _, row = _run_cell_captured_env(tmp_path, monkeypatch, cell)
+    assert (row["fade_delay_ms"], row["fade_doppler_hz"]) == (2.0, 1.0)   # CCIR poor
+
+
+def test_unfaded_cell_has_blank_fade_columns(tmp_path, monkeypatch):
+    _, row = _run_cell_captured_env(tmp_path, monkeypatch,
+                                    {"sigma": 0, "payload": 512, "timeout": 30})
+    assert row["watterson"] == "off"
+    assert row["fade_delay_ms"] == "" and row["fade_doppler_hz"] == ""
 
 
 @pytest.mark.parametrize("cell", [

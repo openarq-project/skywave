@@ -86,6 +86,17 @@ def test_cast_row_is_tolerant():
     assert r["got"] == "" and r["goodput"] == "n/a" and r["extra_col"] == "hi"
 
 
+def test_fade_columns_cast_to_float_or_stay_blank():
+    # the machine-readable half of the fade contract: a scorer reads delay/doppler off
+    # these instead of parsing the `watterson` descriptor (a filename label, not a
+    # contract). Blank means "no single static pair" -- a schedule, or unfaded.
+    r = cast_row({"fade_delay_ms": "2.0", "fade_doppler_hz": "1.0"})
+    assert r["fade_delay_ms"] == 2.0 and isinstance(r["fade_delay_ms"], float)
+    assert r["fade_doppler_hz"] == 1.0
+    blank = cast_row({"fade_delay_ms": "", "fade_doppler_hz": ""})
+    assert blank["fade_delay_ms"] == "" and blank["fade_doppler_hz"] == ""
+
+
 def test_written_corpus_header_matches_columns(tmp_path):
     # end-to-end: a DictWriter over COLUMNS (what sweep_runner does) yields a header that
     # is exactly the schema's columns, so a reader keying on COLUMNS lines up.

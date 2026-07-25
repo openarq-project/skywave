@@ -17,10 +17,15 @@ Cell spec (<cells.json>): a JSON array of cells. Fields per cell: "sigma" (requi
 "watterson" (preset name, default "off"), "payload" (bytes, default 4096), "timeout"
 (transfer deadline s, default 120), "reps" (default 1), "fade_delay_ms"+"fade_doppler_hz"
 (custom fade pair overriding the preset), "env" ({SIM_* only} extra channel knobs --
-asymmetric SIM_SIGMA_AB/BA, SIM_TR_JITTER_MS, SIM_QRM_*, a SIM_TR_UNKEY_MS override, ...;
+asymmetric SIM_SIGMA_AB/BA, SIM_TR_JITTER_MS, SIM_QRM_*, SIM_FADE_SCHEDULE (which has no
+first-class field, so `env` is its only route), a SIM_TR_UNKEY_MS override, ...;
 non-SIM_ keys are rejected at load so a spec can't override runner-owned SEED/TXGAIN),
 and "label" (short name folded into the log/npstats basename so cells differing only by
 "env" don't clobber each other's artifacts).
+
+Whichever route a fade arrives by, the row records the one channel_sim ACTUALLY applied
+(fade_resolved): the `watterson` column names it and fade_delay_ms/fade_doppler_hz carry
+its numbers -- the cell's own fields state an intention that the sim may override.
 
 Usage: skywave-sweep <modem> <cells.json> <out.csv> [tag]
        skywave-sweep --calibrate-pep <modem> [target_dbfs] [payload] [timeout]
@@ -277,9 +282,50 @@ def _fnsafe(s):
     return re.sub(r"[^A-Za-z0-9._-]", "", str(s))
 
 
+def _num(s):
+    """float(s) when it parses, else the raw string, so the two fade columns hold a
+    number-or-blank like every other typed column. main() rejects a non-numeric pair at
+    spec load; this keeps a direct run_cell() caller returning a row instead of raising."""
+    try:
+        return float(s)
+    except (TypeError, ValueError):
+        return s
+
+
+def fade_resolved(env):
+    """What channel_sim will ACTUALLY fade with: (name, delay_ms, doppler_hz).
+
+    Mirrors channel_sim's resolution ladder -- SIM_FADE_SCHEDULE beats an explicit
+    delay+doppler pair beats the named SIM_WATTERSON preset -- against the FINAL child
+    env, so the corpus records what RAN rather than what the cell's first-class fields
+    asked for. Each of those three can arrive by a route the cell dict never sees (an
+    operator export, the cell `env` passthrough), and the two override paths are SILENT
+    in channel_sim: a row named from the cell alone claims an intention.
+
+    delay/doppler are "" when no single static pair applies -- a schedule sweeps through
+    several, "off" fades not at all -- and are filled from watterson.PRESETS for a named
+    preset so the columns mean the same thing however the fade was requested.
+
+    Keep in sync with channel_sim's fade resolution: one contract in two places.
+    """
+    sched = env.get("SIM_FADE_SCHEDULE", "").strip()
+    if sched:
+        return "sched_" + sched.replace(",", "_").replace(":", ""), "", ""
+    delay = env.get("SIM_FADE_DELAY_MS", "").strip()
+    doppler = env.get("SIM_FADE_DOPPLER_HZ", "").strip()
+    if delay and doppler:
+        return f"custom_{delay}ms_{doppler}Hz", _num(delay), _num(doppler)
+    name = env.get("SIM_WATTERSON", "off").strip().lower() or "off"
+    from skywave import watterson          # lazy: keeps numpy off the launcher's path
+    preset = watterson.PRESETS.get(name)   # None for "off" AND for an unknown name
+    if preset is None:
+        return name, "", ""
+    return name, preset[0], preset[1]
+
+
 def run_cell(modem, cell, rep, writer, fcsv, tag):
     cfg = resolve_adapter(modem)
-    sigma = cell["sigma"]; watt = cell.get("watterson", "off")
+    sigma = cell["sigma"]; cell_watt = cell.get("watterson", "off")
     payload = cell.get("payload", 4096); tmo = cell.get("timeout", 120)
     env = dict(os.environ)
     env["SIM_HALF_DUPLEX"] = "1"; env["SIM_PTT"] = "1"
@@ -288,7 +334,7 @@ def run_cell(modem, cell, rep, writer, fcsv, tag):
     # (SIM_TR_UNKEY_MS) for a T/R-penalty study.
     env["SIM_TR_UNKEY_MS"] = os.environ.get("SIM_TR_UNKEY_MS", "0")
     env["SIGMA"] = str(sigma)
-    env["SIM_WATTERSON"] = watt
+    env["SIM_WATTERSON"] = cell_watt
     # Optional custom fade: an explicit delay+doppler pair overrides the named preset
     # (channel_sim takes its custom path when BOTH are set), for delay-spread sweeps.
     # Backward-compatible: only applied when the cell carries the fields.
@@ -296,15 +342,6 @@ def run_cell(modem, cell, rep, writer, fcsv, tag):
         env["SIM_FADE_DELAY_MS"] = str(cell["fade_delay_ms"])
     if "fade_doppler_hz" in cell:
         env["SIM_FADE_DOPPLER_HZ"] = str(cell["fade_doppler_hz"])
-    if "fade_delay_ms" in cell and "fade_doppler_hz" in cell:
-        # channel_sim takes the custom-fade path whenever BOTH are set, overriding
-        # SIM_WATTERSON regardless of its value -- record what was actually applied
-        # (CSV-is-ACTUALS, not intentions) or a k3/k4-style cell is indistinguishable
-        # from an unfaded one in the results.
-        # filename-safe: `watt` feeds directly into the log/npstats basename below,
-        # so no "/" or ":" (a slash silently became a path separator and made every
-        # k3/k4-style cell fail at open() with ENOENT -- caught live 2026-07-25).
-        watt = f"custom_{cell['fade_delay_ms']}ms_{cell['fade_doppler_hz']}Hz"
     env["SEED"] = str(1234 + rep * 7)
     # Signal-time budget parity: bound the run at the cell timeout in VIRTUAL seconds.
     # Only the lockstep sock loop reads SIM_MAX_VIRTUAL_S, so this is inert on the
@@ -318,6 +355,17 @@ def run_cell(modem, cell, rep, writer, fcsv, tag):
     # a SIM_TR_UNKEY_MS override, ... Applied AFTER the runner defaults (so a cell
     # may override them) and BEFORE the adapter's extra_env (which stays last).
     env.update({k: str(v) for k, v in cell.get("env", {}).items()})
+    # Fade provenance, resolved HERE and not earlier: SIM_FADE_SCHEDULE, an explicit
+    # delay+doppler pair, and even SIM_WATTERSON itself can all arrive via the cell
+    # `env` above -- and the schedule has NO first-class cell field, so `env` is its
+    # only route. Resolving before this line recorded the cell's request, which is how
+    # every scheduled-fade sweep landed in the corpus labelled "off".
+    # _fnsafe because `watt` is also a log/npstats basename fragment below: a "/" in it
+    # became a path separator and made every such cell fail at open() with ENOENT
+    # (caught live 2026-07-25). The numbers live in their own typed columns, so the
+    # descriptor is free to be a human/filename label rather than a parseable record.
+    watt, fade_ms, fade_hz = fade_resolved(env)
+    watt = _fnsafe(watt)
     # equal-PEP drive unless the launcher pinned TXGAIN itself (campaign_pep
     # does) or EQUAL_GAIN=1 requests the historical baseline.
     if "TXGAIN" not in os.environ:
@@ -396,7 +444,8 @@ def run_cell(modem, cell, rep, writer, fcsv, tag):
            "goodput": round(gp, 2), "peak_bps": peak, "sn_med": sn,
            "elapsed": el, "status": status, "rc": p.returncode,
            "log": os.path.basename(log), "rig_gen": RIG_GEN,
-           "connect_s": conn, "label": label, "wall_s": wall}
+           "connect_s": conn, "label": label, "wall_s": wall,
+           "fade_delay_ms": fade_ms, "fade_doppler_hz": fade_hz}
     writer.writerow(row); fcsv.flush()
     lbl = f" [{label}]" if label else ""
     print(f"[{modem}]{lbl} s={sigma}({row['snr3k']}dB) {watt} p={payload} r{rep}: "

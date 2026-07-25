@@ -290,6 +290,12 @@ def run_cell(modem, cell, rep, writer, fcsv, tag):
         env["SIM_FADE_DELAY_MS"] = str(cell["fade_delay_ms"])
     if "fade_doppler_hz" in cell:
         env["SIM_FADE_DOPPLER_HZ"] = str(cell["fade_doppler_hz"])
+    if "fade_delay_ms" in cell and "fade_doppler_hz" in cell:
+        # channel_sim takes the custom-fade path whenever BOTH are set, overriding
+        # SIM_WATTERSON regardless of its value -- record what was actually applied
+        # (CSV-is-ACTUALS, not intentions) or a k3/k4-style cell is indistinguishable
+        # from an unfaded one in the results.
+        watt = f"custom:{cell['fade_delay_ms']}ms/{cell['fade_doppler_hz']}Hz"
     env["SEED"] = str(1234 + rep * 7)
     # Signal-time budget parity: bound the run at the cell timeout in VIRTUAL seconds.
     # Only the lockstep sock loop reads SIM_MAX_VIRTUAL_S, so this is inert on the

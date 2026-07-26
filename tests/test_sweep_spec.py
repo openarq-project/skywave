@@ -56,6 +56,48 @@ def test_missing_sigma_fails_fast(tmp_path, monkeypatch):
     assert not out.exists()
 
 
+def test_basename_collision_fails_before_any_run(tmp_path, monkeypatch):
+    # The FRINGE campaign's own bug (2026-07-26): two cells agreeing on every
+    # basename-relevant field (sigma/watterson/payload/rep) but differing only by an
+    # env-only knob (there, atten_db) with no "label" set write the SAME log/npstats
+    # path and silently clobber each other -- only the last-run cell's artifacts
+    # survive. This must be a load-time SystemExit, before any cell runs, not a
+    # silently-corrupted corpus discovered after a multi-hour campaign.
+    spec = _write_spec(tmp_path, [
+        {"sigma": 12000, "watterson": "poor", "payload": 256, "reps": 1,
+         "env": {"SIM_ATTEN_DB": "8"}},
+        {"sigma": 12000, "watterson": "poor", "payload": 256, "reps": 1,
+         "env": {"SIM_ATTEN_DB": "12"}},
+    ])
+    out = tmp_path / "out.csv"
+    with pytest.raises(SystemExit, match="basename collision"):
+        _run_main(monkeypatch, spec, str(out))
+    assert not out.exists()
+
+
+def test_label_disambiguates_the_collision(tmp_path, monkeypatch):
+    # The actual fix: a distinguishing "label" on at least one cell (both, by
+    # convention) clears the same collision the test above raises on.
+    spec = _write_spec(tmp_path, [
+        {"sigma": 12000, "watterson": "poor", "payload": 256, "reps": 1,
+         "env": {"SIM_ATTEN_DB": "8"}, "label": "a8"},
+        {"sigma": 12000, "watterson": "poor", "payload": 256, "reps": 1,
+         "env": {"SIM_ATTEN_DB": "12"}, "label": "a12"},
+    ])
+    out = tmp_path / "out.csv"
+    _run_main(monkeypatch, spec, str(out))
+    assert out.exists()
+
+
+def test_reps_of_the_same_cell_do_not_collide(tmp_path, monkeypatch):
+    # A sanity check on the checker itself: reps of ONE cell must not false-positive
+    # (each rep's `rep` index is part of the basename).
+    spec = _write_spec(tmp_path, [{"sigma": 0, "payload": 512, "reps": 3}])
+    out = tmp_path / "out.csv"
+    _run_main(monkeypatch, spec, str(out))
+    assert out.exists()
+
+
 def _run_one_cell(tmp_path, monkeypatch, cell):
     """Drive run_cell against the in-process loopback adapter, logs into tmp_path."""
     monkeypatch.setattr(sweep_runner, "LOGDIR", str(tmp_path))
@@ -102,26 +144,41 @@ def test_label_is_sanitized(tmp_path, monkeypatch):
 # cell at its own timeout in VIRTUAL seconds (inert on real-time paths: only the
 # lockstep sock loop reads SIM_MAX_VIRTUAL_S).
 
+class _FakePopen:
+    """Stand-in for sp.Popen(..., stdout=sp.PIPE): run_cell now streams+timestamps each
+    line off `.stdout` (see the SIM_ATTEN_DB/connected work, 2026-07-26) instead of a
+    blocking sp.run with a direct file redirect -- pkill still goes through sp.run
+    unmodified, so that mock stays separate (below)."""
+    def __init__(self, argv, cwd=None, env=None, stdout=None, stderr=None, **kw):
+        self.seen = env or {}
+        self.stdout = iter(["RESULT: 512/512 B in 1.0s intact=True goodput=512.0 B/s "
+                             "| peak_bitrate=0bps | SN_med=-99.0 | connect=0.1s | "
+                             "wall=1.0s\n"])
+        self.returncode = None
+
+    def wait(self):
+        self.returncode = 0
+        return self.returncode
+
+
 def _run_cell_captured_env(tmp_path, monkeypatch, cell):
     """Drive run_cell with a stubbed subprocess; return the env it launched with."""
     monkeypatch.setattr(sweep_runner, "LOGDIR", str(tmp_path))
     seen = {}
 
-    def fake_run(argv, cwd=None, env=None, stdout=None, stderr=None, **kw):
-        if argv and argv[0] == "pkill":
-            class P:
-                returncode = 1
-            return P()
-        seen.clear()
-        seen.update(env or {})
-        stdout.write(b"RESULT: 512/512 B in 1.0s intact=True goodput=512.0 B/s "
-                     b"| peak_bitrate=0bps | SN_med=-99.0 | connect=0.1s | wall=1.0s\n")
-
+    def fake_pkill_run(argv, cwd=None, env=None, stdout=None, stderr=None, **kw):
         class P:
-            returncode = 0
+            returncode = 1
         return P()
 
-    monkeypatch.setattr(sweep_runner.sp, "run", fake_run)
+    def fake_popen(argv, **kw):
+        p = _FakePopen(argv, **kw)
+        seen.clear()
+        seen.update(p.seen)
+        return p
+
+    monkeypatch.setattr(sweep_runner.sp, "run", fake_pkill_run)
+    monkeypatch.setattr(sweep_runner.sp, "Popen", fake_popen)
     out = tmp_path / "row.csv"
     with open(out, "w", newline="") as f:
         w = csv.DictWriter(f, fieldnames=COLUMNS)
@@ -306,14 +363,18 @@ def test_sim_log_differs_per_rep_and_per_cell(tmp_path, monkeypatch):
             w.writeheader()
             captured = {}
 
-            def fake_run(argv, cwd=None, env=None, stdout=None, stderr=None, **kw):
-                if argv and argv[0] == "pkill":
-                    return type("P", (), {"returncode": 1})()
-                captured.update(env or {})
-                stdout.write(b"RESULT: 512/512 B in 1.0s intact=True goodput=512.0 B/s\n")
-                return type("P", (), {"returncode": 0})()
+            def fake_pkill_run(argv, cwd=None, env=None, stdout=None, stderr=None, **kw):
+                return type("P", (), {"returncode": 1})()
 
-            monkeypatch.setattr(sweep_runner.sp, "run", fake_run)
+            def fake_popen(argv, **kw):
+                p = _FakePopen(argv, **kw)
+                captured.update(p.seen)
+                p.stdout = iter(["RESULT: 512/512 B in 1.0s intact=True goodput=512.0 "
+                                 "B/s\n"])
+                return p
+
+            monkeypatch.setattr(sweep_runner.sp, "run", fake_pkill_run)
+            monkeypatch.setattr(sweep_runner.sp, "Popen", fake_popen)
             sweep_runner.run_cell("loopback", {"sigma": 0, "payload": 512, "timeout": 30},
                                   rep, w, f, "spec")
         seen.add(captured["SIM_LOG"])

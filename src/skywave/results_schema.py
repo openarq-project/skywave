@@ -59,6 +59,20 @@ integer -- record the change in the changelog below.
     pre-attenuation, so it would otherwise overstate delivered SNR by exactly this
     amount) -- this column exists for provenance, not as a correction a reader must
     apply again. Added for the FRINGE deep-SNR campaign. Append = no bump.
+  results-schema/1 + connected/time_to_connect (2026-07-26): trailing columns appended --
+    ACQUISITION, independent of decode outcome. `status`/`connect_s`/`wall_s` all key off
+    a "RESULT" line that only appears after a full transfer attempt; a row that connects
+    and then never decodes (VARA at -16.5 dB in the FRINGE smoke: CONNECTED, then zero
+    bytes for the full 600 s budget) has NO RESULT line, so those columns read exactly
+    like a row that never connected at all. `connected` is a bool read off the adapters'
+    shared `<- {A,B}: CONNECTED` handshake line (present regardless of whether a RESULT
+    line follows); `time_to_connect` is the elapsed-seconds timestamp sweep_runner now
+    stamps on every captured subprocess line, read straight off that same line ("" if
+    connected is False, or for freedata, which has no handshake distinct from the
+    transfer and is connected=True by construction). Below a modem's decode floor, Arms
+    A and B of a fringe/deep-SNR sweep return identical zeros in every OTHER column --
+    these two are what actually separates "didn't acquire" from "acquired but couldn't
+    decode." Append = no bump.
 """
 import csv
 import json
@@ -76,6 +90,7 @@ COLUMNS = [
     "connect_s", "label", "wall_s",
     "fade_delay_ms", "fade_doppler_hz",
     "atten_db",
+    "connected", "time_to_connect",
 ]
 
 # Per-column caster for the READER side (read_corpus). Everything is stored as text in
@@ -89,6 +104,9 @@ COLUMN_TYPES = {
     "rig_gen": int, "connect_s": float, "label": str, "wall_s": float,
     "fade_delay_ms": float, "fade_doppler_hz": float,
     "atten_db": float,
+    # connected stays str (mirrors `intact`): bool("False") == True in Python, so casting
+    # this column to bool would silently invert every False row. Callers compare .lower().
+    "connected": str, "time_to_connect": float,
 }
 
 

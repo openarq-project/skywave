@@ -149,6 +149,39 @@ RES_PEAK  = re.compile(r"peak_bitrate=(\d+)")
 RES_SN    = re.compile(r"SN_med=(-?[\d.]+)")
 RES_CONN  = re.compile(r"connect=([\d.]+)s")
 RES_WALL  = re.compile(r"wall=([\d.]+)s")
+# The shared TNC-adapter convention (vara/mercury/mercury_sock/ardop/armstrong all print
+# `  <- {A,B}: {line}` and gate their handshake on `line.startswith("CONNECTED")`), so this
+# matches a successful link connect regardless of whether a full RESULT line ever follows --
+# RES_CONN above is blank on a connect-then-no-decode row (no RESULT line at all), which is
+# exactly the case `connected`/`time_to_connect` exist to distinguish from a real connect
+# failure (owner review, FRINGE campaign, 2026-07-26: VARA at -16.5 dB connected and still
+# scored zero bytes -- Arm B's "connect-dominated" justification only holds above the decode
+# floor). freedata has no handshake (link_connect always returns True) so it's connected by
+# construction, not by log text.
+CONNECTED_RE = re.compile(r"<-\s*\w+:\s*CONNECTED\b")
+# Prefix stamped on every captured subprocess line (see run_cell): elapsed seconds since
+# that attempt's t0. Lets time_to_connect be read straight off the CONNECTED line itself
+# instead of needing a second wall-clock source.
+LINE_TS_RE = re.compile(r"^\[\+\s*([\d.]+)\]")   # the {elapsed:8.3f} field pads with spaces
+
+
+def _cell_basename_declared(tag, modem, cell, rep):
+    """Approximate the (tag, modem, cell, rep) -> log/npstats basename using only the
+    cell's DECLARED fields, for the load-time uniqueness check below (run_cell's real
+    basename instead uses channel_sim's RESOLVED fade descriptor -- fade_resolved needs
+    the built env, which doesn't exist yet at spec-load time).
+
+    label is the only field a spec author controls to disambiguate cells that agree on
+    every other basename component (sigma/watterson/payload/rep) -- e.g. an atten_db (or
+    any other env-only) sweep. Using the declared "watterson" means this won't catch a
+    SIM_FADE_SCHEDULE/env override silently changing the effective fade (a separate,
+    pre-existing, documented risk) -- it catches the collision class actually seen: same
+    declared fields, differing only by an unlabeled knob."""
+    label = _fnsafe(cell.get("label", ""))
+    watt = cell.get("watterson", "off")
+    payload = cell.get("payload", 4096)
+    return (f"{tag}_{modem}_" + (f"{label}_" if label else "")
+            + f"s{cell['sigma']}_{watt}_p{payload}_r{rep}")
 
 
 def snr3k_nominal(sigma, gain=1.0):
@@ -379,6 +412,11 @@ def run_cell(modem, cell, rep, writer, fcsv, tag):
     # only by `env` (e.g. moderate s4000 with and without T/R jitter) would otherwise
     # write the SAME files and silently clobber each other's logs and stats.
     label = _fnsafe(cell.get("label", ""))
+    # NOTE: this uses the RESOLVED watt (fade_resolved, above), not the cell's raw
+    # declared "watterson" -- a scheduled/custom fade's filename must name what
+    # channel_sim actually ran. _cell_basename_declared (used by the load-time
+    # uniqueness check) approximates with the declared field instead, since that
+    # check runs before any env/fade resolution exists to consult.
     base = f"{tag}_{modem}_" + (f"{label}_" if label else "") + \
            f"s{sigma}_{watt}_p{payload}_r{rep}"
     log = os.path.join(LOGDIR, base + ".log")
@@ -408,12 +446,23 @@ def run_cell(modem, cell, rep, writer, fcsv, tag):
     attempts = 2  # one extra try, consumed ONLY on a connect-type failure (Mercury HD race)
     for att in range(attempts):
         t0 = time.time()
+        # Stream + timestamp each line as it arrives ("[+12.345] <line>") instead of a
+        # blind redirect: neither the adapters nor channel_sim stamp their own output, so
+        # without this, "time to connect" cannot be recovered after the fact -- only
+        # whichever numbers happen to reach a final RESULT line (RES_CONN, blank on any
+        # row with no RESULT at all -- exactly the connect-then-no-decode case below).
         with open(log, "wb") as lf:
-            p = sp.run(["timeout", str(kill), *adapter_argv(cfg, payload, tmo)],
-                       cwd=BENCH_ROOT, env=skywave.child_env(env),
-                       stdout=lf, stderr=sp.STDOUT)
+            p = sp.Popen(["timeout", str(kill), *adapter_argv(cfg, payload, tmo)],
+                        cwd=BENCH_ROOT, env=skywave.child_env(env),
+                        stdout=sp.PIPE, stderr=sp.STDOUT, text=True, bufsize=1)
+            chunks = []
+            for raw_line in p.stdout:
+                stamped = f"[+{time.time() - t0:8.3f}] {raw_line}"
+                lf.write(stamped.encode("utf-8", errors="replace"))
+                chunks.append(stamped)
+            p.wait()
         el = round(time.time() - t0, 1)
-        txt = open(log, errors="replace").read()
+        txt = "".join(chunks)
         got = tot = 0; dt = el; intact = "false"; gp = 0.0; peak = 0; sn = -99.0
         conn = ""    # blank = not reported (fail_connect row, or a pre-connect_s adapter)
         wall = ""    # blank = not reported (fail row, or a pre-wall_s adapter)
@@ -452,6 +501,23 @@ def run_cell(modem, cell, rep, writer, fcsv, tag):
         between_cell_cleanup()
     if att > 0 and status != "fail_connect":
         status += "+retry"
+    # Acquisition, independent of decode outcome: a connect-then-no-decode row (VARA at
+    # -16.5 dB in the FRINGE smoke -- CONNECTED, then zero bytes in the full 600 s budget)
+    # has NO "RESULT" line at all, so `conn`/`wall` above stay blank and `status` reads
+    # "timeout"/"fail" exactly like a row that never connected. Below the decode floor,
+    # Arms A and B return identical zeros and stop being distinguishable -- these two
+    # columns are what actually answers "did it acquire" in either arm.
+    if modem == "freedata":
+        connected, time_to_connect = True, ""     # no handshake distinct from the transfer
+    else:
+        mconn = CONNECTED_RE.search(txt)
+        if mconn:
+            connected = True
+            line_start = txt.rfind("\n", 0, mconn.start()) + 1
+            mts = LINE_TS_RE.match(txt[line_start:])
+            time_to_connect = float(mts.group(1)) if mts else ""
+        else:
+            connected, time_to_connect = False, ""
     stats = read_np_stats(npstats)
     act_rms = round(float(stats.get("act_rms", 0.0)), 1)
     gain = env.get("TXGAIN", "1.0")
@@ -474,7 +540,8 @@ def run_cell(modem, cell, rep, writer, fcsv, tag):
            "log": os.path.basename(log), "rig_gen": RIG_GEN,
            "connect_s": conn, "label": label, "wall_s": wall,
            "fade_delay_ms": fade_ms, "fade_doppler_hz": fade_hz,
-           "atten_db": atten_db}
+           "atten_db": atten_db,
+           "connected": connected, "time_to_connect": time_to_connect}
     writer.writerow(row); fcsv.flush()
     lbl = f" [{label}]" if label else ""
     print(f"[{modem}]{lbl} s={sigma}({row['snr3k']}dB) {watt} p={payload} r{rep}: "
@@ -534,6 +601,22 @@ def main():
         if bad:
             raise SystemExit(f"sweep_runner: cell {idx} in {spec}: env keys must start "
                              f"with SIM_ (got {', '.join(bad)})")
+    # Basename-collision fail-fast (owner review, FRINGE campaign, 2026-07-26): a cell
+    # list where two (cell, rep) pairs agree on tag/sigma/watterson/payload/rep but
+    # differ only by an unlabeled knob (atten_db was the case that surfaced this) write
+    # the SAME log/npstats path and silently clobber each other -- only the LAST such
+    # cell's artifacts survive. Catch it here, at load, instead of discovering it after
+    # a multi-hour campaign that a "label" field would have fixed for one line of JSON.
+    seen = {}
+    for idx, c in enumerate(cells):
+        for rep in range(c.get("reps", 1)):
+            key = _cell_basename_declared(tag, modem, c, rep)
+            if key in seen:
+                raise SystemExit(
+                    f"sweep_runner: basename collision in {spec}: cell {seen[key]} and "
+                    f"cell {idx} (rep {rep}) both resolve to '{key}' -- add a "
+                    f"distinguishing \"label\" field to at least one of them")
+            seen[key] = idx
     # Column order is owned by results_schema (the versioned corpus contract, B4) so a
     # rename can't silently desync the writer from downstream readers.
     cols = COLUMNS

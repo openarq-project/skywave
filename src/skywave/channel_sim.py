@@ -30,6 +30,14 @@ Env:
            rates. 48 kHz-calibrated cell values stay valid verbatim at any FS. [0.0]
   SIM_SIGMA_REF_FS  reference rate for the SIGMA semantics above; 0 = disable
            (SIGMA is then the raw per-sample std at the cable rate)         [48000]
+  SIM_ATTEN_DB  path-loss attenuation applied to the signal only, after fade/foff/skew
+           and before the delay line and AWGN (level(gain->clip)->[fade]->ATTEN->
+           [delay]->+AWGN). Reaches deeper SNR than SIGMA alone can (SIGMA vs int16
+           rails), and every modem takes the same dB so equal-PEP fairness is preserved.
+           Does NOT touch TXGAIN or the TX-stats accumulator (_accum runs pre-ATTEN, in
+           tx_shape()) — a consumer of act_rms must subtract SIM_ATTEN_DB from any SNR it
+           derives from act_rms/SIGMA, or its SNR will read high by exactly this amount.
+           [0.0]
   SEED     base RNG seed; per-direction seeds = SEED+11 (A->B), SEED+22 (B->A)      [1234]
   NP_STATS if set, write per-direction signal stats JSON to <path>.11 / <path>.22
            (incl. key_duty aggregate airtime and key_bursts, the keyed-burst /
@@ -109,6 +117,12 @@ FS = int(os.environ.get("SIM_FS", "48000").strip() or "48000")
 NCH = int(os.environ.get("SIM_NCH", "2").strip() or "2")
 GAIN = float(os.environ.get("TXGAIN", "1.0").strip() or "1.0")
 SIGMA = float(os.environ.get("SIGMA", "0.0").strip() or "0.0")
+# SIM_ATTEN_DB: path-loss on the signal only (post-fade, pre-delay/noise). Lets deep-fringe
+# cells reach SNRs SIGMA alone cannot (a large SIGMA clips the int16 sum instead of lowering
+# SNR further). Every modem takes the same dB, so equal-PEP fairness is preserved — do NOT
+# fold this into TXGAIN. See module docstring for the correctness trap on derived SNR.
+ATTEN_DB = float(os.environ.get("SIM_ATTEN_DB", "0.0").strip() or "0.0")
+ATTEN = 10.0 ** (-ATTEN_DB / 20.0)
 SEED = int(os.environ.get("SEED", "1234").strip() or "1234")
 STATS = os.environ.get("NP_STATS", "").strip()
 # SIM_TXDUMP: if set, dump each direction's post-gain, pre-noise TX stream (the exact bytes the
@@ -786,6 +800,8 @@ class Link:
             m = self.fx.skew.process(np.ascontiguousarray(w[0::NCH]))
             for c in range(NCH):
                 w[c::NCH] = m
+        if ATTEN_DB != 0.0:
+            np.multiply(w, ATTEN, out=w)              # path loss, linear (no clip)
         if self.dl.size:
             s = self._dlscratch                       # [dl | w], allocation-free
             m = self.dl.size

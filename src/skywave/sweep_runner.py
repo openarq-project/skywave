@@ -345,6 +345,8 @@ def run_cell(modem, cell, rep, writer, fcsv, tag):
         env["SIM_FADE_DELAY_MS"] = str(cell["fade_delay_ms"])
     if "fade_doppler_hz" in cell:
         env["SIM_FADE_DOPPLER_HZ"] = str(cell["fade_doppler_hz"])
+    if "atten_db" in cell:
+        env["SIM_ATTEN_DB"] = str(cell["atten_db"])
     env["SEED"] = str(1234 + rep * 7)
     # Signal-time budget parity: bound the run at the cell timeout in VIRTUAL seconds.
     # Only the lockstep sock loop reads SIM_MAX_VIRTUAL_S, so this is inert on the
@@ -456,6 +458,13 @@ def run_cell(modem, cell, rep, writer, fcsv, tag):
     snr = snr3k_measured(act_rms, sigma)
     if snr is None:
         snr = snr3k_nominal(sigma, gain)
+    # act_rms is measured pre-ATTEN (_accum runs in tx_shape(), before the deliver_block
+    # ATTEN stage -- see channel_sim.py's SIM_ATTEN_DB doc), so it overstates the delivered
+    # SNR by exactly the attenuation. Correct it here rather than in the accumulator, so
+    # the TX-stats/PAPR pipeline (calibration, etc.) stays untouched.
+    atten_db = float(env.get("SIM_ATTEN_DB", "0.0") or "0.0")
+    if atten_db:
+        snr = round(snr - atten_db, 1)
     row = {"modem": modem, "tag": tag, "sigma": sigma, "snr3k": snr,
            "act_rms": act_rms, "txgain": gain,
            "watterson": watt, "payload": payload, "rep": rep,
@@ -464,7 +473,8 @@ def run_cell(modem, cell, rep, writer, fcsv, tag):
            "elapsed": el, "status": status, "rc": p.returncode,
            "log": os.path.basename(log), "rig_gen": RIG_GEN,
            "connect_s": conn, "label": label, "wall_s": wall,
-           "fade_delay_ms": fade_ms, "fade_doppler_hz": fade_hz}
+           "fade_delay_ms": fade_ms, "fade_doppler_hz": fade_hz,
+           "atten_db": atten_db}
     writer.writerow(row); fcsv.flush()
     lbl = f" [{label}]" if label else ""
     print(f"[{modem}]{lbl} s={sigma}({row['snr3k']}dB) {watt} p={payload} r{rep}: "

@@ -53,6 +53,12 @@ integer -- record the change in the changelog below.
     unfaded -- a PRESETS.get(name) that falls back to "off"/None recreates the exact
     corpus lie this change fixed. Prefer the two numeric columns over parsing the
     descriptor string; its format is a human/filename label, not a contract.
+  results-schema/1 + atten_db (2026-07-26): trailing column `atten_db` appended -- the
+    cell's SIM_ATTEN_DB ACTUAL (path-loss dB applied by channel_sim, 0.0 when unset).
+    `snr3k` already has this subtracted out by sweep_runner (act_rms is measured
+    pre-attenuation, so it would otherwise overstate delivered SNR by exactly this
+    amount) -- this column exists for provenance, not as a correction a reader must
+    apply again. Added for the FRINGE deep-SNR campaign. Append = no bump.
 """
 import csv
 import json
@@ -69,6 +75,7 @@ COLUMNS = [
     "elapsed", "status", "rc", "log", "rig_gen",
     "connect_s", "label", "wall_s",
     "fade_delay_ms", "fade_doppler_hz",
+    "atten_db",
 ]
 
 # Per-column caster for the READER side (read_corpus). Everything is stored as text in
@@ -81,6 +88,7 @@ COLUMN_TYPES = {
     "sn_med": float, "elapsed": float, "status": str, "rc": int, "log": str,
     "rig_gen": int, "connect_s": float, "label": str, "wall_s": float,
     "fade_delay_ms": float, "fade_doppler_hz": float,
+    "atten_db": float,
 }
 
 

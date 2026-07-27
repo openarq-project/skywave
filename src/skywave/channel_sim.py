@@ -570,6 +570,16 @@ try:
     from scipy.signal import butter as _butter, sosfilt as _sosfilt
 except ImportError:  # scipy is only needed when fading or the rig BPF is enabled
     _butter = _sosfilt = None
+# The public sosfilt wrapper spends ~2/3 of its per-call time on argument
+# validation/axis handling — at one 1024-sample block per call, 4 calls per
+# block-pair, that overhead dominated the whole transform chain (profiled
+# 2026-07-27). The compiled kernel takes (sos, x(n_signals, n), zi(n_signals,
+# n_sections, 2)) in-place and is bit-identical to the wrapper (verified);
+# private scipy API, so fall back to the wrapper if it moves.
+try:
+    from scipy.signal._sosfilt import _sosfilt as _sosfilt_kernel
+except ImportError:
+    _sosfilt_kernel = None
 
 
 def _resolve_rig_band():
@@ -588,12 +598,24 @@ class RigBPF:
     def __init__(self, lo_hz, hi_hz, order, fs):
         if _butter is None:
             raise RuntimeError("SIM_RIG_BPF / SIM_RIG_LO needs scipy (pip install scipy)")
-        self.sos = _butter(order, [lo_hz, hi_hz], btype="band", fs=fs, output="sos")
+        self.sos = np.ascontiguousarray(
+            _butter(order, [lo_hz, hi_hz], btype="band", fs=fs, output="sos"))
         self.zi = np.zeros((self.sos.shape[0], 2))
+        self._zi3 = self.zi.reshape(1, -1, 2)   # kernel-shaped view of the SAME state
+        self._x = None                          # persistent (1, n) kernel work buffer
 
     def process(self, mono):
-        y, self.zi = _sosfilt(self.sos, mono, zi=self.zi)
-        return y
+        if _sosfilt_kernel is None:             # scipy moved the kernel: slow path
+            y, self.zi = _sosfilt(self.sos, mono, zi=self.zi)
+            self._zi3 = self.zi.reshape(1, -1, 2)
+            return y
+        n = mono.shape[0]
+        x = self._x
+        if x is None or x.shape[1] != n:
+            self._x = x = np.empty((1, n))
+        x[0] = mono                             # also the contiguous copy the kernel needs
+        _sosfilt_kernel(self.sos, x, self._zi3)
+        return x[0].copy()                      # callers may hold results across calls
 
 
 class Link:
@@ -1139,6 +1161,7 @@ def run_lockstep(ab, ba, ptt, stop):
     # equivalent) instead of silently scaling with the virtual pace.
     virt_status = os.path.join(SOCK_DIR, "virt_now_ms")
     last_status_ms = -10**9
+    last_stats_ms = -10**9
     k = 0
     while not stop.is_set():
         vnow_ms = ((k + 1) * BLOCK * 1000) // FS     # block END time, exact
@@ -1197,7 +1220,12 @@ def run_lockstep(ab, ba, ptt, stop):
         ba.nblocks += 1
         k += 1
         VIRT_NOW_S = vnow_ms / 1000.0
-        if STATS:                            # every block: drivers poll virtual_s
+        # Same 500 virtual-ms cadence as the virt_now_ms status file: nothing
+        # in-tree reads npstats mid-run faster than that (sweep_runner reads it
+        # once post-run; adapters time off virt_now_ms), and the two
+        # open+json+rename calls PER BLOCK were ~30% of the lockstep loop.
+        if STATS and vnow_ms - last_stats_ms >= 500:
+            last_stats_ms = vnow_ms
             ab.write_stats()
             ba.write_stats()
     VIRT_NOW_S = (k * BLOCK * 1000) // FS / 1000.0   # end of the last completed block

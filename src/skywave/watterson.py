@@ -130,15 +130,27 @@ class WattersonChannel:
         self.hist_len = len(self.h) + self.delay
         self.hist = np.zeros(self.hist_len, dtype=np.float64)
         self.t = 0          # absolute audio-sample index (for Doppler interpolation)
+        self._buf = None    # persistent [hist | block] scratch (lazy: block size unknown)
+        self._ar = None     # cached float64 arange for the interpolation grid
 
-    def _gain_block(self, gain_low, n):
-        """Linear-interpolate `n` complex gain samples at the current absolute time onto
-        the low-rate grid; wrap modulo the generated length so a session longer than
-        `dur_s` keeps fading (a small seam once per cycle is harmless for goodput stats)."""
-        idx = (self.t + np.arange(n)) * (self.low_fs / self.fs)
+    def _interp_grid(self, n):
+        """(i0, frac) low-rate interpolation coordinates for the next `n` audio samples,
+        shared by both paths (identical grid — computing it twice was pure waste); wrap
+        modulo the generated length so a session longer than `dur_s` keeps fading (a
+        small seam once per cycle is harmless for goodput stats). float64 arange is
+        bit-identical to the previous int arange (sample indices are exact in a double)."""
+        if self._ar is None or self._ar.shape[0] < n:
+            self._ar = np.arange(n, dtype=np.float64)
+        idx = (self.t + self._ar[:n]) * (self.low_fs / self.fs)
         idx = np.mod(idx, self.n_low - 1)
         i0 = idx.astype(np.int64)
         frac = idx - i0
+        return i0, frac
+
+    def _gain_block(self, gain_low, n):
+        """Linear-interpolate `n` complex gain samples at the current absolute time
+        (kept for API compatibility; process() uses the shared-grid path)."""
+        i0, frac = self._interp_grid(n)
         g0 = gain_low[i0]
         g1 = gain_low[i0 + 1]
         return g0 + (g1 - g0) * frac
@@ -149,8 +161,13 @@ class WattersonChannel:
         n = len(block)
         if out is None:
             out = np.empty(n, dtype=np.float64)
-        # Concatenate history + this block, compute the analytic signal over the block.
-        buf = np.concatenate((self.hist, block))
+        # [history | block] in a persistent scratch (was a per-block np.concatenate);
+        # the analytic signal is computed over the whole span.
+        if self._buf is None or self._buf.shape[0] != self.hist_len + n:
+            self._buf = np.empty(self.hist_len + n, dtype=np.float64)
+        buf = self._buf
+        buf[:self.hist_len] = self.hist
+        buf[self.hist_len:] = block
         # Imag part: full-band FIR Hilbert (valid region aligned so z[k] matches buf sample
         # at offset hist_len - gdelay + k... we index explicitly below).
         imag_full = np.convolve(buf, self.h, mode="valid")  # length = len(buf)-len(h)+1
@@ -161,15 +178,17 @@ class WattersonChannel:
         real0 = buf[base:base + n]
         # imag_full[j] corresponds to buf center index j + gdelay; we want center = base + k.
         imv0 = imag_full[base - self.gdelay: base - self.gdelay + n]
-        z0 = real0 + 1j * imv0
         # Delayed path: same analytic signal `delay` samples earlier.
         real1 = buf[base - self.delay: base - self.delay + n]
         imv1 = imag_full[base - self.gdelay - self.delay: base - self.gdelay - self.delay + n]
-        z1 = real1 + 1j * imv1
-        g1 = self._gain_block(self.p1, n)
-        g2 = self._gain_block(self.p2, n)
-        faded = self.hf_gain * np.real(g1 * z0 + g2 * z1)
-        out[:] = faded
+        i0, frac = self._interp_grid(n)             # one grid, both paths
+        g1 = self.p1[i0] + (self.p1[i0 + 1] - self.p1[i0]) * frac
+        g2 = self.p2[i0] + (self.p2[i0 + 1] - self.p2[i0]) * frac
+        # Re{g1*z0 + g2*z1} expanded on the real/imag parts directly — identical
+        # elementwise arithmetic (a complex multiply's real part IS gr*zr - gi*zi),
+        # without materializing z0/z1 or the complex products' imaginary halves.
+        out[:] = (g1.real * real0 - g1.imag * imv0) + (g2.real * real1 - g2.imag * imv1)
+        out *= self.hf_gain
         # Roll history: keep the last hist_len samples of buf for the next block.
         self.hist[:] = buf[-self.hist_len:]
         self.t += n

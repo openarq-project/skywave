@@ -199,6 +199,14 @@ FADE_SEED = int(os.environ.get("SIM_FADE_SEED", str(SEED)).strip() or str(SEED))
 # identical channel realizations. Overrides SIM_WATTERSON when set.
 FADE_SCHEDULE = os.environ.get("SIM_FADE_SCHEDULE", "").strip()
 FADE_XFADE_S = float(os.environ.get("SIM_FADE_XFADE_S", "1.0").strip() or "1.0")
+# Doppler-shaping filter convention (adjudicated 2026-07-28; see watterson.py
+# _doppler_gain_lowrate). "codec2" (default) = gen_fading lineage, REALIZED
+# spread ~0.8x nominal — kept default for corpus/codec2-ch comparability.
+# "milstd" = MIL-STD-188-110C App E time-domain Gaussian taps, realized spread
+# = nominal (the F.1487 power-spectrum convention). Flipping the default is a
+# RIG_GEN event.
+FADE_FILTER = (os.environ.get("SIM_FADE_FILTER", "codec2").strip().lower()
+               or "codec2")
 # Rig SSB audio passband (TX + RX). A real SSB transceiver band-limits the audio
 # to ~2.4-2.9 kHz on BOTH transmit and receive, so a wide mode's edge carriers (FD-OFDM-2438
 # spans ~281-2719 Hz) hit the filter skirt + edge group delay. The flat-to-Nyquist sim
@@ -306,6 +314,15 @@ FOFF_HZ = float(os.environ.get("SIM_FOFF_HZ", "0").strip() or "0")
 # − on B->A). Unset = static offset (bit-exact legacy path).
 FOFF_RAMP_HZ = os.environ.get("SIM_FOFF_RAMP_HZ", "").strip()
 FOFF_RAMP_S = float(os.environ.get("SIM_FOFF_RAMP_S", "600").strip() or "600")
+# Sinusoidal LO wobble (the IONOS instrument's FM DEVIATION / FM RATE axes,
+# firmware modes 9/10: a VLF sine on the down-mix LO; deck ladder deviation
+# 1..200 Hz, rate 0.1..20 Hz; usable with all channel types — VHF/UHF Doppler
+# flutter / oscillator-wobble modeling). Adds dev*sin(2*pi*rate*t) to the
+# instantaneous offset; composes with SIM_FOFF_HZ and the ramp, differential
+# like them (+dev A->B, -dev B->A — a half-period phase flip, kept for
+# convention consistency). SIM_FOFF_DEV_HZ requires SIM_FOFF_RATE_HZ > 0.
+FOFF_DEV_HZ = float(os.environ.get("SIM_FOFF_DEV_HZ", "0").strip() or "0")
+FOFF_RATE_HZ = float(os.environ.get("SIM_FOFF_RATE_HZ", "0").strip() or "0")
 CLOCK_PPM = float(os.environ.get("SIM_CLOCK_PPM", "0").strip() or "0")
 CLOCK_SLACK_MS = float(os.environ.get("SIM_CLOCK_SLACK_MS", "20").strip() or "20")
 ALC_DB = float(os.environ.get("SIM_ALC_OVERSHOOT_DB", "0").strip() or "0")
@@ -839,9 +856,17 @@ class Link:
         # to the signal, it does not saturate; the RX pad + guard below is the
         # only int16-boundary clip).
         qrm = self.fx.qrm if self.fx is not None else None
+        # FM ionosnc: the fade carries a complementary per-block noise-gain
+        # track (the IONOS instrument raises the noise as the signal fades;
+        # fm_channel docstring). None on every other fade kind — the baseline
+        # noise path stays byte-identical.
+        ngain = getattr(self.fade, "noise_gain", None)
         if deliver:
             if self.sigma > 0.0:
                 self._fill_noise(self.noise)
+                if ngain is not None:
+                    for c in range(NCH):
+                        self.noise[c::NCH] *= ngain
                 w += self.noise
             if qrm is not None:
                 self._add_qrm(w, qrm)
@@ -850,6 +875,9 @@ class Link:
             # transmitter) only; no peer signal reaches it
             if self.sigma > 0.0:
                 self._fill_noise(w)
+                if ngain is not None:
+                    for c in range(NCH):
+                        w[c::NCH] *= ngain
             else:
                 w[:] = 0.0
             if qrm is not None:
@@ -1246,6 +1274,11 @@ def build_channel_effects():
     fade_ab = fade_ba = None
     fdelay = fdop = None
     fade_desc = "fade=off"
+    from skywave import watterson as _watt
+    if FADE_FILTER not in _watt.FILTER_MODES:
+        print(f"channel_sim: unknown SIM_FADE_FILTER='{FADE_FILTER}' "
+              f"(use {'|'.join(_watt.FILTER_MODES)})", file=sys.stderr, flush=True)
+        return 2
     if FADE_SCHEDULE:
         from skywave import watterson
         segs = []
@@ -1265,9 +1298,11 @@ def build_channel_effects():
                       f"{frm} -> {to}", file=sys.stderr, flush=True)
             return _log
         fade_ab = watterson.ScheduledFade(FS, segs, FADE_DUR_S, FADE_SEED + 11,
-                                          FADE_XFADE_S, _mk_transition_logger("A->B"))
+                                          FADE_XFADE_S, _mk_transition_logger("A->B"),
+                                          filter_mode=FADE_FILTER)
         fade_ba = watterson.ScheduledFade(FS, segs, FADE_DUR_S, FADE_SEED + 22,
-                                          FADE_XFADE_S, _mk_transition_logger("B->A"))
+                                          FADE_XFADE_S, _mk_transition_logger("B->A"),
+                                          filter_mode=FADE_FILTER)
         fade_desc = ("fade=schedule[" + ",".join(f"{n}:{s:g}" for n, s in segs)
                      + f"]xf={FADE_XFADE_S:g}s")
     elif FADE_DOPPLER and FADE_DELAY:
@@ -1284,9 +1319,29 @@ def build_channel_effects():
         fade_name = WATTERSON
     if fdop is not None:
         from skywave import watterson
-        fade_ab = watterson.WattersonChannel(FS, fdelay, fdop, FADE_DUR_S, FADE_SEED + 11)
-        fade_ba = watterson.WattersonChannel(FS, fdelay, fdop, FADE_DUR_S, FADE_SEED + 22)
+        fade_ab = watterson.WattersonChannel(FS, fdelay, fdop, FADE_DUR_S,
+                                             FADE_SEED + 11, filter_mode=FADE_FILTER)
+        fade_ba = watterson.WattersonChannel(FS, fdelay, fdop, FADE_DUR_S,
+                                             FADE_SEED + 22, filter_mode=FADE_FILTER)
         fade_desc = f"fade={fade_name}({fdelay}ms/{fdop}Hz)"
+        # F.1487 Annex 3 s6: an ensemble-converged ABSOLUTE result needs
+        # ~3000 independent fade states (channel seconds x Doppler). If one
+        # full realization can't reach that, say so up front with the rep
+        # count that would (paired-seed A/B orderings are exempt — channel
+        # variance cancels between arms). fade_units in the corpus carries
+        # the per-row arithmetic.
+        _units_per_real = FADE_DUR_S * fdop
+        if _units_per_real < 3000.0:
+            print(f"channel_sim: note — {fade_name}({fdop:g}Hz) yields "
+                  f"{_units_per_real:.0f} fade units per {FADE_DUR_S:g}s "
+                  f"realization; ensemble convergence for ABSOLUTE numbers "
+                  f"needs ~3000 (≈{int(np.ceil(3000.0 / _units_per_real))} "
+                  "independent-seed reps at full dwell, or virt_time dwell; "
+                  "paired-seed A/B orderings are unaffected)",
+                  file=sys.stderr, flush=True)
+    if fade_ab is not None and FADE_FILTER != "codec2":
+        # Provenance: non-default Doppler-filter convention is part of the cell
+        fade_desc += f" fade_filter={FADE_FILTER}"
 
     # Resolve the rig SSB passband. Each direction gets its OWN stateful TX + RX filter
     # (4 total; the state must not be shared across legs). Same band both ends (symmetric
@@ -1358,18 +1413,18 @@ def build_channel_effects():
             except ValueError as e:
                 print(f"channel_sim: {e}", file=sys.stderr, flush=True)
                 return 2
-            kind, fd, kdb, depth, rate, shape = ("static", 0.0, 0.0, 0.0,
-                                                 0.0, "sin")
+            kind, fd, kdb, depth, rate, shape, sn0 = ("static", 0.0, 0.0, 0.0,
+                                                      0.0, "sin", 0.0)
             fdesc = "static"
             if fspec is not None:
-                kind, fd, kdb, depth, rate, shape, fdesc = fspec
+                kind, fd, kdb, depth, rate, shape, sn0, fdesc = fspec
             ssig, stau = shspec if shspec is not None else (0.0, 0.0)
             fade_ab = fm_channel.FmFade(FS, kind, FADE_DUR_S, FADE_SEED + 11,
                                         fd, kdb, depth, rate, ssig, stau,
-                                        ionos_shape=shape)
+                                        ionos_shape=shape, ionos_sn0_db=sn0)
             fade_ba = fm_channel.FmFade(FS, kind, FADE_DUR_S, FADE_SEED + 22,
                                         fd, kdb, depth, rate, ssig, stau,
-                                        ionos_shape=shape)
+                                        ionos_shape=shape, ionos_sn0_db=sn0)
             fade_desc = f"fm_fade={fdesc}"
             if shspec is not None:
                 fade_desc += f" fm_shadow={ssig:g}dB/tau{stau:g}s"
@@ -1403,7 +1458,12 @@ def build_channel_effects():
                                    imp=None, qrm=None)
     fx_desc = []
     _foff_ramp = float(FOFF_RAMP_HZ) if FOFF_RAMP_HZ else None
-    if any((FOFF_HZ, _foff_ramp, CLOCK_PPM, ALC_DB, RX_AGC, NOISE_VD,
+    if FOFF_DEV_HZ < 0.0 or (FOFF_DEV_HZ > 0.0 and FOFF_RATE_HZ <= 0.0):
+        print("channel_sim: SIM_FOFF_DEV_HZ needs SIM_FOFF_RATE_HZ > 0 "
+              "(sinusoidal wobble: dev*sin(2*pi*rate*t))",
+              file=sys.stderr, flush=True)
+        return 2
+    if any((FOFF_HZ, _foff_ramp, FOFF_DEV_HZ, CLOCK_PPM, ALC_DB, RX_AGC, NOISE_VD,
             QRM_OCC, QRM_SWEEP)):
         from skywave import rig_effects as fxm
         if ALC_DB:
@@ -1414,15 +1474,21 @@ def build_channel_effects():
             _tag = f"alc={ALC_PRESET}" if ALC_PRESET != "off" else "alc"
             fx_desc.append(f"{_tag}=+{ALC_DB:g}dB/{ALC_SETTLE_MS:g}ms"
                            + (f"/rearm{_alc_rearm_s:g}s" if _alc_rearm_s else ""))
-        if FOFF_HZ or _foff_ramp is not None:
+        if FOFF_HZ or _foff_ramp is not None or FOFF_DEV_HZ:
             fx_ab.foff = fxm.FreqShift(FS, +FOFF_HZ, ramp_to_hz=_foff_ramp,
-                                       ramp_s=FOFF_RAMP_S)
+                                       ramp_s=FOFF_RAMP_S,
+                                       wobble_dev_hz=+FOFF_DEV_HZ,
+                                       wobble_rate_hz=FOFF_RATE_HZ)
             fx_ba.foff = fxm.FreqShift(FS, -FOFF_HZ, ramp_to_hz=_foff_ramp,
-                                       ramp_s=FOFF_RAMP_S)
+                                       ramp_s=FOFF_RAMP_S,
+                                       wobble_dev_hz=-FOFF_DEV_HZ,
+                                       wobble_rate_hz=FOFF_RATE_HZ)
             if _foff_ramp is not None:
                 fx_desc.append(f"foff=+-{FOFF_HZ:g}->{_foff_ramp:g}Hz/{FOFF_RAMP_S:g}s")
-            else:
+            elif FOFF_HZ:
                 fx_desc.append(f"foff=+-{FOFF_HZ:g}Hz")
+            if FOFF_DEV_HZ:
+                fx_desc.append(f"foff_wobble=+-{FOFF_DEV_HZ:g}Hz@{FOFF_RATE_HZ:g}Hz")
         if CLOCK_PPM:
             fx_ab.skew = fxm.ClockSkew(FS, +CLOCK_PPM, CLOCK_SLACK_MS)
             fx_ba.skew = fxm.ClockSkew(FS, -CLOCK_PPM, CLOCK_SLACK_MS)

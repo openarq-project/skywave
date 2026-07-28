@@ -93,6 +93,93 @@ def _main_rc(**env):
     return r.returncode, r.stderr
 
 
+def test_ionosnc_complementary_gains_exact():
+    # a(t)/b(t) must equal the ionos S/N trajectory 10^(-d/20) exactly, with
+    # both tracks normalized to 1 at the envelope maximum (fm_channel docs).
+    from skywave import fm_channel
+    fade = fm_channel.FmFade(48000.0, "ionosnc", 60.0, 1,
+                             ionos_depth_db=30.0, ionos_rate_hz=1.0,
+                             ionos_sn0_db=30.0)
+    a, b = fade.env.track, fade.noise_env.track
+    ph = np.arange(len(a)) / (len(a) - 1)
+    d = 30.0 * 0.5 * (1.0 - np.cos(2.0 * np.pi * ph))
+    assert a[0] == 1.0 and b[0] == 1.0
+    assert np.abs(20.0 * np.log10(a / b) + d).max() < 1e-9
+    # instrument split at the trough: noise near +24 dB, signal only ~-6 dB
+    assert 23.0 < 20.0 * np.log10(b.max()) < 25.5
+    assert -7.0 < 20.0 * np.log10(a.min()) < -4.5
+
+
+def test_ionosnc_noise_rises_through_link():
+    # Undelivered path (no TX signal): the receiver's noise floor must trace
+    # the complementary noise track — LOUDER in the fade trough.
+    cs = load_sim(SIM_FM_PORT="data9600", SIM_FM_FADE="ionosnc:30:3:30",
+                  SIGMA="1000")
+    from skywave import fm_channel
+    fade = fm_channel.FmFade(cs.FS, "ionosnc", 60.0, 1,
+                             ionos_depth_db=30.0, ionos_rate_hz=3.0,
+                             ionos_sn0_db=30.0)
+    link = make_link(cs, fade=fade)
+    zero = interleave(cs, np.zeros(cs.BLOCK))
+    rms = []
+    for _ in range(cs.FS // cs.BLOCK):        # ~1 s = 3 fade periods
+        y = feed(link, zero)
+        rms.append(float(np.sqrt(np.mean(y[0::cs.NCH].astype(float) ** 2))))
+    swing = 20.0 * np.log10(max(rms) / max(min(rms), 1e-9))
+    assert 22.0 < swing < 26.5                # +24.25 dB noise rise traced
+
+
+def test_ionosnc_signal_dip_is_shallow_through_link():
+    # Delivered path: the SIGNAL under ionosnc dips only ~5.75 dB at a 30 dB
+    # fade (the S/N excursion is carried by the rising noise) — the defining
+    # difference from plain `ionos`, whose signal dips the full 30 dB.
+    cs = load_sim(SIM_FM_PORT="data9600", SIM_FM_FADE="ionosnc:30:3:30",
+                  SIGMA="0")
+    from skywave import fm_channel
+    fade = fm_channel.FmFade(cs.FS, "ionosnc", 60.0, 1,
+                             ionos_depth_db=30.0, ionos_rate_hz=3.0,
+                             ionos_sn0_db=30.0)
+    link = make_link(cs, fade=fade)
+    x = interleave(cs, np.full(cs.BLOCK, 8000.0))
+    rms = []
+    for _ in range(cs.FS // cs.BLOCK):
+        y = feed(link, x)
+        rms.append(float(np.sqrt(np.mean(y[0::cs.NCH].astype(float) ** 2))))
+    swing = 20.0 * np.log10(max(rms) / max(min(rms), 1e-9))
+    assert 4.5 < swing < 7.0                  # ~5.75 dB, NOT 30 dB
+
+
+def test_ionosnc_determinism_through_link():
+    outs = []
+    for _ in range(2):
+        cs = load_sim(SIM_FM_PORT="data9600", SIM_FM_FADE="ionosnc:20:3:25",
+                      SIGMA="1000")
+        from skywave import fm_channel
+        fade = fm_channel.FmFade(cs.FS, "ionosnc", 30.0, cs.FADE_SEED + 11,
+                                 ionos_depth_db=20.0, ionos_rate_hz=3.0,
+                                 ionos_sn0_db=25.0)
+        link = make_link(cs, fade=fade)
+        x = tone_block(cs)
+        outs.append(np.concatenate([feed(link, x) for _ in range(8)]))
+    assert np.array_equal(outs[0], outs[1])
+
+
+def test_plain_ionos_has_no_noise_track():
+    # The baseline noise path must stay untouched for every non-nc kind.
+    from skywave import fm_channel
+    fade = fm_channel.FmFade(48000.0, "ionos", 60.0, 1,
+                             ionos_depth_db=20.0, ionos_rate_hz=3.0)
+    fade.process(np.zeros(1024))
+    assert fade.noise_env is None and fade.noise_gain is None
+
+
+def test_ionosnc_spec_needs_sn0():
+    from skywave import fm_channel
+    import pytest
+    with pytest.raises(ValueError):
+        fm_channel.resolve_fade_spec("ionosnc:30:1", "2m")   # missing sn0_db
+
+
 def test_fade_knobs_require_fm_port():
     rc, err = _main_rc(SIM_FM_FADE="mobile-urban")
     assert rc == 2 and "SIM_FM_PORT" in err

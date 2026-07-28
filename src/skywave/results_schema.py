@@ -73,6 +73,14 @@ integer -- record the change in the changelog below.
     A and B of a fringe/deep-SNR sweep return identical zeros in every OTHER column --
     these two are what actually separates "didn't acquire" from "acquired but couldn't
     decode." Append = no bump.
+  results-schema/1 + fade_units (2026-07-28): trailing column appended -- F.1487
+    Annex 3 s6 statistical-coverage bookkeeping: independent fade states the row
+    sampled, wall_s x fade_doppler_hz ("" for no-fade rows, schedules, or rows with
+    no wall_s). Derivable from existing columns; made explicit so scorers can SUM
+    it over reps against the ~3000-unit ensemble-convergence bar without re-deriving
+    the rule, and so under-sampled absolute numbers are visible per row. Paired-seed
+    A/B orderings do not need the bar (channel variance cancels between arms); it
+    gates ABSOLUTE-number claims. Append = no bump.
 """
 import csv
 import json
@@ -91,6 +99,7 @@ COLUMNS = [
     "fade_delay_ms", "fade_doppler_hz",
     "atten_db",
     "connected", "time_to_connect",
+    "fade_units",
 ]
 
 # Per-column caster for the READER side (read_corpus). Everything is stored as text in
@@ -107,6 +116,7 @@ COLUMN_TYPES = {
     # connected stays str (mirrors `intact`): bool("False") == True in Python, so casting
     # this column to bool would silently invert every False row. Callers compare .lower().
     "connected": str, "time_to_connect": float,
+    "fade_units": float,
 }
 
 

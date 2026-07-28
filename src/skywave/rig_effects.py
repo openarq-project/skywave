@@ -19,16 +19,26 @@ from skywave.watterson import _hilbert_fir
 
 
 class FreqShift:
-    """Constant carrier-frequency offset on a real passband stream.
+    """Carrier-frequency offset on a real passband stream (static, ramped
+    and/or sinusoidally wobbled).
 
-    y(t) = Re{ z(t) * e^(j*2*pi*f*t) } with z the analytic signal (FIR Hilbert,
+    y(t) = Re{ z(t) * e^(j*phi(t)) } with z the analytic signal (FIR Hilbert,
     state carried across blocks; output delayed by the Hilbert group delay, same
-    as the Watterson applicator). SIM_FOFF_HZ is the two-station DIFFERENTIAL:
-    channel_sim applies +f on A->B and -f on B->A (opposing LO errors).
-    Realistic values: typ +-7..15 Hz (TCXO pair), worst ~+-100 Hz (research doc
-    Section 2 axis 10)."""
+    as the Watterson applicator) and phi the integral of the instantaneous
+    offset. SIM_FOFF_HZ is the two-station DIFFERENTIAL: channel_sim applies
+    +f on A->B and -f on B->A (opposing LO errors). Realistic values: typ
+    +-7..15 Hz (TCXO pair), worst ~+-100 Hz (research doc Section 2 axis 10).
 
-    def __init__(self, fs, foff_hz, hilbert_taps=255, ramp_to_hz=None, ramp_s=600.0):
+    Wobble (wobble_dev_hz/wobble_rate_hz): a sinusoidal term
+    dev*sin(2*pi*rate*t) added to the instantaneous offset — the IONOS
+    instrument's "FM DEVIATION"/"FM RATE" axes (HFSim_BFD_2_03.ino modes 9/10:
+    a VLF sine on the down-mix LO; deck ladder dev 1..200 Hz, rate 0.1..20 Hz,
+    usable with all channel types — VHF/UHF Doppler flutter and oscillator
+    wobble modeling). Composes with the static offset and the ramp; phase stays
+    continuous through the same integral."""
+
+    def __init__(self, fs, foff_hz, hilbert_taps=255, ramp_to_hz=None, ramp_s=600.0,
+                 wobble_dev_hz=0.0, wobble_rate_hz=0.0):
         self.fs = fs
         self.foff = float(foff_hz)
         # Optional slow carrier-drift ramp. The
@@ -39,6 +49,10 @@ class FreqShift:
         # stays phase-continuous (a per-block constant-freq would step-jump).
         self.ramp_to = None if ramp_to_hz is None else float(ramp_to_hz)
         self.ramp_samp = max(1.0, float(ramp_s) * fs)
+        self.wdev = float(wobble_dev_hz)
+        self.wrate = float(wobble_rate_hz)
+        if self.wdev and self.wrate <= 0.0:
+            raise ValueError("FreqShift wobble needs wobble_rate_hz > 0")
         self.h, self.gdelay = _hilbert_fir(hilbert_taps)
         self.hist_len = len(self.h)
         self.hist = np.zeros(self.hist_len, dtype=np.float64)
@@ -48,9 +62,13 @@ class FreqShift:
     def _foff_at(self, t_samp):
         """Instantaneous offset (Hz) at absolute sample indices `t_samp`."""
         if self.ramp_to is None:
-            return np.full_like(t_samp, self.foff, dtype=np.float64)
-        frac = np.clip(t_samp / self.ramp_samp, 0.0, 1.0)
-        return self.foff + (self.ramp_to - self.foff) * frac
+            f = np.full_like(t_samp, self.foff, dtype=np.float64)
+        else:
+            frac = np.clip(t_samp / self.ramp_samp, 0.0, 1.0)
+            f = self.foff + (self.ramp_to - self.foff) * frac
+        if self.wdev:
+            f += self.wdev * np.sin((2.0 * np.pi * self.wrate / self.fs) * t_samp)
+        return f
 
     def process(self, block):
         n = len(block)
@@ -59,7 +77,7 @@ class FreqShift:
         base = self.hist_len - self.gdelay
         z = buf[base:base + n] + 1j * imag_full[base - self.gdelay:
                                                 base - self.gdelay + n]
-        if self.ramp_to is None:
+        if self.ramp_to is None and not self.wdev:
             # Static path: preserve the original formula EXACTLY (bit-exact
             # baseline — ph[k] = 2*pi*foff*(t+k)/fs).
             ph = (2.0 * np.pi * self.foff / self.fs) * (self.t + np.arange(n))

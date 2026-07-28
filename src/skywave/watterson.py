@@ -68,10 +68,44 @@ PRESETS = {
 }
 
 
-def _doppler_gain_lowrate(doppler_hz, low_fs, n_low, rng):
-    """One complex-Gaussian path at `low_fs`, Gaussian Doppler spectrum of 2-sigma width
-    `doppler_hz` (gen_fading.doppler_spread's filter, generated at the low rate and kept
-    there for interpolation rather than resampled up)."""
+FILTER_MODES = ("codec2", "milstd")
+
+
+def _milstd_fir(doppler_hz, low_fs):
+    """MIL-STD-188-110C Appendix E fading-filter taps, verbatim construction:
+    f_j(t) = k*sqrt(2)*exp(-pi^2*t^2*d^2) for -tau < t < tau, tau chosen so the
+    tap magnitude at +-tau is <= 1% of the peak. A Gaussian impulse response
+    analytically gives |H(f)|^2 = exp(-2*f^2/d^2) — the App E target tap-gain
+    POWER spectrum with 2-sigma spread exactly `d` (sigma = d/2). Unit-energy
+    normalized so white noise in -> unit-variance gain process out (the
+    realization-level hf_gain normalization still applies downstream)."""
+    d = float(doppler_hz)
+    tau = np.sqrt(np.log(100.0)) / (np.pi * d)          # 1%-of-peak truncation
+    m = int(np.ceil(tau * low_fs))
+    t = np.arange(-m, m + 1) / low_fs
+    b = np.sqrt(2.0) * np.exp(-(np.pi ** 2) * (t ** 2) * (d ** 2))
+    return b / np.sqrt(np.sum(b ** 2))
+
+
+def _doppler_gain_lowrate(doppler_hz, low_fs, n_low, rng, filter_mode="codec2"):
+    """One complex-Gaussian path at `low_fs` with Gaussian Doppler spectrum of
+    nominal 2-sigma width `doppler_hz`, shaped per `filter_mode`:
+
+    codec2 (default): gen_fading.doppler_spread's filter — the Gaussian PSD is
+      handed to the frequency-sampling design as the AMPLITUDE target (no
+      sqrt), so the REALIZED power spectrum is Gaussian^2: 2-sigma spread
+      ~0.71x nominal (~0.80x with this grid's leakage; measured 2026-07-28).
+      Kept byte-identical as the default for corpus/FreeDATA-codec2
+      comparability — flipping the default is a RIG_GEN event.
+    milstd: MIL-STD-188-110C App E time-domain Gaussian taps (_milstd_fir),
+      which realize the standard's tap-gain power spectrum exactly
+      (|H|^2 Gaussian, spread = nominal; F.1487 Eq. 2 convention). Use for
+      standards-faithful cells and cross-instrument comparisons."""
+    if filter_mode == "milstd":
+        b = _milstd_fir(doppler_hz, low_fs)
+        ntaps = len(b)
+        w = rng.standard_normal(n_low + ntaps) + 1j * rng.standard_normal(n_low + ntaps)
+        return lfilter(b, [1.0], w)[ntaps:].astype(np.complex128)
     sigma = doppler_hz / 2.0
     ntaps = 100
     # Gaussian frequency response 0..low_fs/2, FIR via frequency sampling (octave fir2).
@@ -106,9 +140,14 @@ class WattersonChannel:
     """Stateful per-direction Watterson applicator. One instance per channel direction
     (independent fading), fed fixed-size real float blocks via `process(block, out)`."""
 
-    def __init__(self, fs, delay_ms, doppler_hz, dur_s, seed, hilbert_taps=255):
+    def __init__(self, fs, delay_ms, doppler_hz, dur_s, seed, hilbert_taps=255,
+                 filter_mode="codec2"):
         self.fs = fs
         self.doppler_hz = doppler_hz
+        self.filter_mode = filter_mode
+        if filter_mode not in FILTER_MODES:
+            raise ValueError(f"unknown fade filter mode '{filter_mode}' "
+                             f"(use {'|'.join(FILTER_MODES)})")
         self.delay = int(round(delay_ms * 1e-3 * fs))      # differential delay in samples
         # Low-rate gain process: oversample the Doppler at >= 32x the 2-sigma
         # spread (MIL-STD-188-110C Appendix E's implementation rule; this
@@ -118,8 +157,10 @@ class WattersonChannel:
         self.low_fs = max(50.0, np.ceil(32.0 * max(doppler_hz, 0.05)))
         n_low = int(np.ceil(dur_s * self.low_fs)) + 4
         rng = np.random.default_rng(seed)
-        self.p1 = _doppler_gain_lowrate(doppler_hz, self.low_fs, n_low, rng)
-        self.p2 = _doppler_gain_lowrate(doppler_hz, self.low_fs, n_low, rng)
+        self.p1 = _doppler_gain_lowrate(doppler_hz, self.low_fs, n_low, rng,
+                                        filter_mode)
+        self.p2 = _doppler_gain_lowrate(doppler_hz, self.low_fs, n_low, rng,
+                                        filter_mode)
         # F.1487: equal mean power, normalized so the average faded power == input power.
         self.hf_gain = 1.0 / np.sqrt(np.var(self.p1) + np.var(self.p2))
         self.n_low = len(self.p1)
@@ -132,16 +173,31 @@ class WattersonChannel:
         self.t = 0          # absolute audio-sample index (for Doppler interpolation)
         self._buf = None    # persistent [hist | block] scratch (lazy: block size unknown)
         self._ar = None     # cached float64 arange for the interpolation grid
+        self._wrap_warned = False   # one loud warning when the realization cycles
 
     def _interp_grid(self, n):
         """(i0, frac) low-rate interpolation coordinates for the next `n` audio samples,
         shared by both paths (identical grid — computing it twice was pure waste); wrap
         modulo the generated length so a session longer than `dur_s` keeps fading (a
         small seam once per cycle is harmless for goodput stats). float64 arange is
-        bit-identical to the previous int arange (sample indices are exact in a double)."""
+        bit-identical to the previous int arange (sample indices are exact in a double).
+
+        A wrap REPLAYS the same realization: past `dur_s` the run stops
+        accumulating independent fade states (F.1487 Annex 3 §6 statistics),
+        so the first wrap warns loudly rather than passing silently."""
         if self._ar is None or self._ar.shape[0] < n:
             self._ar = np.arange(n, dtype=np.float64)
         idx = (self.t + self._ar[:n]) * (self.low_fs / self.fs)
+        if not self._wrap_warned and \
+                (self.t + n) * (self.low_fs / self.fs) >= self.n_low - 1:
+            self._wrap_warned = True
+            import sys as _sys
+            print(f"watterson: fade realization wrapped at t="
+                  f"{self.t / self.fs:.0f}s — the run now REPLAYS the same "
+                  f"{(self.n_low - 1) / self.low_fs:.0f}s fading trace and stops "
+                  "accumulating independent fade states (raise SIM_FADE_DUR_S "
+                  "to cover the run, or count fade_units per F.1487 A3 s6)",
+                  file=_sys.stderr, flush=True)
         idx = np.mod(idx, self.n_low - 1)
         i0 = idx.astype(np.int64)
         frac = idx - i0
@@ -213,7 +269,7 @@ class ScheduledFade:
     passes the block through unfaded (gain 1)."""
 
     def __init__(self, fs, segments, dur_s, seed, xfade_s=1.0,
-                 on_transition=None, hilbert_taps=255):
+                 on_transition=None, hilbert_taps=255, filter_mode="codec2"):
         self.fs = fs
         self.xfade = max(1, int(round(xfade_s * fs)))
         self.on_transition = on_transition
@@ -226,7 +282,7 @@ class ScheduledFade:
             if preset is not None:
                 delay_ms, dop = preset
                 ch = WattersonChannel(fs, delay_ms, dop, dur_s, seed + 100 * i,
-                                      hilbert_taps)
+                                      hilbert_taps, filter_mode=filter_mode)
             end = None if length is None else t + length
             self.segs.append([name, ch, t, end])
             if length is None:

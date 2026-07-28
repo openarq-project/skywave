@@ -50,6 +50,7 @@ that ship today:
 | `ardop` | ARDOP (`ardopcf`) | includes chunked, buffer-throttled bulk TX |
 | `vara` | VARA HF | proprietary, typically under Wine; two instances brought up by an external up/down lifecycle |
 | `freedata` | FreeDATA | REST + websocket; runs under FreeDATA's own venv (set `ADAPTER_PY`) |
+| `modem73` | modem73 | datagram KISS TNC with no native ARQ — the adapter runs its own selective-repeat transfer over the air (set `MODEM73_BIN`) |
 
 More are welcome.
 

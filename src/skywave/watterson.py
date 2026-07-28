@@ -60,6 +60,19 @@ PRESETS = {
     "disturbed": (6.0, 10.0),
     "nvis-disturbed": (7.0, 1.0),
     "high-lat": (7.0, 30.0),
+    # Completing the Otnes/ITU draft latitude table (PathSim technical guide
+    # s4.1.11; the other six conditions were already covered above): low-lat
+    # quiet 0.5 ms/0.5 Hz, high-lat quiet 1 ms/0.5 Hz, high-lat moderate
+    # 3 ms/10 Hz ("high-lat" above is that table's high-lat DISTURBED).
+    "low-lat-quiet": (0.5, 0.5),
+    "high-lat-quiet": (1.0, 0.5),
+    "high-lat-moderate": (3.0, 10.0),
+    # CCIR 520-1 FLAT fading: single-effective-path (zero differential
+    # delay — the two equal-power taps sum to one Rayleigh gain), no
+    # frequency selectivity; "flat" 0.2 Hz and the 1 Hz extreme. Distinct
+    # from the FM Tier-A flat fades (those are envelope-only, no Hilbert).
+    "flat": (0.0, 0.2),
+    "flat-extreme": (0.0, 1.0),
     # DAMSON-measured auroral 5%-exceedance worst case (Doppler 2-55 Hz, delay
     # 1-11 ms). The one
     # regime measurably outside the mid-lat presets; use only for explicit
@@ -68,7 +81,10 @@ PRESETS = {
 }
 
 
-FILTER_MODES = ("codec2", "milstd")
+FILTER_MODES = ("milstd", "codec2-2016")
+# Legacy alias: pre-gen-8 corpora and scripts said "codec2"; the explicit
+# -2016 name marks it as the frozen, documented-defective realization.
+FILTER_ALIASES = {"codec2": "codec2-2016"}
 
 
 def _milstd_fir(doppler_hz, low_fs):
@@ -87,20 +103,24 @@ def _milstd_fir(doppler_hz, low_fs):
     return b / np.sqrt(np.sum(b ** 2))
 
 
-def _doppler_gain_lowrate(doppler_hz, low_fs, n_low, rng, filter_mode="codec2"):
+def _doppler_gain_lowrate(doppler_hz, low_fs, n_low, rng, filter_mode="milstd"):
     """One complex-Gaussian path at `low_fs` with Gaussian Doppler spectrum of
     nominal 2-sigma width `doppler_hz`, shaped per `filter_mode`:
 
-    codec2 (default): gen_fading.doppler_spread's filter — the Gaussian PSD is
-      handed to the frequency-sampling design as the AMPLITUDE target (no
-      sqrt), so the REALIZED power spectrum is Gaussian^2: 2-sigma spread
-      ~0.71x nominal (~0.80x with this grid's leakage; measured 2026-07-28).
-      Kept byte-identical as the default for corpus/FreeDATA-codec2
-      comparability — flipping the default is a RIG_GEN event.
-    milstd: MIL-STD-188-110C App E time-domain Gaussian taps (_milstd_fir),
-      which realize the standard's tap-gain power spectrum exactly
-      (|H|^2 Gaussian, spread = nominal; F.1487 Eq. 2 convention). Use for
-      standards-faithful cells and cross-instrument comparisons."""
+    milstd (default since RIG_GEN 8): MIL-STD-188-110C App E time-domain
+      Gaussian taps (_milstd_fir), which realize the standard's tap-gain
+      POWER spectrum exactly (|H|^2 Gaussian, spread = nominal within 0.5%
+      at 0.1-30 Hz; the F.1487 Eq. 2 convention).
+    codec2-2016 (frozen legacy; alias "codec2"): gen_fading.doppler_spread's
+      filter — the Gaussian PSD is handed to the frequency-sampling design
+      as the AMPLITUDE target (no sqrt), so the realized power spectrum is
+      Gaussian^2. Measured realized/nominal spread is SPREAD-DEPENDENT
+      (2026-07-28, this exact code): 6.03x at 0.1 Hz, 1.33x at 0.5 Hz,
+      0.91x at 1 Hz, 0.79x at >=2 Hz — the low-spread blowup is this
+      port's 50 Hz low_fs floor colliding with the fixed 100-point design
+      grid (upstream codec2 is a uniform ~0.71x). Kept byte-frozen ONLY to
+      reproduce pre-gen-8 corpora; never use for new cells."""
+    filter_mode = FILTER_ALIASES.get(filter_mode, filter_mode)
     if filter_mode == "milstd":
         b = _milstd_fir(doppler_hz, low_fs)
         ntaps = len(b)
@@ -141,10 +161,11 @@ class WattersonChannel:
     (independent fading), fed fixed-size real float blocks via `process(block, out)`."""
 
     def __init__(self, fs, delay_ms, doppler_hz, dur_s, seed, hilbert_taps=255,
-                 filter_mode="codec2"):
+                 filter_mode="milstd"):
         self.fs = fs
         self.doppler_hz = doppler_hz
-        self.filter_mode = filter_mode
+        filter_mode = FILTER_ALIASES.get(filter_mode, filter_mode)
+        self.filter_mode = filter_mode                     # canonical name
         if filter_mode not in FILTER_MODES:
             raise ValueError(f"unknown fade filter mode '{filter_mode}' "
                              f"(use {'|'.join(FILTER_MODES)})")
@@ -269,7 +290,7 @@ class ScheduledFade:
     passes the block through unfaded (gain 1)."""
 
     def __init__(self, fs, segments, dur_s, seed, xfade_s=1.0,
-                 on_transition=None, hilbert_taps=255, filter_mode="codec2"):
+                 on_transition=None, hilbert_taps=255, filter_mode="milstd"):
         self.fs = fs
         self.xfade = max(1, int(round(xfade_s * fs)))
         self.on_transition = on_transition

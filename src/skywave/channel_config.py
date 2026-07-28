@@ -55,7 +55,7 @@ class ChannelConfig:
     watterson: str = "off"          # SIM_WATTERSON  preset name or off
     fade_doppler_hz: str = ""       # SIM_FADE_DOPPLER_HZ  (custom fade; "" = unset)
     fade_delay_ms: str = ""         # SIM_FADE_DELAY_MS    (custom fade; "" = unset)
-    fade_dur_s: float = 1200.0      # SIM_FADE_DUR_S
+    fade_dur_s: float = 3600.0      # SIM_FADE_DUR_S
     fade_schedule: str = ""         # SIM_FADE_SCHEDULE
     fade_seed: int = None           # SIM_FADE_SEED  (inherits seed)
     # ---- link timing / turnaround ----
@@ -144,7 +144,7 @@ class ChannelConfig:
             rig_bpf=lo("SIM_RIG_BPF", "data", "off"), rig_order=i("SIM_RIG_ORDER", 6),
             watterson=lo("SIM_WATTERSON", "off", "off"),
             fade_doppler_hz=s("SIM_FADE_DOPPLER_HZ"), fade_delay_ms=s("SIM_FADE_DELAY_MS"),
-            fade_dur_s=f("SIM_FADE_DUR_S", 1200), fade_schedule=s("SIM_FADE_SCHEDULE"),
+            fade_dur_s=f("SIM_FADE_DUR_S", 3600), fade_schedule=s("SIM_FADE_SCHEDULE"),
             fade_seed=i("SIM_FADE_SEED", seed),
             # NB the get-default and the `or` fallback DIFFER for these (unset -> the
             # non-zero default; explicitly empty -> 0), so they are spelled out.

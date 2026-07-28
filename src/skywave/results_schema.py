@@ -81,6 +81,12 @@ integer -- record the change in the changelog below.
     the rule, and so under-sampled absolute numbers are visible per row. Paired-seed
     A/B orderings do not need the bar (channel variance cancels between arms); it
     gates ABSOLUTE-number claims. Append = no bump.
+  results-schema/1 + snr2k7 (2026-07-28): trailing column appended -- the row's
+    SNR re-expressed in the ITU-R F.520-2 Annex 3 2.7 kHz noise reference
+    bandwidth (snr3k + 10*log10(3000/2700) = snr3k + 0.46 dB). Pure derived
+    convenience so cells can be quoted against ITU-convention instruments
+    without the reader re-deriving the bandwidth correction ("" when snr3k
+    is missing). Furman/App E use 3 kHz = the existing snr3k. Append = no bump.
 """
 import csv
 import json
@@ -99,7 +105,7 @@ COLUMNS = [
     "fade_delay_ms", "fade_doppler_hz",
     "atten_db",
     "connected", "time_to_connect",
-    "fade_units",
+    "fade_units", "snr2k7",
 ]
 
 # Per-column caster for the READER side (read_corpus). Everything is stored as text in
@@ -116,7 +122,7 @@ COLUMN_TYPES = {
     # connected stays str (mirrors `intact`): bool("False") == True in Python, so casting
     # this column to bool would silently invert every False row. Callers compare .lower().
     "connected": str, "time_to_connect": float,
-    "fade_units": float,
+    "fade_units": float, "snr2k7": float,
 }
 
 

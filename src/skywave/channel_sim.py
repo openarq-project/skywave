@@ -184,7 +184,7 @@ SIM_PTT = os.environ.get("SIM_PTT", "0").strip() == "1"
 WATTERSON = (os.environ.get("SIM_WATTERSON", "off").strip().lower() or "off")
 FADE_DOPPLER = os.environ.get("SIM_FADE_DOPPLER_HZ", "").strip()
 FADE_DELAY = os.environ.get("SIM_FADE_DELAY_MS", "").strip()
-FADE_DUR_S = float(os.environ.get("SIM_FADE_DUR_S", "1200").strip() or "1200")
+FADE_DUR_S = float(os.environ.get("SIM_FADE_DUR_S", "3600").strip() or "3600")
 FADE_SEED = int(os.environ.get("SIM_FADE_SEED", str(SEED)).strip() or str(SEED))
 # Scheduled fading: a time sequence of
 # presets within ONE session, the missing instrument for ADAPTIVE rate-control
@@ -200,13 +200,20 @@ FADE_SEED = int(os.environ.get("SIM_FADE_SEED", str(SEED)).strip() or str(SEED))
 FADE_SCHEDULE = os.environ.get("SIM_FADE_SCHEDULE", "").strip()
 FADE_XFADE_S = float(os.environ.get("SIM_FADE_XFADE_S", "1.0").strip() or "1.0")
 # Doppler-shaping filter convention (adjudicated 2026-07-28; see watterson.py
-# _doppler_gain_lowrate). "codec2" (default) = gen_fading lineage, REALIZED
-# spread ~0.8x nominal — kept default for corpus/codec2-ch comparability.
-# "milstd" = MIL-STD-188-110C App E time-domain Gaussian taps, realized spread
-# = nominal (the F.1487 power-spectrum convention). Flipping the default is a
-# RIG_GEN event.
-FADE_FILTER = (os.environ.get("SIM_FADE_FILTER", "codec2").strip().lower()
-               or "codec2")
+# _doppler_gain_lowrate). "milstd" (default since RIG_GEN 8) = MIL-STD-188-110C
+# App E time-domain Gaussian taps: realized spread = nominal (the F.1487
+# power-spectrum convention). "codec2-2016" (alias "codec2") = the frozen
+# legacy realization with SPREAD-DEPENDENT mislabeling (6.03x/1.33x/0.91x/
+# 0.79x realized at 0.1/0.5/1/>=2 Hz) — reproduce pre-gen-8 corpora only.
+FADE_FILTER = (os.environ.get("SIM_FADE_FILTER", "milstd").strip().lower()
+               or "milstd")
+# One-flag App-E-reference-channel mode: forces the milstd filter, strips the
+# rig SSB BPF (E.4.3: radio filters disabled in a compliance simulator), and
+# refuses AGC/ALC composition. Individual knobs explicitly set AGAINST it are
+# a config conflict, not a silent override (provenance doctrine).
+COMPLIANCE = os.environ.get("SIM_COMPLIANCE", "").strip().lower() in ("1", "true", "milstd")
+if COMPLIANCE:
+    FADE_FILTER = "milstd"       # explicit contradictions rejected in build_channel_effects
 # Rig SSB audio passband (TX + RX). A real SSB transceiver band-limits the audio
 # to ~2.4-2.9 kHz on BOTH transmit and receive, so a wide mode's edge carriers (FD-OFDM-2438
 # spans ~281-2719 Hz) hit the filter skirt + edge group delay. The flat-to-Nyquist sim
@@ -1275,10 +1282,31 @@ def build_channel_effects():
     fdelay = fdop = None
     fade_desc = "fade=off"
     from skywave import watterson as _watt
-    if FADE_FILTER not in _watt.FILTER_MODES:
+    _fade_filter = _watt.FILTER_ALIASES.get(FADE_FILTER, FADE_FILTER)
+    if _fade_filter not in _watt.FILTER_MODES:
         print(f"channel_sim: unknown SIM_FADE_FILTER='{FADE_FILTER}' "
               f"(use {'|'.join(_watt.FILTER_MODES)})", file=sys.stderr, flush=True)
         return 2
+    if COMPLIANCE:
+        # App E reference-channel mode: explicit contradictions are config
+        # errors; the DEFAULT rig BPF is superseded (with a banner note below).
+        _explicit_ff = os.environ.get("SIM_FADE_FILTER", "").strip().lower()
+        if _explicit_ff and _watt.FILTER_ALIASES.get(_explicit_ff, _explicit_ff) != "milstd":
+            print("channel_sim: SIM_COMPLIANCE requires the milstd fade filter "
+                  f"— unset SIM_FADE_FILTER (got '{_explicit_ff}')",
+                  file=sys.stderr, flush=True)
+            return 2
+        _explicit_bpf = os.environ.get("SIM_RIG_BPF", "").strip().lower()
+        if (_explicit_bpf not in ("", "off")) or (RIG_LO and RIG_HI):
+            print("channel_sim: SIM_COMPLIANCE disables radio filters in the "
+                  "reference channel (App E E.4.3) — unset SIM_RIG_BPF/"
+                  "SIM_RIG_LO/SIM_RIG_HI", file=sys.stderr, flush=True)
+            return 2
+        if ALC_DB or RX_AGC:
+            print("channel_sim: SIM_COMPLIANCE forbids AGC/ALC in the "
+                  "reference channel (App E / Furman item 7) — unset "
+                  "SIM_ALC_OVERSHOOT_DB / SIM_RX_AGC", file=sys.stderr, flush=True)
+            return 2
     if FADE_SCHEDULE:
         from skywave import watterson
         segs = []
@@ -1339,15 +1367,22 @@ def build_channel_effects():
                   "independent-seed reps at full dwell, or virt_time dwell; "
                   "paired-seed A/B orderings are unaffected)",
                   file=sys.stderr, flush=True)
-    if fade_ab is not None and FADE_FILTER != "codec2":
-        # Provenance: non-default Doppler-filter convention is part of the cell
-        fade_desc += f" fade_filter={FADE_FILTER}"
+    if fade_ab is not None:
+        # Provenance: the Doppler-filter convention is part of the cell —
+        # printed unconditionally (canonical name) since the gen-8 flip so
+        # mixed-generation corpora stay self-describing.
+        fade_desc += f" fade_filter={_fade_filter}"
 
     # Resolve the rig SSB passband. Each direction gets its OWN stateful TX + RX filter
     # (4 total; the state must not be shared across legs). Same band both ends (symmetric
     # link); a real link cascades the transmitter's TX filter and the receiver's RX filter.
     rig_band = _resolve_rig_band()
     rig_desc = "rig_bpf=off"
+    if COMPLIANCE:
+        # Reference channel: the DEFAULT rig BPF is superseded here (explicit
+        # settings were rejected above).
+        rig_band = None
+        rig_desc = "rig_bpf=off compliance=appE"
     rig_ab_tx = rig_ab_rx = rig_ba_tx = rig_ba_rx = None
     sql_ab = sql_ba = None
     noise_lpf_ab = noise_lpf_ba = None

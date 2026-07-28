@@ -62,7 +62,7 @@ def test_tap_envelope_is_rayleigh():
 
 def test_taps_are_independent():
     """The two paths p1, p2 of a WattersonChannel are uncorrelated."""
-    ch = watterson.WattersonChannel(8000, 1.0, 1.0, 300, 99)
+    ch = watterson.WattersonChannel(8000, 1.0, 1.0, 1200, 99)
     c = np.corrcoef(np.abs(ch.p1), np.abs(ch.p2))[0, 1]
     assert abs(c) < 0.05, f"tap envelopes correlated: |rho|={abs(c):.3f}"
 

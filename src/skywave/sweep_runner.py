@@ -552,7 +552,10 @@ def run_cell(modem, cell, rep, writer, fcsv, tag):
            # arithmetic visible per row. "" for no-fade rows or missing wall.
            "fade_units": (round(float(wall) * float(fade_hz), 1)
                           if (wall != "" and fade_hz not in ("", None, 0.0))
-                          else "")}
+                          else ""),
+           # ITU-R F.520-2 2.7 kHz noise-reference-bandwidth SNR (see
+           # results_schema changelog): snr3k + 10*log10(3000/2700).
+           "snr2k7": (round(snr + 0.46, 1) if snr is not None else "")}
     writer.writerow(row); fcsv.flush()
     lbl = f" [{label}]" if label else ""
     print(f"[{modem}]{lbl} s={sigma}({row['snr3k']}dB) {watt} p={payload} r{rep}: "

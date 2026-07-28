@@ -25,6 +25,6 @@ def test_gen7_shipped_defaults_are_realistic_profile():
     assert cs.TR_UNKEY_MS == 25.0
 
 
-def test_rig_gen_is_7():
+def test_rig_gen_is_8():
     from skywave.rig_version import RIG_GEN
-    assert RIG_GEN == 7
+    assert RIG_GEN == 8

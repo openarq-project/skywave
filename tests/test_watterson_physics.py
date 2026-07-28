@@ -32,6 +32,13 @@ def test_presets_match_f1487_goldens():
     assert watterson.PRESETS["nvis-disturbed"] == (7.0, 1.0)   # F.1487 Annex 3 §3.4
     assert watterson.PRESETS["disturbed"] == (6.0, 10.0)       # low-lat disturbed
     assert watterson.PRESETS["high-lat"] == (7.0, 30.0)        # high-lat disturbed
+    # Otnes/ITU draft latitude table completion (PathSim tech guide s4.1.11)
+    assert watterson.PRESETS["low-lat-quiet"] == (0.5, 0.5)
+    assert watterson.PRESETS["high-lat-quiet"] == (1.0, 0.5)
+    assert watterson.PRESETS["high-lat-moderate"] == (3.0, 10.0)
+    # CCIR 520-1 flat fading (zero differential delay = single Rayleigh path)
+    assert watterson.PRESETS["flat"] == (0.0, 0.2)
+    assert watterson.PRESETS["flat-extreme"] == (0.0, 1.0)
 
 
 def test_power_normalization():
@@ -98,14 +105,20 @@ def _realized_spread(dop, low_fs, dur_s, rng, filter_mode="codec2"):
 
 
 def test_realized_doppler_spread():
-    """codec2 (default) filter: realized 2-sigma spread is KNOWN-NARROW,
-    ~0.8x nominal (missing sqrt(PSD) + design-grid leakage; adjudicated
-    2026-07-28 against F.1487 Eq.2 / MIL-STD-188-110C App E / NTIA-Johnson).
-    Pinned AT its measured value — not at nominal — so a silent change in
-    either direction fails: byte-stability of the default is the contract."""
-    rng = np.random.default_rng(3)
-    realized = _realized_spread(1.5, 50.0, 240, rng, "codec2")
-    assert abs(realized / 1.5 - 0.80) < 0.05, f"codec2 realized {realized:.3f} Hz"
+    """codec2-2016 (frozen legacy) filter: realized 2-sigma spread is
+    KNOWN-WRONG and SPREAD-DEPENDENT (missing sqrt(PSD) + the 50 Hz-floor x
+    fixed-grid interaction; adjudicated 2026-07-28 against F.1487 Eq.2 /
+    MIL-STD-188-110C App E / NTIA-Johnson). Pinned AT the measured ladder —
+    not at nominal — so a silent change in either direction fails:
+    byte-stability of the frozen legacy realization is the contract that
+    keeps pre-gen-8 corpora reproducible."""
+    for dop, ratio in ((0.1, 6.03), (0.5, 1.33), (1.0, 0.91), (2.0, 0.79)):
+        low_fs = max(50.0, np.ceil(32.0 * dop))
+        rng = np.random.default_rng(3)
+        dur = max(240.0, 400.0 / dop)          # enough fade units at slow spreads
+        realized = _realized_spread(dop, low_fs, dur, rng, "codec2-2016")
+        assert abs(realized / dop / ratio - 1.0) < 0.06, \
+            f"legacy realized {realized:.3f} Hz at nominal {dop} (pin {ratio}x)"
 
 
 def test_milstd_filter_realizes_nominal_spread():
@@ -161,7 +174,7 @@ def test_interpolation_images_suppressed():
     multiples of low_fs; ours measured -77 dBc — pin at -70 with margin).
     Cross-instrument context: PathSim's polyphase interpolator measures
     -62 dBc on the same probe."""
-    for mode in ("codec2", "milstd"):
+    for mode in ("codec2-2016", "milstd"):
         ch = watterson.WattersonChannel(float(FS), 2.0, 1.0, dur_s=100, seed=9,
                                         filter_mode=mode)
         blk = 8000.0 * np.sin(2 * np.pi * 1500.0 * np.arange(1024) / FS)
@@ -178,16 +191,21 @@ def test_interpolation_images_suppressed():
                 assert img < -70.0, f"{mode}: image at {sgn*off:+.0f} Hz = {img:.1f} dBc"
 
 
-def test_default_filter_mode_is_byte_identical_codec2():
-    """The knob must not move the default: explicit codec2 == legacy default."""
+def test_default_filter_mode_is_milstd_and_legacy_is_frozen():
+    """Gen 8: default == milstd; the 'codec2' alias resolves to the frozen
+    codec2-2016 realization byte-for-byte (pre-gen-8 corpus reproduction)."""
     a = watterson.WattersonChannel(FS, 2.0, 1.0, dur_s=10, seed=7)
     b = watterson.WattersonChannel(FS, 2.0, 1.0, dur_s=10, seed=7,
-                                   filter_mode="codec2")
-    assert np.array_equal(a.p1, b.p1) and np.array_equal(a.p2, b.p2)
-    # and milstd is genuinely different
-    c = watterson.WattersonChannel(FS, 2.0, 1.0, dur_s=10, seed=7,
                                    filter_mode="milstd")
-    assert not np.array_equal(a.p1, c.p1)
+    assert a.filter_mode == "milstd"
+    assert np.array_equal(a.p1, b.p1) and np.array_equal(a.p2, b.p2)
+    legacy = watterson.WattersonChannel(FS, 2.0, 1.0, dur_s=10, seed=7,
+                                        filter_mode="codec2-2016")
+    alias = watterson.WattersonChannel(FS, 2.0, 1.0, dur_s=10, seed=7,
+                                       filter_mode="codec2")
+    assert alias.filter_mode == "codec2-2016"
+    assert np.array_equal(legacy.p1, alias.p1) and np.array_equal(legacy.p2, alias.p2)
+    assert not np.array_equal(a.p1, legacy.p1)
 
 
 def test_unknown_filter_mode_rejected():

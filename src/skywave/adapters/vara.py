@@ -31,6 +31,10 @@ modem stations persist. SIGMA/TXGAIN/NP_STATS/SIM_* pass through to channel_sim 
 Callsigns default to generic test calls; a REGISTERED VARA (full-speed) needs its
 licensed callsign -- set VARA_ACALL / VARA_BCALL, or edit ACALL/BCALL below.
 
+Channel width is VARA_BW (500 / 2300 / 2750, default 2300). The three widths are separate
+physical layers -- each has its own speed-level table, carrier sets and MFSK combs -- so a
+sweep cell is only comparable to another at the same width.
+
 Run (with two VARA.exe instances already up on 8300/8310):
   skywave-sweep vara spec.json out.csv
 """
@@ -49,6 +53,11 @@ class VaraAdapter(ModemAdapter):
     A_PORT, B_PORT = 8300, 8310          # A = answerer, B = caller; data ports are +1
     ACALL = os.environ.get("VARA_ACALL", "").strip() or "W1ABC"
     BCALL = os.environ.get("VARA_BCALL", "").strip() or "W2XYZ"
+    # VARA HF has three channel widths and they are different physical layers, not just
+    # different rates: each has its own speed-level table, its own carrier sets and its own
+    # MFSK combs.  A cell measured at one width says nothing about another, so the width
+    # has to be selectable rather than fixed at 2300.
+    BW = os.environ.get("VARA_BW", "").strip() or "2300"
     ready_timeout_s = 20.0
     connect_timeout_s = 250.0
 
@@ -99,7 +108,7 @@ class VaraAdapter(ModemAdapter):
     def link_connect(self, deadline):
         # Command sockets (self.a/self.b) were opened ONCE in wait_ready; reuse them.
         for s, call in ((self.a, self.ACALL), (self.b, self.BCALL)):
-            for c in (f"MYCALL {call}", "COMPRESSION OFF", "BW2300"):
+            for c in (f"MYCALL {call}", "COMPRESSION OFF", f"BW{self.BW}"):
                 self._snd(s, c); time.sleep(0.2)
         self._pump(time.time() + 1.5)
         self._snd(self.a, "LISTEN ON"); time.sleep(0.7)

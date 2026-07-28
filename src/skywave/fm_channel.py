@@ -20,11 +20,41 @@ Fade kinds (SIM_FM_FADE):
       `sin` (default) = sinusoidal-in-dB swinging 0..-depth; `sq` =
       switched square-in-dB (half period at 0 dB, half at -depth, 5 ms
       raised-cosine edges so the gain step doesn't splatter) — the harsher
-      reading, a true periodic blackout. The 2026-07-19 ordering run
-      measured VARA FM collapse ratios of 0.63-0.66 under `sin` vs the
-      report's ~0.3 at 0.1 Hz; `sq` exists to test whether shape closes
-      that gap. Deterministic: the seed does not perturb it; phase starts
-      at the envelope maximum (sq: starts in the unfaded half).
+      reading, kept as a stress shape only: measured 2026-07-19, `sq`
+      kills a cell the published curves show healthy, and `sin` under
+      report-class dwell on a quiet host matched the published slow-fade
+      collapse ratio (0.32 vs 0.29), so `sin` is the confirmed reading.
+      The instrument source (github.com/ARSFI/HFSimulator, Fade()) later
+      confirmed it: raised-cosine in dB, starting unfaded. Deterministic:
+      the seed does not perturb it; phase starts at the envelope maximum
+      (sq: starts in the unfaded half).
+  ionosnc:<depth_db>:<rate_hz>:<sn0_db>
+      The same periodic sinusoidal-in-dB S/N trajectory, realized the way
+      the IONOS instrument actually does it (HFSim_BFD_2_03.ino Fade() ->
+      AdjustS_N()): complementary signal/noise mixer gains
+      sig = R/(1+R), noise = 1-sig, with R the target voltage S/N ratio
+      10^((sn0-d(t))/20) floored at the instrument's -40 dB S/N stop.
+      In a deep trough the NOISE rises to near full scale while the
+      absolute signal drops only a few dB — total audio level stays
+      roughly constant and the receiver hears loud hiss, not the near-
+      silence of the plain `ionos` envelope fade. MEASURED 2026-07-27
+      (VARA FM 4.x wide/data9600, depth {10,30} x rate {0.1,1} Hz vs the
+      published grid): the two realizations are statistically equivalent
+      on a squelchless data port — both match the published deep-fade
+      cells (0.04 vs 0.044 at 30 dB/0.1 Hz) and NEITHER reproduces the
+      published depth-10@0.1 Hz collapse to 0.26, which contradicts the
+      report's own steady-state curve (0.70 at the cell's 20 dB trough
+      S/N) and is judged a VARA-3.x-era slow-fade adaptation artifact.
+      Keep `ionos` for published-comparable cells; use `ionosnc` where
+      absolute trough level plausibly matters (micspk gated-squelch or
+      VOX cells — untested, the level difference gates the RX path
+      there). sn0_db is the cell's
+      nominal unfaded S/N (the published fade cells ran 30 dB). Both
+      gain tracks are normalized to 1 at the envelope maximum, so the
+      unfaded calibration (TXGAIN/SIGMA) is untouched. The signal track
+      rides the fade slot; the noise track is applied by the harness to
+      its own noise fill (Link reads `.noise_gain` each block).
+      Deterministic and seed-free like `ionos`.
   rayleigh:<fD_hz>
       Mobile/obstructed NLOS regime: |g(t)| of a complex Gaussian process
       with the classical Jakes/CLASS Doppler spectrum
@@ -124,17 +154,31 @@ def _jakes_gain_lowrate(fd_hz, low_fs, n_low, rng, ntaps=257):
 
 class _InterpTrack:
     """Low-rate real track linearly interpolated at the audio rate with
-    modulo wrap (watterson._gain_block pattern; the seam once per dur_s is
-    harmless for goodput stats)."""
+    modulo wrap (watterson._gain_block pattern). For the deterministic
+    periodic tracks (ionos/ionosnc) the wrap IS the waveform; for RANDOM
+    tracks (rayleigh/rice envelope, shadowing) a wrap replays the same
+    realization and stops accumulating independent fade states, so those
+    construct with warn_wrap=True and announce the first cycle."""
 
-    def __init__(self, track, low_fs, fs):
+    def __init__(self, track, low_fs, fs, warn_wrap=False, label=""):
         self.track = np.ascontiguousarray(track, dtype=np.float64)
         self.low_fs = low_fs
         self.fs = fs
         self.n = len(track)
+        self.warn_wrap = warn_wrap
+        self.label = label
+        self._warned = False
 
     def block(self, t0, n):
         idx = (t0 + np.arange(n)) * (self.low_fs / self.fs)
+        if self.warn_wrap and not self._warned and \
+                (t0 + n) * (self.low_fs / self.fs) >= self.n - 1:
+            self._warned = True
+            import sys as _sys
+            print(f"fm_channel: {self.label or 'fade'} realization wrapped at "
+                  f"t={t0 / self.fs:.0f}s — the run now replays the same "
+                  f"{(self.n - 1) / self.low_fs:.0f}s trace (raise the fade "
+                  "duration to cover the run)", file=_sys.stderr, flush=True)
         idx = np.mod(idx, self.n - 1)
         i0 = idx.astype(np.int64)
         frac = idx - i0
@@ -150,15 +194,36 @@ class FmFade:
 
     def __init__(self, fs, kind, dur_s, seed, fd_hz=0.0, k_db=0.0,
                  ionos_depth_db=0.0, ionos_rate_hz=0.0,
-                 shadow_sigma_db=0.0, shadow_tau_s=0.0, ionos_shape="sin"):
+                 shadow_sigma_db=0.0, shadow_tau_s=0.0, ionos_shape="sin",
+                 ionos_sn0_db=0.0):
         self.fs = fs
         self.kind = kind
         self.fd_hz = fd_hz
         rng = np.random.default_rng(seed)
         self.env = None                  # fast-fade track (None => unity)
+        self.noise_env = None            # ionosnc noise track (None => unity)
+        self.noise_gain = None           # per-block noise gain the harness reads
         self.g_low = None                # complex low-rate gain (V1 gates)
         self.low_fs = None
-        if kind == "ionos":
+        if kind == "ionosnc":
+            if ionos_rate_hz <= 0.0 or ionos_depth_db < 0.0:
+                raise ValueError("ionosnc fade needs depth_db>=0 and rate_hz>0")
+            # One-period tracks like `ionos`, but split into the instrument's
+            # complementary signal/noise gains (see the module docstring).
+            low_fs = max(50.0, 1024.0 * ionos_rate_hz)
+            n = int(round(low_fs / ionos_rate_hz)) + 1
+            ph = ionos_rate_hz * (np.arange(n) / low_fs)   # 0..1 over the period
+            d_db = ionos_depth_db * 0.5 * (1.0 - np.cos(2 * np.pi * ph))
+            sn_db = np.maximum(ionos_sn0_db - d_db, -40.0)  # instrument floor
+            r0 = 10.0 ** (ionos_sn0_db / 20.0)
+            r = 10.0 ** (sn_db / 20.0)
+            a = (r * (1.0 + r0)) / (r0 * (1.0 + r))         # signal, a(0)=1
+            b = (1.0 + r0) / (1.0 + r)                      # noise,  b(0)=1
+            self.env_db_low = 20.0 * np.log10(a)            # V1 gate inspects
+            self.env = _InterpTrack(a, low_fs, fs)
+            self.noise_env = _InterpTrack(b, low_fs, fs)
+            self.low_fs = low_fs
+        elif kind == "ionos":
             if ionos_rate_hz <= 0.0 or ionos_depth_db < 0.0:
                 raise ValueError("ionos fade needs depth_db>=0 and rate_hz>0")
             # Deterministic periodic fade in dB, 0..-depth, starting unfaded.
@@ -206,7 +271,8 @@ class FmFade:
                      + np.sqrt(1.0 / (k_lin + 1.0)) * g)
             env = np.abs(g)
             env /= np.sqrt(np.mean(env ** 2))           # realized E[env^2]=1
-            self.env = _InterpTrack(env, low_fs, fs)
+            self.env = _InterpTrack(env, low_fs, fs, warn_wrap=True,
+                                    label=f"{kind} fast-fade")
             self.g_low = g
             self.low_fs = low_fs
         elif kind != "static":
@@ -226,7 +292,8 @@ class FmFade:
             for i in range(1, n_sh):                    # AR(1), one-time init
                 db[i] = a * db[i - 1] + innov[i]
             self.shadow_db_low = db                     # V1 gate inspects
-            self.shadow = _InterpTrack(10.0 ** (db / 20.0), _SHADOW_FS, fs)
+            self.shadow = _InterpTrack(10.0 ** (db / 20.0), _SHADOW_FS, fs,
+                                       warn_wrap=True, label="shadowing")
         self.t = 0                                      # absolute sample index
 
     def process(self, block, out=None):
@@ -234,6 +301,10 @@ class FmFade:
         if out is None:
             out = np.empty(n, dtype=np.float64)
         np.copyto(out, block)
+        if self.noise_env is not None:
+            # Same time window as the signal track below; the harness applies
+            # this to the noise it adds for this block (Link._fill_noise).
+            self.noise_gain = self.noise_env.block(self.t, n)
         if self.env is not None:
             out *= self.env.block(self.t, n)
         if self.shadow is not None:
@@ -244,8 +315,8 @@ class FmFade:
 
 def resolve_fade_spec(fade_str, band):
     """Parse SIM_FM_FADE into (kind, fd_hz, k_db, depth_db, rate_hz, shape,
-    desc). Raises ValueError with a usable message on bad input (channel_sim
-    turns it into the provenance-doctrine config error)."""
+    sn0_db, desc). Raises ValueError with a usable message on bad input
+    (channel_sim turns it into the provenance-doctrine config error)."""
     s = (fade_str or "off").strip().lower()
     if s == "off":
         return None
@@ -255,30 +326,38 @@ def resolve_fade_spec(fade_str, band):
         model, fd2m, fd70 = PRESETS[s]
         fd = fd2m if band == "2m" else fd70
         if model == "static":
-            return ("static", 0.0, 0.0, 0.0, 0.0, "sin", f"{s}@{band}(static)")
+            return ("static", 0.0, 0.0, 0.0, 0.0, "sin", 0.0,
+                    f"{s}@{band}(static)")
         k = 0.0                                          # TETRA RICE K=0 dB
         desc = f"{s}@{band}({model},fD={fd:g}Hz" + (",K=0dB)" if model == "rice" else ")")
-        return (model, fd, k, 0.0, 0.0, "sin", desc)
+        return (model, fd, k, 0.0, 0.0, "sin", 0.0, desc)
     parts = s.split(":")
     if parts[0] == "ionos" and len(parts) in (3, 4):
         depth, rate = float(parts[1]), float(parts[2])
         shape = parts[3] if len(parts) == 4 else "sin"
         if shape not in ("sin", "sq"):
             raise ValueError(f"unknown ionos fade shape '{shape}' (use sin|sq)")
-        return ("ionos", 0.0, 0.0, depth, rate, shape,
+        return ("ionos", 0.0, 0.0, depth, rate, shape, 0.0,
                 f"ionos({depth:g}dB@{rate:g}Hz,{shape})")
+    if parts[0] == "ionosnc" and len(parts) == 4:
+        depth, rate, sn0 = float(parts[1]), float(parts[2]), float(parts[3])
+        return ("ionosnc", 0.0, 0.0, depth, rate, "sin", sn0,
+                f"ionosnc({depth:g}dB@{rate:g}Hz,SN0={sn0:g}dB)")
     if parts[0] == "rayleigh" and len(parts) == 2:
         fd = float(parts[1])
-        return ("rayleigh", fd, 0.0, 0.0, 0.0, "sin", f"rayleigh(fD={fd:g}Hz)")
+        return ("rayleigh", fd, 0.0, 0.0, 0.0, "sin", 0.0,
+                f"rayleigh(fD={fd:g}Hz)")
     if parts[0] == "rice" and len(parts) in (2, 3):
         fd = float(parts[1])
         k = float(parts[2]) if len(parts) == 3 else 0.0
-        return ("rice", fd, k, 0.0, 0.0, "sin", f"rice(fD={fd:g}Hz,K={k:g}dB)")
+        return ("rice", fd, k, 0.0, 0.0, "sin", 0.0,
+                f"rice(fD={fd:g}Hz,K={k:g}dB)")
     if parts[0] == "static":
-        return ("static", 0.0, 0.0, 0.0, 0.0, "sin", "static")
+        return ("static", 0.0, 0.0, 0.0, 0.0, "sin", 0.0, "static")
     raise ValueError(
         f"unknown SIM_FM_FADE '{fade_str}' (use off | {'|'.join(PRESETS)} | "
-        "ionos:<depth_db>:<rate_hz>[:sin|sq] | rayleigh:<fD> | "
+        "ionos:<depth_db>:<rate_hz>[:sin|sq] | "
+        "ionosnc:<depth_db>:<rate_hz>:<sn0_db> | rayleigh:<fD> | "
         "rice:<fD>[:<K_dB>] | static)")
 
 

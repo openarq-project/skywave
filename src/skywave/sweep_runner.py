@@ -85,6 +85,9 @@ BUILTIN_ADAPTERS = {
     # FreeDATA needs its own venv (fastapi/uvicorn + websocket-client): set ADAPTER_PY
     # to that python so adapter_argv launches the adapter under it. See adapters/freedata.py.
     "freedata":  {"module": "skywave.adapters.freedata",  "kill_pad": 110, "extra_env": {}},
+    # modem73 is a datagram KISS TNC (no native ARQ); the adapter supplies the
+    # selective-repeat transfer layer itself. Set MODEM73_BIN. See adapters/modem73.py.
+    "modem73":   {"module": "skywave.adapters.modem73",   "kill_pad": 90, "extra_env": {}},
 }
 
 
@@ -541,7 +544,18 @@ def run_cell(modem, cell, rep, writer, fcsv, tag):
            "connect_s": conn, "label": label, "wall_s": wall,
            "fade_delay_ms": fade_ms, "fade_doppler_hz": fade_hz,
            "atten_db": atten_db,
-           "connected": connected, "time_to_connect": time_to_connect}
+           "connected": connected, "time_to_connect": time_to_connect,
+           # F.1487 Annex 3 s6 statistical-coverage bookkeeping: independent
+           # fade states this row sampled (channel seconds x Doppler spread).
+           # A result is ensemble-converged when the SUM over its reps
+           # reaches ~3000; scorers aggregate, this column just makes the
+           # arithmetic visible per row. "" for no-fade rows or missing wall.
+           "fade_units": (round(float(wall) * float(fade_hz), 1)
+                          if (wall != "" and fade_hz not in ("", None, 0.0))
+                          else ""),
+           # ITU-R F.520-2 2.7 kHz noise-reference-bandwidth SNR (see
+           # results_schema changelog): snr3k + 10*log10(3000/2700).
+           "snr2k7": (round(snr + 0.46, 1) if snr is not None else "")}
     writer.writerow(row); fcsv.flush()
     lbl = f" [{label}]" if label else ""
     print(f"[{modem}]{lbl} s={sigma}({row['snr3k']}dB) {watt} p={payload} r{rep}: "

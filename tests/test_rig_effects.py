@@ -44,6 +44,39 @@ def test_freq_shift_link_wiring():
     assert abs(dominant_freq(y, cs.FS) - 1525.0) < 2.0
 
 
+def test_freq_shift_wobble_traces_instantaneous_frequency():
+    # IONOS FM DEVIATION/RATE: dev*sin(2*pi*rate*t) on the LO. A 1500 Hz tone
+    # through dev=50 Hz @ 5 Hz must sweep its instantaneous frequency across
+    # 1500 +- 50 Hz, phase-continuously.
+    sh = fxm.FreqShift(FS, 0.0, wobble_dev_hz=50.0, wobble_rate_hz=5.0)
+    n = np.arange(FS * 2)
+    x = 5000.0 * np.sin(2 * np.pi * 1500.0 * n / FS)
+    y = np.concatenate([sh.process(x[k:k + 1024]) for k in range(0, len(x), 1024)])
+    body = y[FS // 2:]                                   # skip the Hilbert warm-up
+    inst = np.diff(np.unwrap(np.angle(hilbert(body)))) * FS / (2 * np.pi)
+    # median-filter the phase-derivative jitter with a coarse block mean
+    inst = inst[:len(inst) // 480 * 480].reshape(-1, 480).mean(axis=1)
+    assert abs(inst.max() - 1550.0) < 5.0
+    assert abs(inst.min() - 1450.0) < 5.0
+    assert abs(np.std(body) / np.std(x) - 1.0) < 0.02    # pure phase effect
+
+
+def test_freq_shift_wobble_off_is_bit_exact():
+    # The static fast path must be untouched when the wobble knobs are zero.
+    n = np.arange(FS)
+    x = 5000.0 * np.sin(2 * np.pi * 1000.0 * n / FS)
+    a = fxm.FreqShift(FS, 25.0)
+    b = fxm.FreqShift(FS, 25.0, wobble_dev_hz=0.0, wobble_rate_hz=0.0)
+    ya = np.concatenate([a.process(x[k:k + 1024]) for k in range(0, len(x), 1024)])
+    yb = np.concatenate([b.process(x[k:k + 1024]) for k in range(0, len(x), 1024)])
+    assert np.array_equal(ya, yb)
+
+
+def test_freq_shift_wobble_needs_rate():
+    with pytest.raises(ValueError):
+        fxm.FreqShift(FS, 0.0, wobble_dev_hz=10.0, wobble_rate_hz=0.0)
+
+
 # ---------------------------------------------------------------- ClockSkew
 def test_clock_skew_scales_frequency():
     ppm = 10000.0                                        # exaggerated for resolution

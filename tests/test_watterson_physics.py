@@ -32,6 +32,13 @@ def test_presets_match_f1487_goldens():
     assert watterson.PRESETS["nvis-disturbed"] == (7.0, 1.0)   # F.1487 Annex 3 §3.4
     assert watterson.PRESETS["disturbed"] == (6.0, 10.0)       # low-lat disturbed
     assert watterson.PRESETS["high-lat"] == (7.0, 30.0)        # high-lat disturbed
+    # Otnes/ITU draft latitude table completion (PathSim tech guide s4.1.11)
+    assert watterson.PRESETS["low-lat-quiet"] == (0.5, 0.5)
+    assert watterson.PRESETS["high-lat-quiet"] == (1.0, 0.5)
+    assert watterson.PRESETS["high-lat-moderate"] == (3.0, 10.0)
+    # CCIR 520-1 flat fading (zero differential delay = single Rayleigh path)
+    assert watterson.PRESETS["flat"] == (0.0, 0.2)
+    assert watterson.PRESETS["flat-extreme"] == (0.0, 1.0)
 
 
 def test_power_normalization():
@@ -83,23 +90,129 @@ def test_realized_differential_delay():
     assert {l1, l2} == {g, g + tau}, f"dominant lags {{{l1},{l2}}} != {{{g},{g+tau}}}"
 
 
+def _realized_spread(dop, low_fs, dur_s, rng, filter_mode="codec2"):
+    """Autocorrelation-derived 2-sigma spread of the generated gain process
+    (R(tau) = exp(-2*pi^2*sigma_f^2*tau^2) for a Gaussian PSD; small-lag fit,
+    tail-insensitive — a second-moment PSD estimate is inflated by design-grid
+    leakage, which is a separate defect from the width convention)."""
+    g = watterson._doppler_gain_lowrate(dop, low_fs, int(dur_s * low_fs), rng,
+                                        filter_mode)
+    lags = np.arange(1, 6)
+    R = np.array([np.abs(np.vdot(g[:-k], g[k:]) / np.vdot(g, g)) for k in lags])
+    tau = lags / low_fs
+    sigma_f = np.sqrt(-np.log(R) / (2 * np.pi ** 2 * tau ** 2)).mean()
+    return 2.0 * sigma_f
+
+
 def test_realized_doppler_spread():
-    """The generated tap-gain process must have the requested 2-sigma spectral width."""
-    dop = 1.5
-    low_fs = 50.0
+    """codec2-2016 (frozen legacy) filter: realized 2-sigma spread is
+    KNOWN-WRONG and SPREAD-DEPENDENT (missing sqrt(PSD) + the 50 Hz-floor x
+    fixed-grid interaction; adjudicated 2026-07-28 against F.1487 Eq.2 /
+    MIL-STD-188-110C App E / NTIA-Johnson). Pinned AT the measured ladder —
+    not at nominal — so a silent change in either direction fails:
+    byte-stability of the frozen legacy realization is the contract that
+    keeps pre-gen-8 corpora reproducible."""
+    for dop, ratio in ((0.1, 6.03), (0.5, 1.33), (1.0, 0.91), (2.0, 0.79)):
+        low_fs = max(50.0, np.ceil(32.0 * dop))
+        rng = np.random.default_rng(3)
+        dur = max(240.0, 400.0 / dop)          # enough fade units at slow spreads
+        realized = _realized_spread(dop, low_fs, dur, rng, "codec2-2016")
+        assert abs(realized / dop / ratio - 1.0) < 0.06, \
+            f"legacy realized {realized:.3f} Hz at nominal {dop} (pin {ratio}x)"
+
+
+def test_milstd_filter_realizes_nominal_spread():
+    """milstd filter (MIL-STD-188-110C App E time-domain Gaussian taps):
+    realized 2-sigma spread == nominal within 5% — the standards-faithful
+    mode's defining gate."""
     rng = np.random.default_rng(3)
-    g = watterson._doppler_gain_lowrate(dop, low_fs, int(240 * low_fs), rng)
-    # Welch-ish: average periodograms over 8 segments
-    nseg = 8
-    seg = len(g) // nseg
+    for dop in (0.5, 1.5, 10.0):
+        low_fs = max(50.0, np.ceil(32.0 * dop))
+        realized = _realized_spread(dop, low_fs, 240, rng, "milstd")
+        assert abs(realized / dop - 1.0) < 0.05, \
+            f"milstd realized {realized:.3f} Hz for nominal {dop}"
+
+
+def test_milstd_psd_shape_within_appe_tolerance():
+    """App E sec E.7.4-style gate: the realized Doppler power spectrum vs the
+    ideal Gaussian, within +-1.5 dB at the -20 dB point and +-2.0 dB at the
+    -30 dB point (single path; long realization stands in for the 3 h tone
+    FFT)."""
+    dop, low_fs = 1.0, 50.0
+    rng = np.random.default_rng(5)
+    g = watterson._doppler_gain_lowrate(dop, low_fs, 600_000, rng, "milstd")
+    seg = 8192
+    nseg = len(g) // seg
     psd = np.zeros(seg)
     for k in range(nseg):
-        s = g[k * seg:(k + 1) * seg] * np.hanning(seg)
-        psd += np.abs(np.fft.fft(s)) ** 2
+        psd += np.abs(np.fft.fft(g[k * seg:(k + 1) * seg] * np.kaiser(seg, 9.0))) ** 2
     f = np.fft.fftfreq(seg, 1.0 / low_fs)
-    sigma_f = np.sqrt(np.sum(psd * f ** 2) / np.sum(psd))
-    realized = 2.0 * sigma_f                           # 2-sigma width convention
-    assert abs(realized - dop) / dop < 0.3, f"realized 2-sigma spread {realized:.2f} Hz"
+    idx = np.argsort(f)
+    f, psd = f[idx], psd[idx]
+
+    def smooth_db(i):
+        # average in LINEAR power over +-2 bins (dB-domain averaging biases
+        # low on a curved slope), then convert
+        return 10.0 * np.log10(psd[max(0, i - 2):i + 3].mean())
+
+    i0 = int(np.argmin(np.abs(f)))
+    ref_db = smooth_db(i0)                          # smoothed 0 Hz reference
+    sigma = dop / 2.0
+    ideal_db = -10.0 * (f ** 2) / (2 * sigma ** 2) * np.log10(np.e)
+    for target_db, tol_db in ((-20.0, 1.5), (-30.0, 2.0)):
+        f_pt = sigma * np.sqrt(-2.0 * target_db / (10.0 * np.log10(np.e)))
+        for sgn in (-1.0, 1.0):
+            i = int(np.argmin(np.abs(f - sgn * f_pt)))
+            meas = smooth_db(i) - ref_db
+            assert abs(meas - ideal_db[i]) < tol_db, \
+                f"at {f[i]:+.2f} Hz: measured {meas:.2f} dB vs ideal {ideal_db[i]:.2f}"
+
+
+def test_interpolation_images_suppressed():
+    """The low-rate -> audio-rate linear interpolation must not leave spectral
+    images at the update-rate offsets (Furman: zero-order hold puts them at
+    multiples of low_fs; ours measured -77 dBc — pin at -70 with margin).
+    Cross-instrument context: PathSim's polyphase interpolator measures
+    -62 dBc on the same probe."""
+    for mode in ("codec2-2016", "milstd"):
+        ch = watterson.WattersonChannel(float(FS), 2.0, 1.0, dur_s=100, seed=9,
+                                        filter_mode=mode)
+        blk = 8000.0 * np.sin(2 * np.pi * 1500.0 * np.arange(1024) / FS)
+        y = np.concatenate([ch.process(blk).copy()
+                            for _ in range(int(66 * FS / 1024))])[FS * 5:]
+        seg = FS * 60
+        X = np.abs(np.fft.rfft(y[:seg] * np.hanning(seg))) ** 2
+        fr = np.fft.rfftfreq(seg, 1.0 / FS)
+        base = X[(fr > 1495) & (fr < 1505)].max()
+        for off in (50.0, 100.0):                 # low_fs and 2*low_fs at d=1
+            for sgn in (-1, 1):
+                band = (fr > 1500 + sgn * off - 2) & (fr < 1500 + sgn * off + 2)
+                img = 10.0 * np.log10(X[band].max() / base)
+                assert img < -70.0, f"{mode}: image at {sgn*off:+.0f} Hz = {img:.1f} dBc"
+
+
+def test_default_filter_mode_is_milstd_and_legacy_is_frozen():
+    """Gen 8: default == milstd; the 'codec2' alias resolves to the frozen
+    codec2-2016 realization byte-for-byte (pre-gen-8 corpus reproduction)."""
+    a = watterson.WattersonChannel(FS, 2.0, 1.0, dur_s=10, seed=7)
+    b = watterson.WattersonChannel(FS, 2.0, 1.0, dur_s=10, seed=7,
+                                   filter_mode="milstd")
+    assert a.filter_mode == "milstd"
+    assert np.array_equal(a.p1, b.p1) and np.array_equal(a.p2, b.p2)
+    legacy = watterson.WattersonChannel(FS, 2.0, 1.0, dur_s=10, seed=7,
+                                        filter_mode="codec2-2016")
+    alias = watterson.WattersonChannel(FS, 2.0, 1.0, dur_s=10, seed=7,
+                                       filter_mode="codec2")
+    assert alias.filter_mode == "codec2-2016"
+    assert np.array_equal(legacy.p1, alias.p1) and np.array_equal(legacy.p2, alias.p2)
+    assert not np.array_equal(a.p1, legacy.p1)
+
+
+def test_unknown_filter_mode_rejected():
+    import pytest
+    with pytest.raises(ValueError):
+        watterson.WattersonChannel(FS, 2.0, 1.0, dur_s=5, seed=1,
+                                   filter_mode="nonsense")
 
 
 def test_rayleigh_envelope():

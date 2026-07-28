@@ -46,7 +46,7 @@ def _parse_sim(desc):
         return "off", "", ""
     if desc.startswith("fade=schedule["):
         return "schedule", "", ""
-    m = re.match(r"fade=(\S+?)\(([\d.]+)ms/([\d.]+)Hz\)$", desc)
+    m = re.match(r"fade=(\S+?)\(([\d.]+)ms/([\d.]+)Hz\)( fade_filter=\S+)?$", desc)
     assert m, f"unparsed channel_sim fade desc: {desc!r}"
     return ("custom" if m.group(1) == "custom" else "preset",
             float(m.group(2)), float(m.group(3)))

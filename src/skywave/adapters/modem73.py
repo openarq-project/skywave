@@ -253,9 +253,15 @@ class Modem73Adapter(ModemAdapter):
     # ---- hooks ----
     def preclean_patterns(self):
         # Scoped to our control ports so they can never match a user's real
-        # modem73 session (or this adapter's own cmdline).
+        # modem73 session (or this adapter's own cmdline). The arecord/aplay
+        # patterns catch orphans left by a PRIOR run's abnormal exit (a NOCONN, an
+        # external timeout kill) that teardown_stations() never got to run for --
+        # without this, one bad cell silently fail_connects every cell after it for
+        # the rest of the campaign (the devices stay exclusively held).
         return [f"modem73 .*--control-port {self.A_CTL}",
-                f"modem73 .*--control-port {self.B_CTL}"]
+                f"modem73 .*--control-port {self.B_CTL}",
+                "arecord -D plughw:[2-5]",
+                "aplay -D plughw:[2-5]"]
 
     def _station_env(self):
         # Bogus PULSE_SERVER defeats miniaudio's Pulse backend (it cannot see the
@@ -518,6 +524,14 @@ class Modem73Adapter(ModemAdapter):
                 except OSError:
                     pass
         super().teardown_stations()      # SIGTERM the modem73 processes
+        # modem73's miniaudio ALSA backend shells out to arecord/aplay for the four
+        # aloop endpoints; a station that dies abnormally (a NOCONN, an external
+        # timeout kill) can orphan these, leaving the device exclusively held for
+        # every subsequent run -- a whole campaign silently fail_connects from one
+        # bad cell onward. Scoped to this rig's fixed cards (modem73_aloop.conf: TXA
+        # card2, RXA card3, TXB card4, RXB card5), same pattern ardop.py uses.
+        for pat in ["arecord -D plughw:[2-5]", "aplay -D plughw:[2-5]"]:
+            sp.run(["pkill", "-9", "-f", pat], stdout=sp.DEVNULL, stderr=sp.DEVNULL)
 
 
 if __name__ == "__main__":

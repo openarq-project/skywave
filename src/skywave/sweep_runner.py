@@ -367,7 +367,11 @@ def run_cell(modem, cell, rep, writer, fcsv, tag):
     sigma = cell["sigma"]; cell_watt = cell.get("watterson", "off")
     payload = cell.get("payload", 4096); tmo = cell.get("timeout", 120)
     env = dict(os.environ)
-    env["SIM_HALF_DUPLEX"] = "1"; env["SIM_PTT"] = "1"
+    # setdefault (not unconditional assignment): an explicit operator override wins,
+    # matching every other cell-env knob below (SIM_TR_UNKEY_MS, SIM_MAX_VIRTUAL_S, ...)
+    # and the --calibrate-pep path above (line 258), which already does this.
+    env.setdefault("SIM_HALF_DUPLEX", "1")
+    env.setdefault("SIM_PTT", "1")
     # Instant T/R turnaround by default (a fair baseline). A non-zero deaf window only
     # modems with a turnaround gate survive, so it is held at 0 here; override via env
     # (SIM_TR_UNKEY_MS) for a T/R-penalty study.

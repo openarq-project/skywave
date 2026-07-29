@@ -289,7 +289,11 @@ class Modem73Adapter(ModemAdapter):
 
     def _launch(self, call, kiss_port, ctl_port, dev, log):
         rx_idx, tx_idx = dev
-        p = sp.Popen([self.bin, "--headless", "--ptt", "none",
+        # --tx-blank: get_status's ptt_on IS tx_blanking_active_, which never
+        # rises unless tx_blanking_enabled (default false) -- without this flag
+        # the PTT poll sees a constant ptt_on=false and SIM_PTT=1 drops every
+        # TX block. The 500 ms tx_delay lead absorbs the <=200 ms poll lag.
+        p = sp.Popen([self.bin, "--headless", "--ptt", "none", "--tx-blank",
                       "--bind", "127.0.0.1", "-p", str(kiss_port),
                       "--control-port", str(ctl_port),
                       "--input-device", str(rx_idx), "--output-device", str(tx_idx),
@@ -328,13 +332,25 @@ class Modem73Adapter(ModemAdapter):
 
         # Level-based CSMA busy detection locks out TX at bench noise levels;
         # sync-only keeps the turnaround behavior on decodable carriers only.
-        setcfg = {"csma_sync_only": 1}
+        # Boolean keys MUST be real JSON booleans: set_config type-checks with
+        # cJSON_IsBool and SILENTLY ignores 0/1 integers (returning ok anyway).
+        setcfg = {"csma_sync_only": True}
         if self.extra_cfg:
             setcfg.update(json.loads(self.extra_cfg))
         for st, ctl in (("A", self.ctlA), ("B", self.ctlB)):
             r = ctl.request(dict(setcfg, cmd="set_config"))
             if not (r and r.get("ok")):
                 print(f"  ({st}: set_config {setcfg} -> {r})", flush=True)
+            # set_config ignores wrongly-typed/unknown keys without erroring, so
+            # read the config back and warn on anything that did not take.
+            applied = ctl.request({"cmd": "get_config"}) or {}
+            for k, want in setcfg.items():
+                if k in applied:
+                    got = applied[k]
+                    ok = (got == bool(want)) if isinstance(got, bool) else (got == want)
+                    if not ok:
+                        print(f"  ({st}: set_config {k}={want!r} did not take, "
+                              f"modem reports {got!r})", flush=True)
         gc = self.ctlB.request({"cmd": "get_config"}) or {}
         payload_size = int(gc.get("payload_size") or 512)
         self.mtu = payload_size - 2       # PHY payload carries a 2-byte length prefix

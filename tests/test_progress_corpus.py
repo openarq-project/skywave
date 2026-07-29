@@ -164,3 +164,46 @@ def test_a_stalled_cell_is_distinguishable_from_a_slow_one(tmp_path, monkeypatch
 @pytest.mark.parametrize("col", ["progress_log", "stall_s"])
 def test_columns_are_in_the_schema(col):
     assert col in COLUMNS
+
+
+def test_cell_log_is_readable_while_the_cell_is_still_running(tmp_path, monkeypatch):
+    """Ticks are useless for watching a live cell if the log only lands at close.
+
+    Measured on the 2026-07-29 bench4 acceptance cell: the log sat at 0 bytes for the
+    first minute of a 254 s run, because `open(log, "wb")` buffers 8 KB and nothing
+    flushed until the file closed. A stalled-vs-slow call you can only make after the
+    run is over is not the one the cadence exists for -- and a killed process loses the
+    log entirely. This asserts from INSIDE the streaming loop, which is the only place
+    the difference is observable.
+    """
+    monkeypatch.setattr(sweep_runner, "LOGDIR", str(tmp_path))
+    monkeypatch.setattr(sweep_runner.sp, "run",
+                        lambda *a, **k: type("P", (), {"returncode": 1})())
+    seen = {}
+
+    def streaming():
+        yield "PROGRESS t=0.0s bytes=0\n"
+        yield "PROGRESS t=5.0s bytes=256\n"
+        # mid-run: whatever has been written must already be on disk
+        logs = list(tmp_path.glob("*.log"))
+        seen["mid"] = logs[0].read_text() if logs else "<no log file>"
+        yield RESULT
+
+    class _Streaming(_FakePopen):
+        def __init__(self, argv, **kw):
+            self.stdout = streaming()      # a live generator, NOT materialized
+            self.returncode = None
+
+    monkeypatch.setattr(sweep_runner.sp, "Popen",
+                        lambda argv, **kw: _Streaming(argv, **kw))
+    out = tmp_path / "row.csv"
+    with open(out, "w", newline="") as f:
+        w = csv.DictWriter(f, fieldnames=COLUMNS)
+        w.writeheader()
+        sweep_runner.run_cell("loopback", {"sigma": 0, "payload": 512, "timeout": 60},
+                              0, w, f, "spec")
+
+    mid = seen.get("mid", "")
+    assert "cell_t0" in mid, f"header not flushed mid-run: {mid!r}"
+    assert "PROGRESS t=0.0s bytes=0" in mid, f"first tick not flushed mid-run: {mid!r}"
+    assert "PROGRESS t=5.0s bytes=256" in mid, f"second tick not flushed mid-run: {mid!r}"

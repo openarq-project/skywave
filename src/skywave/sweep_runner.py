@@ -536,6 +536,7 @@ def run_cell(modem, cell, rep, writer, fcsv, tag):
             # parser of this file ignores it.
             lf.write(f"[+{0.0:8.3f}] cell_t0 wall={t0:.3f} attempt={att}\n"
                      .encode("utf-8"))
+            lf.flush()
             p = sp.Popen(["timeout", str(kill), *adapter_argv(cfg, payload, tmo)],
                         cwd=BENCH_ROOT, env=skywave.child_env(env),
                         stdout=sp.PIPE, stderr=sp.STDOUT, text=True, bufsize=1)
@@ -543,6 +544,15 @@ def run_cell(modem, cell, rep, writer, fcsv, tag):
             for raw_line in p.stdout:
                 stamped = f"[+{time.time() - t0:8.3f}] {raw_line}"
                 lf.write(stamped.encode("utf-8", errors="replace"))
+                # Flush per line. Without this the 8 KB default buffer holds everything
+                # until close, so a long cell's log sits at 0 bytes while it runs and
+                # cannot be watched at all -- measured on the 2026-07-29 bench4
+                # acceptance cell, empty for the first minute of a 254 s run. That
+                # defeats the point of cadence PROGRESS ticks (telling a stalled
+                # transfer from a slow one AS IT HAPPENS) and loses the whole log if
+                # the process is killed. A few thousand lines per cell makes the cost
+                # irrelevant next to seconds of airtime.
+                lf.flush()
                 chunks.append(stamped)
             p.wait()
         el = round(time.time() - t0, 1)

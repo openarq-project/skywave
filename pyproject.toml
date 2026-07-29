@@ -40,6 +40,8 @@ hfchan = "skywave.hfchan:main"
 skywave-sweep = "skywave.sweep_runner:main"
 # The half-duplex channel-sim process (usually spawned by the harness).
 skywave-channel = "skywave.channel_sim:main"
+# Scheduled-fade scorer: what the modem did at each channel transition.
+skywave-score-transitions = "skywave.score_transitions:main"
 
 [tool.setuptools.packages.find]
 where = ["src"]

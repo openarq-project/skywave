@@ -63,9 +63,9 @@ depends on numpy and scipy. From a checkout:
 pip install -e .          # editable; add [test] for pytest: pip install -e ".[test]"
 ```
 
-This puts the `skywave` package on the path and installs three console scripts:
-`hfchan`, `skywave-sweep`, and `skywave-channel`. You can also run any entry
-point without installing, straight from `src/`, with
+This puts the `skywave` package on the path and installs four console scripts:
+`hfchan`, `skywave-sweep`, `skywave-channel`, and `skywave-score-transitions`.
+You can also run any entry point without installing, straight from `src/`, with
 `PYTHONPATH=src python3 -m skywave.<module>`.
 
 ### Platforms
@@ -103,6 +103,16 @@ Compare a modem across a set of cells:
 skywave-sweep mymodem cells.json out.csv
 ```
 
+Score what a modem did when the channel changed under it. A cell with a scheduled
+fade (`"env": {"SIM_FADE_SCHEDULE": "good:120,poor:180,good:0"}`) is the only one
+that exercises adaptive rate control; run it with delivery ticks on, then join each
+transition to the modem's own behaviour around it:
+
+```
+SKYW_PROGRESS_S=5 skywave-sweep mymodem sched_cells.json out.csv
+skywave-score-transitions out.csv -o transitions.csv
+```
+
 ## Documentation
 
 Channel model and physics:
@@ -136,7 +146,7 @@ Validation and comparison:
 Harness and transports:
 
 - [docs/MODEM-ADAPTER-CONTRACT.md](docs/MODEM-ADAPTER-CONTRACT.md): the contract for adding
-  a modem.
+  a modem, including the optional byte-vs-time delivery curve.
 - [docs/TRANSPORT.md](docs/TRANSPORT.md): running with or without an ALSA loopback rig.
 - [docs/TRANSPORT-DESIGN.md](docs/TRANSPORT-DESIGN.md): the socket and virtual-clock
   transport design.

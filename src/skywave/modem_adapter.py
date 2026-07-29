@@ -289,6 +289,16 @@ class ModemAdapter(abc.ABC):
             # window once the transfer has returned.
             self._prog_t0 = b0
             self._prog_next = b0
+            if cfg.progress_s > 0:
+                # The curve's ORIGIN on both clocks. Ticks carry t RELATIVE to this
+                # point, which is enough to score the transfer against itself but not
+                # to place it against anything the CHANNEL logged -- the fade
+                # schedule's transitions, above all. `bench` is on the bench_time axis
+                # (= the sim's signal clock on a virtual-clock transport, so a fade
+                # transition at audio t maps to tick t = audio - bench here); `wall`
+                # anchors the same instant for a real-time rig. Emitted only when
+                # ticks are on, so a run without them is byte-identical to before.
+                print(f"XFER_START bench={b0:.3f} wall={t0:.3f}", flush=True)
             recv = bytes(self.transfer(payload, t0 + cfg.timeout_s))
             dt = self.bench_time() - b0
             # Terminal tick: pin the curve's final point at the true end of the

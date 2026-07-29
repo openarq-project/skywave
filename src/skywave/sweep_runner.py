@@ -528,6 +528,14 @@ def run_cell(modem, cell, rep, writer, fcsv, tag):
         # whichever numbers happen to reach a final RESULT line (RES_CONN, blank on any
         # row with no RESULT at all -- exactly the connect-then-no-decode case below).
         with open(log, "wb") as lf:
+            # Wall anchor for the stamps below. Every captured line is stamped RELATIVE
+            # to this attempt's t0, which on its own cannot be joined to the channel
+            # sim's audio clock (its own log's [audio-clock] line is absolute wall).
+            # score_transitions needs both to put fade transitions and modem events on
+            # one axis. Carries no RESULT/CONNECTED/NOCONN token, so every existing
+            # parser of this file ignores it.
+            lf.write(f"[+{0.0:8.3f}] cell_t0 wall={t0:.3f} attempt={att}\n"
+                     .encode("utf-8"))
             p = sp.Popen(["timeout", str(kill), *adapter_argv(cfg, payload, tmo)],
                         cwd=BENCH_ROOT, env=skywave.child_env(env),
                         stdout=sp.PIPE, stderr=sp.STDOUT, text=True, bufsize=1)

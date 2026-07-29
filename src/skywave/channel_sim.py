@@ -739,6 +739,24 @@ class Link:
         while not self.stop.is_set():
             if not self.read_block():
                 break                       # capture ended
+            if self.nblocks == 0:
+                # AUDIO-CLOCK ANCHOR. This block is t=0 for every per-block clock in
+                # this direction -- above all the fade schedule's, whose transition
+                # timestamps are audio seconds. Nothing else in the log related that
+                # clock to anything an ADAPTER measures, so the transition ground truth
+                # and the modem's own events had no common axis and "switch latency"
+                # could not actually be computed from a cell's artifacts.
+                # Emitted from the first block rather than beside the startup banner:
+                # the banner precedes ALSA capture startup by an unbounded amount, and
+                # that gap would land directly in every latency number.
+                # Not needed on the SIM_CLOCK=virt_time path (run_lockstep, which does
+                # not come through here): there the adapter's bench_time IS this sim's
+                # virt_now_ms, so audio time and adapter time already share an origin.
+                # Single write for the same reason as the fade-schedule logger below:
+                # both directions emit this from their own thread, on their first block.
+                sys.stderr.write(f"channel_sim: [audio-clock {self.name}] t=0.000s "
+                                 f"wall={time.time():.3f}\n")
+                sys.stderr.flush()
             t0 = time.monotonic()
             self.process()
             if not self.write_block():
@@ -1322,8 +1340,15 @@ def build_channel_effects():
 
         def _mk_transition_logger(direction):
             def _log(t_s, frm, to):
-                print(f"channel_sim: [fade-schedule {direction}] t={t_s:.2f}s "
-                      f"{frm} -> {to}", file=sys.stderr, flush=True)
+                # ONE write, not print()'s write(message)+write(newline) pair. The two
+                # directions log from separate threads and hit the same boundary within
+                # microseconds of each other, so print() interleaved mid-line in ~12% of
+                # runs -- the peer's record landing INSIDE this one's `to` field
+                # ("good -> poorchannel_sim: [fade-schedule ...") and corrupting the
+                # ground truth this line exists to be. Measured 2026-07-29.
+                sys.stderr.write(f"channel_sim: [fade-schedule {direction}] "
+                                 f"t={t_s:.2f}s {frm} -> {to}\n")
+                sys.stderr.flush()
             return _log
         fade_ab = watterson.ScheduledFade(FS, segs, FADE_DUR_S, FADE_SEED + 11,
                                           FADE_XFADE_S, _mk_transition_logger("A->B"),

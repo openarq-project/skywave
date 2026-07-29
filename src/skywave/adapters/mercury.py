@@ -9,16 +9,38 @@ modem on the ModemAdapter contract -- copy it as a starting point for another mo
 Set MERCURY_BIN to the Mercury binary, then run it via the harness as the `mercury` modem:
 
   skywave-sweep mercury spec.json out.csv
+
+PROVENANCE + PIN GATE. skywave never clones, pulls or builds Mercury -- it just
+execs $MERCURY_BIN -- so a box's binary is STICKY and used to be scored with no
+record of which commit it was. Every run now captures that record and prints it
+as `MERCURY_PROVENANCE {json}`; campaigns pin it. Env:
+
+  MERCURY_PIN_FILE       path to a MERCURY_PIN.json {commit, rationale, [tag]}
+  MERCURY_PIN            inline commit sha (alternative to the file)
+  MERCURY_PIN_RATIONALE  reason, required alongside an inline MERCURY_PIN
+  MERCURY_PIN_OVERRIDE=1 run despite a violation (recorded, never silent)
+  MERCURY_PROVENANCE_FILE  also write the record here as JSON
+
+With no pin the run proceeds but is flagged `unpinned` -- fine for a smoke,
+not for a corpus. See skywave.modem_provenance for the rationale.
 """
+import json
 import os
 import re
 import select
+import shutil
 import signal
 import socket
 import subprocess as sp
 import time
 
 from skywave.modem_adapter import ModemAdapter, run_adapter
+from skywave.modem_provenance import (
+    PinViolation,
+    ProvenanceError,
+    format_record,
+    gate,
+)
 
 
 class MercuryAdapter(ModemAdapter):
@@ -30,6 +52,10 @@ class MercuryAdapter(ModemAdapter):
     def __init__(self, cfg):
         super().__init__(cfg)
         self.merc = os.environ.get("MERCURY_BIN", "").strip() or "mercury"
+        # Establish (and, if pinned, enforce) which Mercury this is BEFORE anything
+        # is launched -- a pin violation must cost zero airtime and leave no
+        # half-started stations behind.
+        self.provenance = self._gate_provenance()
         # PTT isolation, same hazard class as armstrong's 2026-07-23 incident:
         # mercury resolves its default "mercury.ini" RELATIVE to the invocation
         # CWD, where a stray file's radio_model could point hamlib at a real
@@ -40,6 +66,64 @@ class MercuryAdapter(ModemAdapter):
         self.a = self.b = self.adat = self.bdat = None
         self.nm = {}
         self.buf = {}
+
+    def _gate_provenance(self):
+        """Capture Mercury's provenance, enforcing MERCURY_PIN* if declared.
+
+        Emits `MERCURY_PROVENANCE {json}` so the record reaches the run log even
+        when the caller keeps no manifest. Raises PinViolation on an unmet pin.
+        """
+        env = os.environ
+        # A bare name (the default "mercury") is resolved on PATH so the record
+        # names the file that will actually be exec'd, not the word.
+        target = self.merc
+        if os.sep not in target:
+            target = shutil.which(target) or target
+
+        pin_file = env.get("MERCURY_PIN_FILE", "").strip() or None
+        pin_commit = env.get("MERCURY_PIN", "").strip() or None
+        pinned = bool(pin_file or pin_commit)
+        try:
+            rec = gate(
+                target, modem="mercury",
+                pin_file=pin_file,
+                pin_commit=pin_commit,
+                rationale=(env.get("MERCURY_PIN_RATIONALE", "").strip() or None),
+                override=(env.get("MERCURY_PIN_OVERRIDE", "").strip() == "1"),
+            )
+        except ProvenanceError:
+            # The binary could not be located (typically a bare `mercury` that is
+            # not on PATH). When a pin is in force that is fatal -- an unidentified
+            # binary is exactly what the pin exists to prevent. Unpinned, it is not
+            # ours to fail on: the launch below will report it far more clearly,
+            # and adapter-construction unit tests never have a real binary.
+            if pinned:
+                raise
+            rec = {"modem": "mercury", "bin": target, "bin_md5": None,
+                   "repo": None, "commit": None, "describe": None,
+                   "pinned": False, "unpinned": True, "override": False,
+                   "pin": None, "problems": [], "unresolved": True}
+            print("mercury provenance: UNRESOLVED (binary not found: "
+                  f"{target}) [UNPINNED]", flush=True)
+            print("MERCURY_PROVENANCE " + json.dumps(rec), flush=True)
+            return rec
+        print(format_record(rec), flush=True)
+        if rec.get("unpinned"):
+            print("  WARNING: mercury is UNPINNED -- fine for a smoke, but these "
+                  "numbers are not campaign-grade (set MERCURY_PIN_FILE).", flush=True)
+        if rec.get("override") and rec.get("problems"):
+            print("  WARNING: MERCURY_PIN_OVERRIDE=1 -- running despite: "
+                  + "; ".join(rec["problems"]), flush=True)
+        print("MERCURY_PROVENANCE " + json.dumps(rec), flush=True)
+
+        out = env.get("MERCURY_PROVENANCE_FILE", "").strip()
+        if out:
+            try:
+                with open(out, "w") as f:
+                    json.dump(rec, f, indent=2)
+            except OSError as e:                       # never fail a run on logging
+                print(f"  WARNING: could not write {out}: {e}", flush=True)
+        return rec
 
     def _bench_ini(self):
         """-C value for every mercury launch (the PTT-isolation invariant)."""
@@ -175,4 +259,11 @@ class MercuryAdapter(ModemAdapter):
 
 if __name__ == "__main__":
     import sys
-    sys.exit(run_adapter(MercuryAdapter))
+    try:
+        sys.exit(run_adapter(MercuryAdapter))
+    except (PinViolation, ProvenanceError) as e:
+        # A clean, readable refusal -- not a traceback. rc=3 is distinct from the
+        # transfer failure code (2) so a sweep can tell "wrong binary" from
+        # "modem lost the payload".
+        print(f"\nFAIL: {e}", file=sys.stderr, flush=True)
+        sys.exit(3)

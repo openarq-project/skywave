@@ -20,6 +20,7 @@ Set ARDOP_BIN to the ardopcf binary, then run it as the `ardop` modem:
   skywave-sweep ardop spec.json out.csv
 """
 import os
+import shutil
 import select
 import socket
 import struct
@@ -27,6 +28,7 @@ import subprocess as sp
 import time
 
 from skywave.modem_adapter import ModemAdapter, run_adapter
+from skywave.modem_provenance import gate_from_env
 
 
 class ArdopAdapter(ModemAdapter):
@@ -44,6 +46,13 @@ class ArdopAdapter(ModemAdapter):
     def __init__(self, cfg):
         super().__init__(cfg)
         self.ardop = os.environ.get("ARDOP_BIN", "").strip() or "ardopcf"
+        # Identify (and, if pinned, enforce) WHICH build this is, before anything is
+        # launched -- see skywave.modem_provenance. A bare name is resolved on PATH
+        # so the record names the file that will actually be exec'd.
+        _t = self.ardop
+        if os.sep not in _t:
+            _t = shutil.which(_t) or _t
+        self.provenance = gate_from_env("ardop", _t)
         self.a = self.b = self.adat = self.bdat = None
         self.nm = {}
         self.buf = {}

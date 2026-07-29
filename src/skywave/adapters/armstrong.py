@@ -18,6 +18,7 @@ Set ARMSTRONG_BIN to a flat-CLI `armstrong-hf` build, then run it as `armstrong`
   skywave-sweep armstrong spec.json out.csv
 """
 import os
+import shutil
 import re
 import select
 import socket
@@ -26,6 +27,7 @@ import time
 
 from skywave import bench_pipes
 from skywave.modem_adapter import ModemAdapter, run_adapter
+from skywave.modem_provenance import gate_from_env
 
 
 class ArmstrongAdapter(ModemAdapter):
@@ -41,6 +43,13 @@ class ArmstrongAdapter(ModemAdapter):
     def __init__(self, cfg):
         super().__init__(cfg)
         self.arm = os.environ.get("ARMSTRONG_BIN", "").strip() or "armstrong-hf"
+        # Identify (and, if pinned, enforce) WHICH build this is, before anything is
+        # launched -- see skywave.modem_provenance. A bare name is resolved on PATH
+        # so the record names the file that will actually be exec'd.
+        _t = self.arm
+        if os.sep not in _t:
+            _t = shutil.which(_t) or _t
+        self.provenance = gate_from_env("armstrong", _t)
         self.sock = os.environ.get("SIM_TRANSPORT", "").strip() == "sock"   # opt-in device-free path
         # Post-CONNECT settle before data. In virt_time the modem's FSM clock races wall
         # time on a fast host, so a long WALL-clock idle here can burn past the ARQ

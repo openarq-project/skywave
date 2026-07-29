@@ -24,7 +24,6 @@ as `MERCURY_PROVENANCE {json}`; campaigns pin it. Env:
 With no pin the run proceeds but is flagged `unpinned` -- fine for a smoke,
 not for a corpus. See skywave.modem_provenance for the rationale.
 """
-import json
 import os
 import re
 import select
@@ -38,8 +37,7 @@ from skywave.modem_adapter import ModemAdapter, run_adapter
 from skywave.modem_provenance import (
     PinViolation,
     ProvenanceError,
-    format_record,
-    gate,
+    gate_from_env,
 )
 
 
@@ -68,62 +66,15 @@ class MercuryAdapter(ModemAdapter):
         self.buf = {}
 
     def _gate_provenance(self):
-        """Capture Mercury's provenance, enforcing MERCURY_PIN* if declared.
+        """Identify (and, if pinned, enforce) which Mercury this is.
 
-        Emits `MERCURY_PROVENANCE {json}` so the record reaches the run log even
-        when the caller keeps no manifest. Raises PinViolation on an unmet pin.
+        A bare name -- the default "mercury" -- is resolved on PATH so the record
+        names the file that will actually be exec'd, not the word.
         """
-        env = os.environ
-        # A bare name (the default "mercury") is resolved on PATH so the record
-        # names the file that will actually be exec'd, not the word.
         target = self.merc
         if os.sep not in target:
             target = shutil.which(target) or target
-
-        pin_file = env.get("MERCURY_PIN_FILE", "").strip() or None
-        pin_commit = env.get("MERCURY_PIN", "").strip() or None
-        pinned = bool(pin_file or pin_commit)
-        try:
-            rec = gate(
-                target, modem="mercury",
-                pin_file=pin_file,
-                pin_commit=pin_commit,
-                rationale=(env.get("MERCURY_PIN_RATIONALE", "").strip() or None),
-                override=(env.get("MERCURY_PIN_OVERRIDE", "").strip() == "1"),
-            )
-        except ProvenanceError:
-            # The binary could not be located (typically a bare `mercury` that is
-            # not on PATH). When a pin is in force that is fatal -- an unidentified
-            # binary is exactly what the pin exists to prevent. Unpinned, it is not
-            # ours to fail on: the launch below will report it far more clearly,
-            # and adapter-construction unit tests never have a real binary.
-            if pinned:
-                raise
-            rec = {"modem": "mercury", "bin": target, "bin_md5": None,
-                   "repo": None, "commit": None, "describe": None,
-                   "pinned": False, "unpinned": True, "override": False,
-                   "pin": None, "problems": [], "unresolved": True}
-            print("mercury provenance: UNRESOLVED (binary not found: "
-                  f"{target}) [UNPINNED]", flush=True)
-            print("MERCURY_PROVENANCE " + json.dumps(rec), flush=True)
-            return rec
-        print(format_record(rec), flush=True)
-        if rec.get("unpinned"):
-            print("  WARNING: mercury is UNPINNED -- fine for a smoke, but these "
-                  "numbers are not campaign-grade (set MERCURY_PIN_FILE).", flush=True)
-        if rec.get("override") and rec.get("problems"):
-            print("  WARNING: MERCURY_PIN_OVERRIDE=1 -- running despite: "
-                  + "; ".join(rec["problems"]), flush=True)
-        print("MERCURY_PROVENANCE " + json.dumps(rec), flush=True)
-
-        out = env.get("MERCURY_PROVENANCE_FILE", "").strip()
-        if out:
-            try:
-                with open(out, "w") as f:
-                    json.dump(rec, f, indent=2)
-            except OSError as e:                       # never fail a run on logging
-                print(f"  WARNING: could not write {out}: {e}", flush=True)
-        return rec
+        return gate_from_env("mercury", target)
 
     def _bench_ini(self):
         """-C value for every mercury launch (the PTT-isolation invariant)."""

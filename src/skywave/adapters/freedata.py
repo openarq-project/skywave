@@ -52,6 +52,7 @@ import time
 import urllib.request
 
 from skywave.modem_adapter import ModemAdapter, run_adapter
+from skywave.modem_provenance import gate_from_env
 from skywave import bench_pipes
 
 FREEDATA_DIR = os.path.expanduser(os.environ.get("FREEDATA_DIR", "~/tools/FreeDATA"))
@@ -181,6 +182,13 @@ class FreedataAdapter(ModemAdapter):
 
     def __init__(self, cfg):
         super().__init__(cfg)
+        # FreeDATA is a source CHECKOUT launched by an interpreter, not a built
+        # binary, so its identity is purely $FREEDATA_DIR's git state -- and it is
+        # just as sticky as a binary (a box keeps whatever was last pulled). The
+        # 2026-06-29 snd-aloop overflow was exactly this failure: dev carried an
+        # uncommitted blocksize=0 RX fix that the bench's fresh clone never got,
+        # and it cost a campaign before anyone thought to diff the two trees.
+        self.provenance = gate_from_env("freedata", FREEDATA_DIR)
         # rx_bytes: last progress count; rx_b64: terminal payload; done: terminal seen.
         self.state = {"stop": False, "post_accept": None,
                       "done": None, "t_end": None, "rx_b64": None, "rx_bytes": 0}

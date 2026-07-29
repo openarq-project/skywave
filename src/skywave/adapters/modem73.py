@@ -36,6 +36,7 @@ Set MODEM73_BIN to the binary, then run it via the harness as the `modem73` mode
 """
 import json
 import os
+import shutil
 import re
 import select
 import socket
@@ -44,6 +45,7 @@ import subprocess as sp
 import time
 
 from skywave.modem_adapter import ModemAdapter, run_adapter
+from skywave.modem_provenance import gate_from_env
 
 # ---------------- KISS framing (pure helpers, unit-tested) ----------------
 FEND, FESC, TFEND, TFESC = 0xC0, 0xDB, 0xDC, 0xDD
@@ -235,6 +237,13 @@ class Modem73Adapter(ModemAdapter):
     def __init__(self, cfg):
         super().__init__(cfg)
         self.bin = os.environ.get("MODEM73_BIN", "").strip() or "modem73"
+        # Identify (and, if pinned, enforce) WHICH build this is, before anything is
+        # launched -- see skywave.modem_provenance. A bare name is resolved on PATH
+        # so the record names the file that will actually be exec'd.
+        _t = self.bin
+        if os.sep not in _t:
+            _t = shutil.which(_t) or _t
+        self.provenance = gate_from_env("modem73", _t)
         self.modulation = os.environ.get("MODEM73_MODULATION", "").strip() or "QPSK"
         self.rate = os.environ.get("MODEM73_RATE", "").strip() or "1/2"
         self.frame = os.environ.get("MODEM73_FRAME", "").strip() or "normal"

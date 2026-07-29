@@ -31,7 +31,7 @@ import subprocess as sp
 from datetime import datetime
 
 __all__ = ["ProvenanceError", "PinViolation", "capture", "load_pin", "gate",
-           "format_record"]
+           "gate_from_env", "format_record"]
 
 # Rationales that are technically non-empty but state nothing. The pin exists so a
 # human records intent; these are the ways people avoid doing that.
@@ -79,18 +79,25 @@ def capture(binary, *, modem):
     does not live in a git work tree -- that is reported, never invented.
     """
     path = os.path.realpath(os.path.expanduser(binary))
-    if not os.path.isfile(path):
+    # A DIRECTORY is a legitimate target: FreeDATA is a source checkout launched
+    # by an interpreter, not a built binary, so its identity is purely the tree's.
+    # Everything else about the record is the same, minus the md5 of a file.
+    is_dir = os.path.isdir(path)
+    if not is_dir and not os.path.isfile(path):
         raise ProvenanceError(f"{modem}: binary not found: {binary}")
 
-    with open(path, "rb") as f:
-        digest = hashlib.md5()
-        for chunk in iter(lambda: f.read(1 << 20), b""):
-            digest.update(chunk)
+    digest = None
+    if not is_dir:
+        with open(path, "rb") as f:
+            digest = hashlib.md5()
+            for chunk in iter(lambda: f.read(1 << 20), b""):
+                digest.update(chunk)
 
     rec = {
         "modem": modem,
         "bin": path,
-        "bin_md5": digest.hexdigest(),
+        "kind": "tree" if is_dir else "binary",
+        "bin_md5": digest.hexdigest() if digest else None,
         "bin_mtime": datetime.fromtimestamp(os.path.getmtime(path)).isoformat(
             timespec="seconds"),
         "repo": None, "commit": None, "describe": None,
@@ -98,7 +105,7 @@ def capture(binary, *, modem):
         "captured": datetime.now().isoformat(timespec="seconds"),
     }
 
-    repo = _find_repo(os.path.dirname(path))
+    repo = _find_repo(path if is_dir else os.path.dirname(path))
     if repo is None:
         return rec
 
@@ -172,18 +179,32 @@ def gate(binary, *, modem, pin_file=None, pin_commit=None, rationale=None,
         return rec
 
     want = (pin.get("commit") or "").strip()
-    if not want:
-        problems.append("pin declares no commit")
-    elif rec["commit"] is None:
-        problems.append(
-            f"{modem}: no git repository behind {rec['bin']} -- its provenance "
-            "cannot be established, so it cannot be pinned (re-clone the tree "
-            "and rebuild on the box)")
-    elif not rec["commit"].startswith(want) and not want.startswith(rec["commit"]):
-        problems.append(
-            f"{modem}: built commit {rec['commit'][:12]} does not match the "
-            f"pinned {want[:12]}"
-            + (f" (tag {pin['tag']})" if pin.get("tag") else ""))
+    # A CLOSED-SOURCE modem (VARA) has no commit to pin -- its binary's md5 is the
+    # only identity it has. Allow either key, so "pin the modem" means the same
+    # thing for every modem in the bakeoff rather than only the open ones.
+    want_md5 = (pin.get("bin_md5") or "").strip().lower()
+
+    if not want and not want_md5:
+        problems.append("pin declares neither `commit` nor `bin_md5`")
+    if want:
+        if rec["commit"] is None:
+            problems.append(
+                f"{modem}: no git repository behind {rec['bin']} -- its provenance "
+                "cannot be established, so it cannot be pinned by commit (re-clone "
+                "the tree and rebuild on the box, or pin `bin_md5` instead)")
+        elif not rec["commit"].startswith(want) and not want.startswith(rec["commit"]):
+            problems.append(
+                f"{modem}: built commit {rec['commit'][:12]} does not match the "
+                f"pinned {want[:12]}"
+                + (f" (tag {pin['tag']})" if pin.get("tag") else ""))
+    if want_md5:
+        if rec["bin_md5"] is None:
+            problems.append(f"{modem}: pinned by bin_md5 but {rec['bin']} is a "
+                            "directory, which has no single binary to hash")
+        elif rec["bin_md5"].lower() != want_md5:
+            problems.append(
+                f"{modem}: binary md5 {rec['bin_md5'][:12]} does not match the "
+                f"pinned {want_md5[:12]}")
 
     if rec["dirty_tracked"]:
         problems.append(
@@ -200,6 +221,70 @@ def gate(binary, *, modem, pin_file=None, pin_commit=None, rationale=None,
             + f"\n\nSet {modem.upper()}_PIN_OVERRIDE=1 to run anyway (the "
               "violation is recorded in the results provenance).",
             record=rec)
+    return rec
+
+
+def gate_from_env(modem, target, env=None, emit=True):
+    """The adapter-facing entry point: capture + enforce, driven entirely by env.
+
+    Reads, for MODEM=mercury/armstrong/ardop/modem73/freedata/vara:
+
+      <MODEM>_PIN_FILE        path to a <MODEM>_PIN.json {commit|bin_md5, rationale}
+      <MODEM>_PIN             inline commit (alternative to the file)
+      <MODEM>_PIN_RATIONALE   reason, required alongside an inline pin
+      <MODEM>_PIN_OVERRIDE=1  run despite a violation (recorded, never silent)
+      <MODEM>_PROVENANCE_FILE also write the record here as JSON
+
+    `target` is the binary (or, for a source-checkout modem, its directory).
+    Every adapter calls this in one line, so the gate has ONE implementation and
+    cannot drift between modems.
+
+    Unresolvable target: fatal once a pin is declared (an unidentifiable build is
+    exactly what a pin exists to prevent), otherwise soft -- adapter unit tests and
+    dry smokes legitimately have no real binary, and the launch reports it better.
+    """
+    env = os.environ if env is None else env
+    up = modem.upper()
+    pin_file = (env.get(f"{up}_PIN_FILE", "") or "").strip() or None
+    pin_commit = (env.get(f"{up}_PIN", "") or "").strip() or None
+    pinned = bool(pin_file or pin_commit)
+
+    try:
+        rec = gate(
+            target, modem=modem, pin_file=pin_file, pin_commit=pin_commit,
+            rationale=((env.get(f"{up}_PIN_RATIONALE", "") or "").strip() or None),
+            override=((env.get(f"{up}_PIN_OVERRIDE", "") or "").strip() == "1"),
+        )
+    except ProvenanceError:
+        if pinned:
+            raise
+        rec = {"modem": modem, "bin": target, "kind": None, "bin_md5": None,
+               "repo": None, "commit": None, "describe": None,
+               "pinned": False, "unpinned": True, "override": False,
+               "pin": None, "problems": [], "unresolved": True}
+        if emit:
+            print(f"{modem} provenance: UNRESOLVED (not found: {target}) [UNPINNED]",
+                  flush=True)
+            print(f"{up}_PROVENANCE " + json.dumps(rec), flush=True)
+        return rec
+
+    if emit:
+        print(format_record(rec), flush=True)
+        if rec.get("unpinned"):
+            print(f"  WARNING: {modem} is UNPINNED -- fine for a smoke, but these "
+                  f"numbers are not campaign-grade (set {up}_PIN_FILE).", flush=True)
+        if rec.get("override") and rec.get("problems"):
+            print(f"  WARNING: {up}_PIN_OVERRIDE=1 -- running despite: "
+                  + "; ".join(rec["problems"]), flush=True)
+        print(f"{up}_PROVENANCE " + json.dumps(rec), flush=True)
+
+    out = (env.get(f"{up}_PROVENANCE_FILE", "") or "").strip()
+    if out:
+        try:
+            with open(out, "w") as f:
+                json.dump(rec, f, indent=2)
+        except OSError as e:                            # never fail a run on logging
+            print(f"  WARNING: could not write {out}: {e}", flush=True)
     return rec
 
 

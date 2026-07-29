@@ -110,6 +110,7 @@ class ArdopAdapter(ModemAdapter):
         recv = bytearray()
         rbuf = b""
         while len(recv) < total and time.time() < deadline:
+            self.progress(len(recv))
             r, _, _ = select.select([self.adat, self.a, self.b], [], [], 0.2)
             for s in r:
                 if s is self.adat:

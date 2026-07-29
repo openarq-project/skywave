@@ -247,6 +247,11 @@ class Modem73Adapter(ModemAdapter):
         self.decB = KissDecoder()
         self.mtu = 510                            # payload_size - 2; refreshed at connect
         self.frame_dur = 3.0                      # airtime of one frame; parsed from log
+        # Receiver-side store, reset per transfer. Initialized here so _pump can read
+        # the delivered-byte count during the connect probe, which pumps before any
+        # transfer() has run.
+        self._rx_chunks = {}                      # seq -> bytes
+        self._rx_total = 0
         self._ptt_state = {"A": False, "B": False}
         self._ptt_next_poll = 0.0
 
@@ -410,7 +415,7 @@ class Modem73Adapter(ModemAdapter):
     def transfer(self, payload, deadline):
         chunks = chunk_payload(payload, self.mtu)
         total = len(chunks)
-        self._rx_chunks = {}              # receiver-side store: seq -> bytes
+        self._rx_chunks = {}              # fresh receiver-side store for this transfer
         self._rx_total = total
         self._last_ack = None
         unacked = set(range(total))
@@ -442,6 +447,13 @@ class Modem73Adapter(ModemAdapter):
     def _pump(self, timeout):
         """One select cycle over both KISS sockets and both control sockets;
         also drives the PTT status poll when SIM_PTT is on."""
+        # Progress tick. This is the one place modem73 waits during a transfer
+        # (_await_reply pumps here, and transfer() only ever waits via _await_reply),
+        # so a cadence tick here covers the whole transfer window -- including a round
+        # that sends everything and then hears no ACK at all, which is exactly the
+        # flatline the curve exists to make visible. A no-op outside that window, so
+        # the connect probe's pumping is unaffected.
+        self.progress(sum(len(v) for v in self._rx_chunks.values()))
         socks = [self.kissA, self.kissB, self.ctlA, self.ctlB]
         r, _, _ = select.select(socks, [], [], timeout)
         for s in r:

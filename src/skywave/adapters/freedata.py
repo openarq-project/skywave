@@ -266,6 +266,10 @@ class FreedataAdapter(ModemAdapter):
             self._dump_logs()
             return b""
         while self.state["done"] is None and time.time() < deadline:
+            # rx_bytes is the IRS's own progress COUNT from the websocket events;
+            # the bytes themselves only arrive with the terminal event, so this is
+            # the only in-flight delivery signal FreeDATA exposes.
+            self.progress(self.state["rx_bytes"])
             time.sleep(0.2)
         if self.state["done"] and self.state["rx_b64"]:
             try:

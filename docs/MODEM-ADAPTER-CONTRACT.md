@@ -64,6 +64,15 @@ Call `self.on_line(station, line)` for **every** control line read from a statio
 relays PTT to the channel (`bench_pipes.fwd_ptt`) and scans telemetry. `station` is
 `"A"` or `"B"` (A = answerer, B = caller/sender, matching every adapter in the tree).
 
+Call `self.progress(bytes_delivered_so_far)` from inside `transfer`'s pump — at the top
+of the select/poll loop, i.e. at **every point the transfer can wait**, not only where
+bytes arrive. It rate-limits itself to `SKYW_PROGRESS_S` and is a no-op when that is
+unset (the default), so the call costs nothing when ticks are off. Missing it does not
+fail anything loudly; it silently produces a modem with no delivery curve, which is how
+`modem73` shipped without one. A modem whose only in-flight signal is a peer-reported
+count (FreeDATA) passes that count — the curve wants the best available estimate, not
+only locally-held bytes.
+
 ## 4. Output
 
 **Framework-compatible line** — `sweep_runner.run_cell()` finds `RESULT`, then within 400
@@ -81,6 +90,14 @@ deliberately fails the RES_CONN parse and leaves the column blank. Classificatio
 (sweep_runner): `got≥total and intact` → **ok**; `got>0` → **partial**; else → **fail**.
 A connect failure prints the **`NOCONN`** token (via `fail_connect()`) and writes no
 RESULT → **fail_connect** (sweep_runner retries it once).
+
+**Delivery curve** (optional, off unless `SKYW_PROGRESS_S` is set) — `self.progress()`
+emits `PROGRESS t=<s> bytes=<n>`, one per cadence interval plus a terminal tick pinned at
+the true end of transfer. `t` is the adapter's `bench_time()` axis, the same one the
+RESULT line's `in <secs>s` is measured on, so on a virtual-clock transport it is signal
+time and NOT the wall clock. Ticks fire on cadence even when the byte count has not
+moved — a flatline is the signal, so silence must mean the process died. sweep_runner
+parses these into a `.progress.csv` sidecar and the `progress_log`/`stall_s` columns.
 
 **Structured forward contract** — `RESULT_JSON {…}`, schema `modem-adapter-result/1`:
 `{schema, got, total, seconds, intact, goodput, peak_bitrate, sn_med, connect_s}`.

@@ -87,6 +87,25 @@ integer -- record the change in the changelog below.
     convenience so cells can be quoted against ITU-convention instruments
     without the reader re-deriving the bandwidth correction ("" when snr3k
     is missing). Furman/App E use 3 kHz = the existing snr3k. Append = no bump.
+  results-schema/1 + progress_log/stall_s (2026-07-29): trailing columns appended --
+    the cell's byte-vs-time DELIVERY CURVE and its one summary statistic. Adapters
+    emit `PROGRESS t=<s> bytes=<n>` ticks when run with SKYW_PROGRESS_S set (off by
+    default, so every corpus collected before this reproduces byte-for-byte and both
+    columns are ""); sweep_runner parks the parsed curve in `<log basename>.progress
+    .csv` (t_s,bytes) and records its name in `progress_log`. Two things the row alone
+    could never answer:
+      * The transfer BUDGET stops being a COLLECTION parameter. read_progress() +
+        bytes_at() re-score a cell at any budget B up to its own window, so raising a
+        campaign's budget no longer breaks comparability with corpora collected at the
+        old one -- changing your mind about B costs a scorer re-run, not a re-run of
+        the campaign. (⚠ bytes_at answers DELIVERED BYTES, not intactness -- see its
+        docstring for which adapters let the two stand in for each other.)
+      * `stall_s` -- the longest span with no byte progress -- separates a STALLED
+        transfer from a slow one, which are indistinguishable in every other column.
+        A connect-then-no-decode row is flat for its whole window, so stall_s ~ wall_s;
+        read it against wall_s, since a healthy transfer still reports about one tick
+        interval. "" when the curve has fewer than two points.
+    Append = no bump per the policy above.
 """
 import csv
 import json
@@ -106,6 +125,7 @@ COLUMNS = [
     "atten_db",
     "connected", "time_to_connect",
     "fade_units", "snr2k7",
+    "progress_log", "stall_s",
 ]
 
 # Per-column caster for the READER side (read_corpus). Everything is stored as text in
@@ -123,6 +143,7 @@ COLUMN_TYPES = {
     # this column to bool would silently invert every False row. Callers compare .lower().
     "connected": str, "time_to_connect": float,
     "fade_units": float, "snr2k7": float,
+    "progress_log": str, "stall_s": float,
 }
 
 
@@ -182,3 +203,52 @@ def read_corpus(csv_path):
     with open(csv_path, newline="") as f:
         for row in csv.DictReader(f):
             yield cast_row(row)
+
+
+def progress_path(row, logdir):
+    """The delivery-curve sidecar for a corpus row, or None when it has none.
+
+    Resolved from the row's `progress_log` column rather than by deriving a name off
+    `log`: the mapping between the two is sweep_runner's, and a scorer re-deriving it
+    by string surgery is exactly the implicit contract this module exists to remove.
+    """
+    name = (row.get("progress_log") or "").strip()
+    return os.path.join(logdir, name) if name else None
+
+
+def read_progress(path):
+    """A cell's delivery curve as [(t_s, bytes), ...] from its `.progress.csv` sidecar.
+    Returns [] for a missing/empty file, so a corpus with ticks off reads as "no curve"
+    rather than raising."""
+    if not path or not os.path.exists(path):
+        return []
+    out = []
+    with open(path, newline="") as f:
+        for r in csv.DictReader(f):
+            try:
+                out.append((float(r["t_s"]), int(r["bytes"])))
+            except (KeyError, TypeError, ValueError):
+                continue
+    return out
+
+
+def bytes_at(curve, budget_s):
+    """Bytes delivered by `budget_s`: the last tick at or before it (0 before the first).
+
+    This is what makes the transfer budget a SCORER parameter instead of a collection
+    one -- a cell collected at a 600 s budget can be re-scored at any B within its own
+    window without re-running the campaign.
+
+    ⚠ It answers DELIVERED BYTES, not intactness. Adapters that deliver in ORDER
+    (armstrong/vara/mercury/ardop each append to one stream) let `bytes_at >= payload`
+    stand in for "would have completed by B". A selective-repeat or count-only adapter
+    (modem73, freedata) can hold the same byte count with holes in it, so an
+    intact-at-B claim for those needs the transfer to have COMPLETED by B -- i.e. the
+    curve reaching payload AND the row's own `intact`.
+    """
+    got = 0
+    for t, n in curve:
+        if t > budget_s:
+            break
+        got = n
+    return got

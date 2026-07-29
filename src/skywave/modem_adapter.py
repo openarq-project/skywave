@@ -62,6 +62,10 @@ class AdapterConfig:
     half_duplex: bool = False
     ptt: bool = False
     watterson: str = "off"
+    # Cadence (s) for the PROGRESS byte-vs-time ticks ModemAdapter.progress() emits.
+    # 0 = off (the pre-2026-07-29 behaviour: a transfer is silent between its "sent"
+    # line and its RESULT line). See ModemAdapter.progress for why this exists.
+    progress_s: float = 0.0
     env: dict = field(default_factory=dict)   # full env, for passthrough to channel_sim
 
     @classmethod
@@ -81,6 +85,7 @@ class AdapterConfig:
             half_duplex=g("SIM_HALF_DUPLEX", "0") == "1",
             ptt=g("SIM_PTT", "0") == "1",
             watterson=g("SIM_WATTERSON", "off"),
+            progress_s=float(g("SKYW_PROGRESS_S", "0") or "0"),
             env=e,
         )
 
@@ -142,6 +147,8 @@ class ModemAdapter(abc.ABC):
         self._stations = []          # station process handles the base SIGTERMs on teardown
         self.modes = []              # telemetry: observed bitrates (peak_bitrate = max)
         self.snrs = []               # telemetry: observed SN samples (sn_med = median)
+        self._prog_t0 = None         # transfer-start mark; None = progress() is a no-op
+        self._prog_next = float("inf")
 
     # ---------------- modem-specific hooks ----------------
     def preclean_patterns(self):
@@ -212,6 +219,39 @@ class ModemAdapter(abc.ABC):
         same goodput. Only differences of this value are used, never absolutes."""
         return time.time()
 
+    def progress(self, got: int):
+        """Emit a `PROGRESS t=<s> bytes=<n>` tick, at most one per cfg.progress_s.
+
+        Adapters call this from inside their transfer() pump; it is a no-op unless
+        SKYW_PROGRESS_S is set. Two things depend on the byte-vs-time curve these
+        ticks form, and neither is recoverable from a RESULT line alone:
+
+        1. The budget stops being a COLLECTION parameter. With a timeline, the
+           scorer answers "was this intact at budget B" for any B up to the run's
+           ceiling, after the fact -- so raising a cell's budget no longer breaks
+           comparability with corpora collected at the old one, and changing your
+           mind about B costs a scorer re-run instead of a campaign.
+        2. A stalled transfer becomes distinguishable from a slow one. Today both
+           look identical: a silent log and got=0. A flatlined curve is what a
+           no-progress early-out keys on, and what tells a 6 dB dead band (link up,
+           no bytes) from a decode floor.
+
+        Ticks are UNCONDITIONAL on cadence, never gated on the byte count changing:
+        a flatline is the signal, so silence must mean "process died", not "nothing
+        moved". Timed on bench_time() so a virtual-clock transport's ticks share the
+        signal-time axis its RESULT line is measured on.
+        """
+        if self._prog_t0 is None or self.cfg.progress_s <= 0:
+            return
+        now = self.bench_time()
+        if now < self._prog_next:
+            return
+        el = now - self._prog_t0
+        print(f"PROGRESS t={el:.1f}s bytes={got}", flush=True)
+        # Advance to the next slot BOUNDARY rather than now+interval, so a long
+        # blocking read does not emit a burst of catch-up ticks on return.
+        self._prog_next = self._prog_t0 + (int(el / self.cfg.progress_s) + 1) * self.cfg.progress_s
+
     def fail_connect(self, msg: str = ""):
         """Emit the token sweep_runner classifies as `fail_connect` (transient, one retry)."""
         print(f"NOCONN {msg}".strip(), flush=True)
@@ -244,8 +284,20 @@ class ModemAdapter(abc.ABC):
             payload = self.make_payload()
             t0 = time.time()
             b0 = self.bench_time()
+            # Arm the progress clock so the first in-loop call anchors the curve at
+            # t~0; disarm after, so a tick can never be attributed to the transfer
+            # window once the transfer has returned.
+            self._prog_t0 = b0
+            self._prog_next = b0
             recv = bytes(self.transfer(payload, t0 + cfg.timeout_s))
             dt = self.bench_time() - b0
+            # Terminal tick: pin the curve's final point at the true end of the
+            # transfer so the scorer never extrapolates between the last cadence
+            # tick and the RESULT line. Then disarm -- no tick may be attributed
+            # to the transfer window after transfer() has returned.
+            self._prog_next = -float("inf")
+            self.progress(len(recv))
+            self._prog_t0 = None
             wall_dt = time.time() - t0
             got = len(recv)
             intact = recv[:cfg.payload_bytes] == payload

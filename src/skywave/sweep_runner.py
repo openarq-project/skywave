@@ -27,6 +27,16 @@ Whichever route a fade arrives by, the row records the one channel_sim ACTUALLY 
 (fade_resolved): the `watterson` column names it and fade_delay_ms/fade_doppler_hz carry
 its numbers -- the cell's own fields state an intention that the sim may override.
 
+Export SKYW_PROGRESS_S=<seconds> to collect a byte-vs-time DELIVERY CURVE per cell:
+adapters then tick `PROGRESS t=<s> bytes=<n>` on that cadence, and each row gets a
+`<log basename>.progress.csv` sidecar (named in the `progress_log` column) plus
+`stall_s`. With a curve the transfer budget becomes a SCORER parameter -- a cell is
+re-scorable at any budget within its own window (results_schema.bytes_at) -- and a
+stalled transfer stops being indistinguishable from a slow one. It is campaign-wide,
+not per-cell: cell `env` is SIM_*-only by design, and a cadence that varied per cell
+would make stall_s incomparable across the corpus. OFF by default (unset = 0), so a
+run without it reproduces a pre-2026-07-29 corpus byte-for-byte.
+
 Usage: skywave-sweep <modem> <cells.json> <out.csv> [tag]
        skywave-sweep --calibrate-pep <modem> [target_dbfs] [payload] [timeout]
          (measure the modem's clean TX peak and write results/<modem>_txgain.txt so it
@@ -166,6 +176,12 @@ CONNECTED_RE = re.compile(r"<-\s*\w+:\s*CONNECTED\b")
 # that attempt's t0. Lets time_to_connect be read straight off the CONNECTED line itself
 # instead of needing a second wall-clock source.
 LINE_TS_RE = re.compile(r"^\[\+\s*([\d.]+)\]")   # the {elapsed:8.3f} field pads with spaces
+# Byte-vs-time delivery ticks (ModemAdapter.progress, enabled by SKYW_PROGRESS_S).
+# Deliberately unanchored: run_cell stamps every captured line with "[+  12.345] ", so a
+# ^-anchored pattern would match nothing here. The `t=` field is the adapter's OWN
+# bench_time axis -- the same axis its RESULT line is measured on -- not the wall-clock
+# stamp; on a virtual-clock transport the two differ by the speedup and must not be mixed.
+PROGRESS_RE = re.compile(r"\bPROGRESS t=([\d.]+)s bytes=(\d+)\b")
 
 
 def _cell_basename_declared(tag, modem, cell, rep):
@@ -329,6 +345,59 @@ def _num(s):
         return float(s)
     except (TypeError, ValueError):
         return s
+
+
+def parse_progress(txt):
+    """The [(t_s, bytes), ...] delivery curve from a cell's captured output.
+
+    Ticks come from ModemAdapter.progress() on a fixed cadence (SKYW_PROGRESS_S),
+    plus one terminal tick pinned at the true end of transfer. Where two ticks share
+    a timestamp the LATER line wins: the terminal tick can legitimately land on the
+    same t as the last cadence tick, and it is the more accurate of the two.
+
+    Empty when ticks are off (the default) or the adapter emitted none.
+    """
+    curve = {}
+    for t, n in PROGRESS_RE.findall(txt):
+        curve[float(t)] = int(n)          # later line at the same t overwrites
+    return sorted(curve.items())
+
+
+def stall_seconds(curve):
+    """Longest span of the curve over which the delivered byte count did not increase.
+
+    This is what separates a STALLED transfer from a merely slow one -- both can end
+    with the same got/goodput, and today both look identical in the corpus. A
+    connect-then-no-decode row (link up, zero bytes for the whole budget) is flat for
+    its entire window, so it reports ~wall_s here.
+
+    Read it against wall_s, not in isolation: a healthy transfer still reports about
+    one tick interval, since that is the resolution the curve was sampled at.
+    "" when the curve has fewer than two points to span.
+    """
+    if len(curve) < 2:
+        return ""
+    worst = 0.0
+    run_start, run_bytes = curve[0]
+    for t, n in curve[1:]:
+        # Measured BEFORE the reset: the span that ends at an increase is still a span
+        # during which nothing was delivered, and it is the one a stall-then-recover
+        # transfer is judged on.
+        worst = max(worst, t - run_start)
+        if n > run_bytes:
+            run_start, run_bytes = t, n
+    return round(worst, 1)
+
+
+def write_progress_curve(path, curve):
+    """Write a cell's delivery curve as a two-column CSV beside its log.
+    results_schema.read_progress() is the reader half."""
+    with open(path, "w", newline="") as f:
+        w = csv.writer(f)
+        w.writerow(["t_s", "bytes"])
+        for t, n in curve:
+            w.writerow([f"{t:.1f}", n])
+    return path
 
 
 def fade_resolved(env):
@@ -525,6 +594,15 @@ def run_cell(modem, cell, rep, writer, fcsv, tag):
             time_to_connect = float(mts.group(1)) if mts else ""
         else:
             connected, time_to_connect = False, ""
+    # Delivery curve, when the adapter was run with ticks on. Parked beside the cell's
+    # log rather than folded into the row: the row is one line per (cell, rep) and the
+    # curve is a series. The row carries the pointer + the one summary a scorer needs
+    # without opening it. Written from the LAST attempt's output, same as `log`.
+    curve = parse_progress(txt)
+    progress_log = ""
+    if curve:
+        progress_log = os.path.basename(
+            write_progress_curve(os.path.join(LOGDIR, base + ".progress.csv"), curve))
     stats = read_np_stats(npstats)
     act_rms = round(float(stats.get("act_rms", 0.0)), 1)
     gain = env.get("TXGAIN", "1.0")
@@ -559,7 +637,11 @@ def run_cell(modem, cell, rep, writer, fcsv, tag):
                           else ""),
            # ITU-R F.520-2 2.7 kHz noise-reference-bandwidth SNR (see
            # results_schema changelog): snr3k + 10*log10(3000/2700).
-           "snr2k7": (round(snr + 0.46, 1) if snr is not None else "")}
+           "snr2k7": (round(snr + 0.46, 1) if snr is not None else ""),
+           # Byte-vs-time delivery curve: the sidecar's basename ("" when ticks were
+           # off), and the longest no-progress span in it. See parse_progress/
+           # stall_seconds and the results_schema changelog.
+           "progress_log": progress_log, "stall_s": stall_seconds(curve)}
     writer.writerow(row); fcsv.flush()
     lbl = f" [{label}]" if label else ""
     print(f"[{modem}]{lbl} s={sigma}({row['snr3k']}dB) {watt} p={payload} r{rep}: "

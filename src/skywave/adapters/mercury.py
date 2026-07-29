@@ -104,6 +104,7 @@ class MercuryAdapter(ModemAdapter):
         self.bdat.sendall(payload)
         print(f"sent {len(payload)} B; reading A.data ...", flush=True)
         while len(recv) < len(payload) and time.time() < deadline:
+            self.progress(len(recv))
             r, _, _ = select.select([self.adat, self.a, self.b], [], [], 0.5)
             for s in r:
                 if s is self.adat:

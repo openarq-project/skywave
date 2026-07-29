@@ -13,6 +13,7 @@ from skywave.adapters.modem73 import (            # noqa: E402
     KissDecoder, kiss_encode, chunk_payload, make_data, make_poll,
     make_ack, parse_ack, parse_list_audio, Modem73Adapter,
 )
+from skywave.adapters import modem73 as m73       # noqa: E402
 from skywave.modem_adapter import AdapterConfig   # noqa: E402
 
 
@@ -185,6 +186,41 @@ def test_receiver_answers_probe_and_poll(monkeypatch):
     base, acked = a._last_ack
     unacked = {s for s in range(3) if s >= base and s not in acked}
     assert unacked == {1}
+
+
+def test_pump_ticks_the_delivery_curve(monkeypatch, capsys):
+    """_pump is modem73's ONLY wait point inside a transfer (transfer() waits only via
+    _await_reply, which pumps), so the progress tick has to live there -- and it has to
+    fire on a round that hears no ACK at all, since that flatline is the signal."""
+    a = Modem73Adapter(AdapterConfig.from_env(argv=["1024", "10"],
+                                              env={"SKYW_PROGRESS_S": "1"}))
+    monkeypatch.setattr(m73.select, "select", lambda *_a, **_k: ([], [], []))
+    clock = [0.0]
+    monkeypatch.setattr(a, "bench_time", lambda: clock[0])
+    a._prog_t0 = a._prog_next = 0.0        # armed, as ModemAdapter.run() does
+
+    a._rx_chunks = {0: b"x" * 100}
+    a._pump(0)
+    clock[0] = 1.0                          # a second round, nothing new decoded
+    a._pump(0)
+    clock[0] = 2.0
+    a._rx_chunks[1] = b"y" * 50
+    a._pump(0)
+
+    ticks = [ln for ln in capsys.readouterr().out.splitlines() if "PROGRESS" in ln]
+    assert ticks == ["PROGRESS t=0.0s bytes=100",
+                     "PROGRESS t=1.0s bytes=100",     # flatline still ticks
+                     "PROGRESS t=2.0s bytes=150"]
+
+
+def test_pump_is_silent_outside_a_transfer(monkeypatch, capsys):
+    """The connect probe pumps too; a tick there would land outside the window the
+    curve claims to cover."""
+    a = Modem73Adapter(AdapterConfig.from_env(argv=["1024", "10"],
+                                              env={"SKYW_PROGRESS_S": "1"}))
+    monkeypatch.setattr(m73.select, "select", lambda *_a, **_k: ([], [], []))
+    a._pump(0)                              # _prog_t0 is None: never armed
+    assert "PROGRESS" not in capsys.readouterr().out
 
 
 def test_preclean_patterns_do_not_match_own_cmdline():

@@ -45,6 +45,11 @@ class LoopbackAdapter(ModemAdapter):
         return True
 
     def transfer(self, payload, deadline):
+        # A real adapter's transfer is a pump loop; call self.progress(bytes_so_far) at
+        # the TOP of it -- every point the transfer can wait, not only where bytes
+        # arrive -- so the cell gets a byte-vs-time delivery curve under
+        # SKYW_PROGRESS_S (see MODEM-ADAPTER-CONTRACT.md §4). This fake delivers in one
+        # step and never waits, so the base class's terminal tick is the whole curve.
         # Fake channel: clean link delivers the payload byte-exact; an absurd noise level
         # (SIGMA) drops half the bytes so the partial/fail path is exercised in tests.
         self.scan_telemetry("B", "BITRATE (7) 600 BPS")

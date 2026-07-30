@@ -71,6 +71,17 @@ FIELDS = [
     # modes against a PEP-limited transmitter. Without papr_db on the row that
     # correction is unavailable and the campaign has to be re-run to get it.
     "rms_dbfs", "peak_dbfs", "papr_db",
+    # production | bench. Load-bearing: vector_report keeps non-production rows
+    # off the primary frontier, so an ablation cannot outrank a shipping mode.
+    "mode_class",
+    # Drive-knob arm. Empty = the mode's built-in default. When set, `label`
+    # carries it too (LABEL@clip=<g>) so the arm is a distinct series everywhere
+    # -- resume dedup, frontier, floor table -- and `label_base` keeps the mode.
+    "clip_gain", "label_base",
+    # Amplitude normalization the adapter declared in the sidecar. A corpus that
+    # silently mixed normalizations would be uncomparable and nothing else would
+    # show it.
+    "norm",
     # Width of the payload check that adjudicates this mode. Drives the
     # false_decode gate; empty means the adapter did not report one and the gate
     # falls back to zero tolerance for that mode.
@@ -200,8 +211,9 @@ def do_mode(adapter, mode, presets, snrs, args, done, writer, wlock, stats):
     try:
         for bi, nframes in enumerate(batch_list):
             seed = args.seed + bi * 7919
-            vec_path, side_path = adapter.encode(label, nframes, seed, scratch,
-                                                 gap_ms=args.gap_ms)
+            vec_path, side_path = adapter.encode(
+                mode.get("label_base", label), nframes, seed, scratch,
+                gap_ms=args.gap_ms, env=mode.get("_env"))
             side = load_sidecar(side_path)
             vec = read_vector(vec_path)
             validate_sidecar(side, vector_len=vec.size)
@@ -280,6 +292,10 @@ def do_mode(adapter, mode, presets, snrs, args, done, writer, wlock, stats):
             "crc_errors": a["crc_errors"],
             "mean_snr_db": f"{a['snr_sum'] / a['n']:.2f}" if a["n"] else "",
             "mean_ber": f"{a['ber_sum'] / a['n']:.5f}" if a["n"] else "",
+            "mode_class": mode.get("mode_class", "production"),
+            "clip_gain": mode.get("clip_gain", ""),
+            "label_base": mode.get("label_base", label),
+            "norm": side.get("norm", "") if isinstance(side, dict) else "",
             "rms_dbfs": mode.get("rms_dbfs", ""),
             "peak_dbfs": mode.get("peak_dbfs", ""),
             "papr_db": mode.get("papr_db", ""),
@@ -323,6 +339,14 @@ def main(argv=None):
     ap.add_argument("--jobs", type=int, default=max(1, (os.cpu_count() or 4) - 2))
     ap.add_argument("--batch-seconds", type=float, default=300.0)
     ap.add_argument("--scratch", default="out")
+    ap.add_argument("--clip-env", default="",
+                    help="name of the adapter's drive-knob env var, e.g. "
+                         "ARM_QAM64W_CLIPGAIN. Requires --clip-gains.")
+    ap.add_argument("--clip-gains", default="",
+                    help="comma-separated values for --clip-env. Each becomes a "
+                         "separate arm labelled LABEL@clip=<v>. Include the "
+                         "mode's DEFAULT as a control by also sweeping without "
+                         "this flag, or by naming the built-in value.")
     ap.add_argument("--cold", action="store_true")
     ap.add_argument("--limit", type=int, default=0)
     ap.add_argument("--allow-long", action="store_true")
@@ -343,6 +367,44 @@ def main(argv=None):
     if a.limit and a.limit < len(modes):
         dropped = len(modes) - a.limit
         modes = modes[:a.limit]
+
+    # Drive-knob arms. Each value becomes its own series with its own label, so
+    # every downstream consumer (resume dedup, frontier, floor table) treats the
+    # arms as distinct modes without needing to know what a clip gain is.
+    gains = [g.strip() for g in a.clip_gains.split(",") if g.strip()]
+    if gains and not a.clip_env:
+        log("vector_sweep: --clip-gains needs --clip-env")
+        return 2
+    if a.clip_env and not gains:
+        log("vector_sweep: --clip-env needs --clip-gains")
+        return 2
+    if gains:
+        armed = []
+        for g in gains:
+            # Re-measure under the arm: a drive knob CHANGES the waveform, and
+            # papr_db is exactly what the equal-PEP derivation keys on, so
+            # carrying the default mode's crest into a clipped arm would corrupt
+            # it. The driver measures, so both arms use one convention.
+            try:
+                relevel = {m["label"]: m
+                           for m in adapter.list_modes(env={a.clip_env: g})}
+            except TypeError:
+                relevel = {}
+                log(f"vector_sweep: WARNING {a.adapter} cannot re-measure levels "
+                    f"per arm; papr_db/rms_dbfs will describe the DEFAULT drive, "
+                    f"not clip={g}. Do not derive equal-PEP floors from it.")
+            for m in modes:
+                arm = dict(m)
+                arm.update({k: v for k, v in relevel.get(m["label"], {}).items()
+                            if k in ("rms_dbfs", "peak_dbfs", "papr_db")})
+                arm["label_base"] = m["label"]
+                arm["label"] = f"{m['label']}@clip={g}"
+                arm["clip_gain"] = g
+                arm["_env"] = {a.clip_env: g}
+                armed.append(arm)
+        log(f"vector_sweep: clip axis {a.clip_env} = {gains} -> "
+            f"{len(modes)} mode(s) x {len(gains)} arm(s) = {len(armed)} series")
+        modes = armed
 
     presets = [p.strip() for p in a.presets.split(",") if p.strip()]
     snrs = frange(a.snr_lo, a.snr_hi, a.snr_step)

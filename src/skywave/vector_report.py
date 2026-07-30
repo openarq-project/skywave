@@ -146,6 +146,16 @@ def main(argv=None):
     ap = argparse.ArgumentParser(description=__doc__.split("\n")[0])
     ap.add_argument("--sweep", required=True)
     ap.add_argument("--expect-cells", type=int, default=0)
+    ap.add_argument("--frontier-exclude-class", default="bench",
+                    help="comma-separated mode_class values kept OFF the primary "
+                         "frontier (default: bench). They are still scored and "
+                         "reported, just in a separate arm -- an ablation that "
+                         "outranks a shipping mode must not be quotable as one.")
+    ap.add_argument("--frontier-exclude-family", default="",
+                    help="comma-separated families kept off the primary frontier, "
+                         "for classes the instrument cannot rank fairly (e.g. "
+                         "'plh', whose preamble airtime is charged with no credit "
+                         "for the acquisition it buys).")
     ap.add_argument("--watch", default="",
                     help="comma-separated substrings naming candidate groups "
                          "whose FADING-frontier membership is pre-registered "
@@ -336,7 +346,34 @@ def main(argv=None):
     for r in rows:
         key = f"{r['adapter']}:{r['label']}" if multi else r["label"]
         meta[key] = (r.get("adapter", ""), r.get("family", ""))
-    def hull_of(p, max_fer):
+    excl_class = {c.strip() for c in a.frontier_exclude_class.split(",") if c.strip()}
+    excl_fam = {f.strip().lower() for f in a.frontier_exclude_family.split(",") if f.strip()}
+    row_class, row_fam = {}, {}
+    for r in rows:
+        k = f"{r['adapter']}:{r['label']}" if multi else r["label"]
+        row_class[k] = (r.get("mode_class") or "production").strip()
+        row_fam[k] = (r.get("family") or "").strip().lower()
+
+    def eligible(key):
+        return (row_class.get(key, "production") not in excl_class
+                and row_fam.get(key, "") not in excl_fam)
+
+    held = sorted(k for k in keys if not eligible(k))
+    if held:
+        by = Counter(f"{row_class.get(k,'?')}/{row_fam.get(k,'?')}" for k in held)
+        print(f"  frontier eligibility: {len(held)} of {len(keys)} series HELD OFF "
+              f"the primary frontier  {dict(by)}")
+        print(f"    excluded class={sorted(excl_class) or 'none'} "
+              f"family={sorted(excl_fam) or 'none'}")
+        print(f"    held: {', '.join(held[:8])}"
+              + (f" (+{len(held)-8} more)" if len(held) > 8 else ""))
+        print("    they are still scored; they are reported as a separate arm and "
+              "in section E.")
+    else:
+        print("  frontier eligibility: all series eligible")
+    print()
+
+    def hull_of(p, max_fer, only_eligible=True):
         """max_fer=TARGET is the USABILITY BAR; None reproduces the raw
         goodput-max frontier. Goodput is rate*(1-FER), so a high-rate mode
         limping at FER 0.4 books ~60% of a large number and would top a raw
@@ -347,6 +384,8 @@ def main(argv=None):
         per_snr = defaultdict(list)
         for (key, pp), pts in cs.items():
             if pp != p:
+                continue
+            if only_eligible and not eligible(key):
                 continue
             for snr, fer, gp in pts:
                 if max_fer is not None and fer > max_fer + EPS:
@@ -415,6 +454,12 @@ def main(argv=None):
             print(f"            !! {len(contra)} member(s) on the frontier with "
                   f"best FER above the bar -- scorer inconsistency, investigate: "
                   f"{', '.join(contra)}")
+        if held:
+            h_order, _ = hull_of(p, TARGET, only_eligible=False)
+            gained = [k for k in h_order if not eligible(k)]
+            if gained:
+                print(f"            held-off arm: {len(gained)} excluded series "
+                      f"would have made this frontier: {', '.join(gained[:5])}")
         unusable = sum(1 for _, (_, _, f) in raw_wins.items() if f > TARGET + EPS)
         print(f"            raw (ideal-retransmission) frontier "
               f"{len(raw_order):3d}, top: "

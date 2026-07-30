@@ -15,7 +15,8 @@ FIELDS = [
     "adapter", "label", "family", "preset", "snr_db", "bw_hz", "sample_rate",
     "frames", "decoded", "fer", "goodput_bps", "payload_bytes", "air_s",
     "nominal_bps", "false_decode", "wrong_frame", "crc_errors", "crc_bits",
-    "extra_json", "host", "arch", "driver_id",
+    "extra_json", "host", "arch", "driver_id", "mode_class", "clip_gain",
+    "label_base",
 ]
 
 
@@ -38,6 +39,7 @@ def cell(label="M", preset="off", snr=0.0, frames=150, decoded=150, **kw):
         goodput_bps=f"{100 * (1 - fer):.2f}", payload_bytes=100, air_s="1.0000",
         nominal_bps="800.00", false_decode=0, wrong_frame=0, crc_errors=0,
         crc_bits=16, host="h", arch="x86_64", driver_id="deadbeefcafe",
+        mode_class=kw.pop("mode_class", "production"),
     )
     base.update(kw)
     return base
@@ -238,3 +240,50 @@ def test_mixed_reference_bandwidth_invalidates(tmp_path, capsys):
     rc = run(tmp_path, rows)
     assert rc == 1
     assert "different reference" in capsys.readouterr().out
+
+
+# --------------------------------------------------- frontier eligibility
+
+def test_bench_ablation_is_held_off_the_production_frontier(tmp_path, capsys):
+    """Decision 2: one corpus, but the label must be load-bearing. A -NOCLIP
+    ablation that outranks a shipping mode must not be quotable as the winner."""
+    prod = curve("QAM16C2", "off", [0.05, 0.01, 0.01])
+    for r in prod:
+        r["goodput_bps"] = "100.00"
+    abl = curve("QAM16C2-NOCLIP", "off", [0.05, 0.01, 0.01], mode_class="bench")
+    for r in abl:
+        r["goodput_bps"] = "900.00"
+    rc = run(tmp_path, prod + abl)
+    out = capsys.readouterr().out
+    top = [l for l in out.splitlines() if "top:" in l][0]
+    assert "QAM16C2-NOCLIP" not in top and "QAM16C2" in top
+    assert "HELD OFF" in out
+    assert "would have made this frontier" in out   # still reported, not hidden
+    assert rc == 0
+
+
+def test_family_exclusion_keeps_plh_off_the_frontier(tmp_path, capsys):
+    """Decision 4: PLH is goodput-dominated by construction here, so it is
+    excluded from the primary frontier rather than annotated."""
+    base = curve("QAM64C", "off", [0.05, 0.01, 0.01], family="qam")
+    for r in base:
+        r["goodput_bps"] = "100.00"
+    plh = curve("PLH-QAM64C", "off", [0.05, 0.01, 0.01], family="plh")
+    for r in plh:
+        r["goodput_bps"] = "900.00"
+    rc = run(tmp_path, base + plh, "--frontier-exclude-family", "plh")
+    out = capsys.readouterr().out
+    top = [l for l in out.splitlines() if "top:" in l][0]
+    assert "PLH-QAM64C" not in top
+    assert rc == 0
+
+
+def test_eligibility_defaults_to_everything_when_unlabelled(tmp_path, capsys):
+    """A corpus predating mode_class must not silently lose its frontier."""
+    rows = curve("M", "off", [0.5, 0.05, 0.01])
+    for r in rows:
+        r["mode_class"] = ""
+    rc = run(tmp_path, rows)
+    out = capsys.readouterr().out
+    assert "all series eligible" in out
+    assert rc == 0

@@ -38,7 +38,13 @@ DEFAULT_SRC = os.path.expanduser("~/tools/armstrong")
 class ArmstrongVectorAdapter(VectorAdapter):
     name = "armstrong"
 
-    def __init__(self, src=None, binary=None):
+    def __init__(self, src=None, binary=None, bench=None):
+        # Bench ablations (0xBExx: -NOCLIP, -NS3, -P08) are OFF by default: they
+        # must never wander into a production sweep by accident. Opt in with
+        # ARMSTRONG_VECTOR_BENCH=1, and note the binary also has to be built
+        # `--features bench-modes` or the driver refuses with an explicit message.
+        self.bench = (bench if bench is not None
+                      else bool(os.environ.get("ARMSTRONG_VECTOR_BENCH")))
         self.src = src or os.environ.get("ARMSTRONG_SRC") or DEFAULT_SRC
         self.binary = binary or os.environ.get("ARMSTRONG_VECTOR") or ""
         if not self.binary:
@@ -52,9 +58,16 @@ class ArmstrongVectorAdapter(VectorAdapter):
                 f"in {self.src}, or set ARMSTRONG_VECTOR to a prebuilt copy.")
         self._modes = None
 
-    def _run(self, args):
+    def _run(self, args, env=None):
+        """`env` overlays the child environment. Modes expose bench drive knobs
+        that way (e.g. ARM_QAM64W_CLIPGAIN), so a clip arm is a different child
+        environment rather than a different binary or mode id."""
+        child = None
+        if env:
+            child = dict(os.environ)
+            child.update({k: str(v) for k, v in env.items()})
         p = subprocess.run([self.binary] + args, capture_output=True, text=True,
-                           cwd=self.src)
+                           cwd=self.src, env=child)
         if p.returncode != 0:
             raise VectorContractError(
                 f"armstrong vector {' '.join(args[:2])} failed "
@@ -74,10 +87,19 @@ class ArmstrongVectorAdapter(VectorAdapter):
 
     # ---- contract --------------------------------------------------------
 
-    def list_modes(self):
-        if self._modes is not None:
+    def list_modes(self, env=None):
+        """`env` re-measures under a drive-knob arm (e.g. ARM_QAM64W_CLIPGAIN).
+
+        The DRIVER does the measuring in both cases, deliberately. Recomputing
+        levels on this side produced a 1.1 dB disagreement: `list` reports RMS
+        over the mode's nominal air_s window, while the modulated audio is
+        shorter than that, so two defensible conventions gave two different
+        numbers for the same waveform. One convention per corpus.
+        """
+        if env is None and self._modes is not None:
             return self._modes
-        rows = list(csv.DictReader(io.StringIO(self._run(["list"]))))
+        argv = ["list", "--bench"] if self.bench else ["list"]
+        rows = list(csv.DictReader(io.StringIO(self._run(argv, env=env))))
         out = []
         for r in rows:
             out.append({
@@ -88,6 +110,10 @@ class ArmstrongVectorAdapter(VectorAdapter):
                 # frontier census is per-family, so collapsing armstrong's four
                 # classes into one label would delete that analysis outright.
                 "family": r["family"],
+                # production | bench. The scorer keeps bench ablations off the
+                # production frontier, so an ablation cannot outrank a shipping
+                # mode and then be quoted as one.
+                "mode_class": r.get("mode_class", "production"),
                 # Every mode in armstrong's registry is codec2-backed and its
                 # payload is adjudicated by the codec2 raw-data CRC-16/CCITT
                 # (`CODEC2_FCS`, phy/src/mode_registry.rs), with
@@ -114,17 +140,19 @@ class ArmstrongVectorAdapter(VectorAdapter):
                 "code_rate": r["code_rate"],
                 "modulation": r["modulation"],
             })
-        self._modes = out
+        if env is None:
+            self._modes = out
         return out
 
     def encode(self, label, frames, seed, outdir, gap_ms=300, flush_ms=1500,
-               **kw):
+               env=None, **kw):
         os.makedirs(outdir, exist_ok=True)
         vec = os.path.abspath(os.path.join(outdir, "clean.f32"))
         side = os.path.abspath(os.path.join(outdir, "clean.json"))
         self._run(["tx", "--mode", label, "-o", vec, "--sidecar", side,
                    "--frames", str(frames), "--seed", str(seed),
-                   "--gap-ms", str(gap_ms), "--flush-ms", str(flush_ms)])
+                   "--gap-ms", str(gap_ms), "--flush-ms", str(flush_ms)],
+                  env=env)
         return vec, side
 
     def decode(self, vector_path, sidecar_path, cold=False):

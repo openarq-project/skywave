@@ -13,3 +13,5 @@ results/
 *.log
 # extraction working doc (references the private source repo — not for publication)
 EXTRACTION-AUDIT.md
+# Claude Code local agent context (auto-generated memory mirror — machine-local)
+.claude/

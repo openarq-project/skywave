@@ -9,7 +9,11 @@ deciding what numbers mean.
   B  INVALIDATION   instrument failures that void the run
   C  FRONTIER       Pareto membership per channel + family/adapter census
   D  QUESTIONS      floor movement AWGN->fading, and any --watch family census
-  E  FLOOR TABLE    floor_db per frontier mode per channel
+  E  FLOOR TABLE    floor_db per frontier mode per channel, under the measured
+                    equal-average-power lens AND the derived equal-PEP lens
+  F  PAIRED SERIES  (--pairs) pre-registered pairs on FER-at-matched-SNR and
+                    floor deltas; config-identical pairs carry a Wilson tie
+                    gate -- a gap there is an instrument fault, not a result
 
 Exit code: 0 = clean, 1 = an INVALIDATION gate tripped (escalate, do not
 interpret the science), 2 = incomplete (still running, or cells missing).
@@ -67,6 +71,27 @@ def median(xs):
     s = sorted(xs)
     n = len(s)
     return s[n // 2] if n % 2 else 0.5 * (s[n // 2 - 1] + s[n // 2])
+
+
+def wilson(k, n, z=1.96):
+    """95% Wilson score interval for a proportion k/n. Chosen over normal
+    approximation because tie-gate comparisons live exactly where p is near 0
+    or 1, which is where the normal interval is wrong."""
+    if n <= 0:
+        return 0.0, 1.0
+    p = k / n
+    d = 1.0 + z * z / n
+    c = (p + z * z / (2 * n)) / d
+    h = z * math.sqrt(p * (1.0 - p) / n + z * z / (4.0 * n * n)) / d
+    return max(0.0, c - h), min(1.0, c + h)
+
+
+def disjoint(a, b):
+    """True when two intervals do not overlap -- the conservative 'gap beyond
+    the Wilson interval' test: it under-calls real differences rather than
+    over-calling chance ones, which is the right polarity for a gate whose
+    trip means 'the instrument is broken'."""
+    return a[0] > b[1] + EPS or b[0] > a[1] + EPS
 
 
 def load_or_exit2(path):
@@ -161,6 +186,23 @@ def main(argv=None):
                          "whose FADING-frontier membership is pre-registered "
                          "(e.g. 'rdm,x2'). A zero census is a REPORTABLE "
                          "NEGATIVE, not a missing result.")
+    ap.add_argument("--pep-ref", default="",
+                    help="series label used as the PAPR reference for the "
+                         "derived equal-PEP floor lens (floor + papr - "
+                         "papr_ref). The reference is a pure additive offset "
+                         "and cannot change any ordering; default is the "
+                         "lowest-PAPR frontier-eligible series, stated in the "
+                         "output.")
+    ap.add_argument("--pairs", default="",
+                    help="JSON file naming pre-registered series pairs: "
+                         '[{"a": LABEL, "b": LABEL, "config_identical": bool, '
+                         '"note": str}]. Pair membership and config identity '
+                         "are MODEM knowledge -- the campaign supplies them; "
+                         "this report only scores them. config_identical "
+                         "pairs carry a tie gate: their payload waveforms are "
+                         "the same bytes, so any per-SNR FER gap beyond the "
+                         "Wilson interval is an instrument fault, not a mode "
+                         "property.")
     a = ap.parse_args(argv)
 
     rows = load_or_exit2(a.sweep)
@@ -327,6 +369,34 @@ def main(argv=None):
               "rate at the knee. A --cold re-run of those modes is the check.")
 
     cs = curves(rows, multi)
+    # Per-series level/airtime metadata and per-point counts, for the equal-PEP
+    # lens and the paired section. papr_db is measured BY THE DRIVER per row
+    # (recomputing it host-side was tried and abandoned: two defensible RMS
+    # windows disagreed by 1.1 dB on the same waveform); it should be constant
+    # within a series, so the median is a formality.
+    ser_papr, ser_air, ser_fails = {}, {}, defaultdict(dict)
+    _papr_acc = defaultdict(list)
+    for r in rows:
+        key = f"{r['adapter']}:{r['label']}" if multi else r["label"]
+        p = r.get("papr_db", "")
+        if p not in ("", None):
+            try:
+                _papr_acc[key].append(float(p))
+            except ValueError:
+                pass
+        if key not in ser_air:
+            try:
+                ser_air[key] = float(r.get("air_s") or 0.0) or None
+            except ValueError:
+                ser_air[key] = None
+        n = inum(r, "frames")
+        dec = inum(r, "decoded", -1)
+        if dec < 0:  # older corpora: recover the count from fer
+            dec = round((1.0 - fnum(r, "fer")) * n)
+        ser_fails[(key, r["preset"])][round(fnum(r, "snr_db"), 3)] = (n - dec, n)
+    for k, v in _papr_acc.items():
+        ser_papr[k] = median(v)
+
     trunc = sum(1 for pts in cs.values() if floor_of(pts)[1] == "truncated_high")
     print(f"  truncated_high     {trunc} curve(s) of {len(cs)}")
     if trunc > 0.5 * len(cs):
@@ -573,6 +643,89 @@ def main(argv=None):
             line += f"{f:>11.1f}" if f is not None else f"{st[:10]:>11}"
         print(line)
 
+    # ---- E2: the same floors under the DERIVED equal-PEP lens.
+    #
+    # The sweep normalizes to equal AVERAGE power (sigma from the vector's own
+    # signal power), which structurally favours high-PAPR modes against a
+    # PEP-limited transmitter. The equal-PEP floor is derived, not re-measured:
+    #   floor_equalPEP = floor_equalAvgPower + (papr_mode - papr_ref)
+    # The reference is a pure additive offset shared by every entry, so it can
+    # never change an ordering -- but the PER-MODE papr term can, and the pairs
+    # whose order flips between the lenses are exactly the ones that have
+    # earned a MEASURED clip arm rather than a derivation.
+    #
+    # Load-bearing caveat, stated where the numbers are: the +PAPR term assumes
+    # a linear PA at full backoff. Prior measured work found the real-PA error
+    # is neither small nor single-signed (clip distortion x multipath breaks
+    # equalisers -- low PAPR is double-edged under fading), so this lens ranks
+    # candidates; it does not settle them.
+    print()
+    if not ser_papr:
+        print("  equal-PEP lens: SKIPPED -- no papr_db in this corpus (predates "
+              "the column). The primary table above is equal-average-power only.")
+    else:
+        ref = ""
+        if a.pep_ref:
+            hits = [k for k in keys
+                    if k == a.pep_ref or k.split(":", 1)[-1] == a.pep_ref]
+            if len(hits) == 1 and hits[0] in ser_papr:
+                ref = hits[0]
+            else:
+                print(f"  equal-PEP lens: --pep-ref '{a.pep_ref}' "
+                      f"{'is ambiguous' if len(hits) > 1 else 'not in corpus or has no papr_db'};"
+                      " falling back to auto.")
+        if not ref:
+            cands = [k for k in union if k in ser_papr and eligible(k)] \
+                or [k for k in ser_papr]
+            ref = min(cands, key=lambda k: (ser_papr[k], k))
+        print(f"  EQUAL-PEP floor table (derived: floor + papr - papr_ref; "
+              f"ref {ref} @ {ser_papr[ref]:.2f} dB PAPR)")
+        # Frontier modes first (in frontier order), then every other ELIGIBLE
+        # series: this lens exists for ladder ORDER, and a ladder candidate
+        # need not have won a frontier cell.
+        pep_rows = union + sorted(k for k in keys
+                                  if eligible(k) and k not in union)
+        print(f"  {'mode':<28}{'papr':>7}" + "".join(f"{p:>11}" for p in pres))
+        for key in pep_rows:
+            pk = ser_papr.get(key)
+            line = (f"  {key:<28}"
+                    + (f"{pk:>7.2f}" if pk is not None else f"{'?':>7}"))
+            for p in pres:
+                f, st = floor_of(cs.get((key, p), []))
+                if f is not None and pk is not None:
+                    line += f"{f + pk - ser_papr[ref]:>11.1f}"
+                elif f is not None:
+                    line += f"{'no_papr':>11}"
+                else:
+                    line += f"{st[:10]:>11}"
+            print(line)
+        flips = []
+        for p in pres:
+            # All ELIGIBLE series, not just the frontier union: the escalation
+            # rule cares about ladder-candidate order, and a mode can be a
+            # ladder candidate without winning a frontier cell.
+            ranked = [(k, floor_of(cs.get((k, p), []))[0]) for k in keys
+                      if eligible(k) and k in ser_papr
+                      and floor_of(cs.get((k, p), []))[1] == "ok"]
+            for i in range(len(ranked)):
+                for j in range(i + 1, len(ranked)):
+                    (ka, fa), (kb, fb) = ranked[i], ranked[j]
+                    da = fa - fb
+                    dp = da + ser_papr[ka] - ser_papr[kb]
+                    if da * dp < 0 and abs(da) > 0.01 and abs(dp) > 0.01:
+                        flips.append((p, ka, kb, da, dp))
+        if flips:
+            print(f"  LENS DISAGREEMENTS ({len(flips)} pair(s) whose floor "
+                  f"order FLIPS between the lenses -- per the pre-registered "
+                  f"escalation rule, ladder-adjacent ones earn a measured "
+                  f"clip-on/clip-off arm):")
+            for p, ka, kb, da, dp in flips:
+                print(f"    {p:9s} {ka} vs {kb}: equal-avg-power "
+                      f"{da:+.1f} dB, equal-PEP {dp:+.1f} dB")
+        else:
+            print("  lens agreement: no floor-order flips between "
+                  "equal-average-power and equal-PEP.")
+
     # Monotonicity. floor_db takes the FIRST crossing (optimistic); the LAST is
     # conservative. They differ only when a curve re-crosses the target, in which
     # case a single number silently picked a side. Report the gap so the caveat is
@@ -597,6 +750,103 @@ def main(argv=None):
               f"{worst[0]:+.2f} dB ({worst[1][0]} on {worst[1][1]}). Quote the "
               f"conservative crossing for them.")
 
+    # -------------------------------------------------- F PAIRED SERIES
+    tie_caveats = []
+    if a.pairs:
+        print()
+        print("=" * 72)
+        print("F. PAIRED SERIES (pre-registered pairs)")
+        print("=" * 72)
+        print("  Pairs compare on FER-at-matched-SNR and floor dB under BOTH "
+              "lenses -- NEVER on goodput or frontier membership: when a "
+              "variant carries acquisition airtime the instrument charges but "
+              "does not credit, a goodput read reports the framing, not the "
+              "mode.")
+        try:
+            with open(a.pairs) as f:
+                pair_spec = json.load(f)
+        except (OSError, json.JSONDecodeError) as e:
+            print(f"  cannot read pairs file {a.pairs}: {e}")
+            print("  -> INCOMPLETE: the paired section was pre-registered but "
+                  "cannot be scored.")
+            incomplete.append("pairs file unreadable")
+            pair_spec = []
+
+        def resolve(name):
+            hits = [k for k in keys
+                    if k == name or k.split(":", 1)[-1] == name]
+            return hits[0] if len(hits) == 1 else None
+
+        for spec in pair_spec:
+            ka, kb = resolve(spec.get("a", "")), resolve(spec.get("b", ""))
+            ident = bool(spec.get("config_identical"))
+            tag = ("[CONFIG-IDENTICAL -- payload waveform is the same bytes; "
+                   "pre-registered expectation: TIE within CI]" if ident
+                   else "[different configs -- a real A/B]")
+            print()
+            print(f"  pair: {spec.get('a','?')} vs {spec.get('b','?')}  {tag}")
+            if spec.get("note"):
+                print(f"    note: {spec['note']}")
+            if ka is None or kb is None:
+                missing = [n for n, k in ((spec.get('a'), ka),
+                                          (spec.get('b'), kb)) if k is None]
+                print(f"    -> NOT IN CORPUS (or ambiguous): {missing}. "
+                      "Scored nothing; say so rather than dropping the pair "
+                      "silently.")
+                continue
+            aa, ab = ser_air.get(ka), ser_air.get(kb)
+            if aa and ab:
+                print(f"    airtime  {aa:.3f} vs {ab:.3f} s  "
+                      f"({(aa / ab - 1) * 100:+.1f}% -- charged, uncredited)")
+            pa, pb = ser_papr.get(ka), ser_papr.get(kb)
+            if pa is not None and pb is not None:
+                print(f"    papr     {pa:.2f} vs {pb:.2f} dB  (delta {pa - pb:+.2f})")
+            print(f"    {'preset':<10}{'floor A':>9}{'floor B':>9}"
+                  f"{'d(avgpwr)':>11}{'d(PEP)':>9}{'worst dFER@SNR':>17}"
+                  f"{'CI-disjoint':>13}")
+            pair_disjoint = 0
+            for p in pres:
+                fa, sta = floor_of(cs.get((ka, p), []))
+                fb, stb = floor_of(cs.get((kb, p), []))
+                fx = ser_fails.get((ka, p), {})
+                fy = ser_fails.get((kb, p), {})
+                common = sorted(set(fx) & set(fy))
+                worst, ndis = (0.0, None), 0
+                for s in common:
+                    kfa, na = fx[s]
+                    kfb, nb = fy[s]
+                    d = kfa / na - kfb / nb if na and nb else 0.0
+                    if abs(d) > abs(worst[0]):
+                        worst = (d, s)
+                    if disjoint(wilson(kfa, na), wilson(kfb, nb)):
+                        ndis += 1
+                pair_disjoint += ndis
+                cf = (f"{fa:>9.2f}" if fa is not None else f"{sta[:8]:>9}")
+                cg = (f"{fb:>9.2f}" if fb is not None else f"{stb[:8]:>9}")
+                dv = (f"{fa - fb:>+11.2f}" if fa is not None and fb is not None
+                      else f"{'--':>11}")
+                dp = (f"{fa - fb + pa - pb:>+9.2f}"
+                      if None not in (fa, fb, pa, pb) else f"{'--':>9}")
+                w = (f"{worst[0]:+.3f} @ {worst[1]:+.1f}" if worst[1] is not None
+                     else "--")
+                print(f"    {p:<10}{cf}{cg}{dv}{dp}{w:>17}"
+                      f"{ndis:>7}/{len(common):<5}")
+            if ident:
+                if pair_disjoint == 0:
+                    print("    TIE GATE: PASS -- no SNR point separates the "
+                          "pair beyond the 95% Wilson interval.")
+                else:
+                    print(f"    TIE GATE: FAILED -- {pair_disjoint} SNR "
+                          f"point(s) separate a byte-identical payload "
+                          f"waveform beyond the 95% Wilson interval. That is "
+                          f"an INSTRUMENT fault (the head charged to the "
+                          f"payload, or sidecar/framing misalignment), not a "
+                          f"mode property. Investigate before interpreting "
+                          f"ANY result in this section.")
+                    tie_caveats.append(
+                        f"{spec.get('a')} vs {spec.get('b')} "
+                        f"({pair_disjoint} pt(s))")
+
     print()
     print("=" * 72)
     if fail:
@@ -606,6 +856,11 @@ def main(argv=None):
     if incomplete:
         print("VERDICT: INCOMPLETE ->", "; ".join(incomplete))
         return 2
+    if tie_caveats:
+        print("CAVEAT (not invalidating, per the pre-registered gate list): "
+              "config-identical tie gate FAILED for", "; ".join(tie_caveats))
+        print("The paired section is not interpretable until the instrument "
+              "fault is resolved. Other sections stand.")
     print("VERDICT: CLEAN -- all gates passed. Report C, D and E.")
     return 0
 

@@ -16,7 +16,7 @@ FIELDS = [
     "frames", "decoded", "fer", "goodput_bps", "payload_bytes", "air_s",
     "nominal_bps", "false_decode", "wrong_frame", "crc_errors", "crc_bits",
     "extra_json", "host", "arch", "driver_id", "mode_class", "clip_gain",
-    "label_base",
+    "label_base", "papr_db",
 ]
 
 
@@ -287,3 +287,135 @@ def test_eligibility_defaults_to_everything_when_unlabelled(tmp_path, capsys):
     out = capsys.readouterr().out
     assert "all series eligible" in out
     assert rc == 0
+
+
+# ------------------------------------------------- equal-PEP lens (Decision 1)
+
+def test_equal_pep_table_shifts_by_papr_delta(tmp_path, capsys):
+    """floor_equalPEP = floor + papr - papr_ref. LO (papr 6) floors at 2 dB, HI
+    (papr 10) at ~3.78 dB; with LO as the auto reference (lowest PAPR), HI's
+    equal-PEP floor must read 3.78 + (10-6) = 7.8."""
+    rows = curve("LO", "off", [0.5, 0.05, 0.01, 0.0], papr_db="6.00")
+    rows += curve("HI", "off", [0.5, 0.5, 0.05, 0.01], papr_db="10.00")
+    rc = run(tmp_path, rows)
+    out = capsys.readouterr().out
+    assert "EQUAL-PEP floor table" in out
+    assert "ref LO @ 6.00 dB PAPR" in out
+    pep_rows = out.split("EQUAL-PEP floor table")[1].splitlines()
+    hi = [ln for ln in pep_rows if ln.strip().startswith("HI")][0]
+    assert "7.8" in hi
+    assert rc == 0
+
+
+def test_lens_order_flip_is_reported(tmp_path, capsys):
+    """The pre-registered escalation trigger: a clipped mode loses at equal
+    average power but wins at equal PEP. A floors 1.9 dB better than B, but
+    carries 4 dB more PAPR -> order flips; the report must name the pair."""
+    rows = curve("NOCLIP", "off", [0.5, 0.05, 0.01, 0.0], papr_db="12.00")   # floor ~1.8
+    rows += curve("CLIP", "off", [0.5, 0.5, 0.05, 0.01], papr_db="8.00")  # ~2 dB later
+    rc = run(tmp_path, rows)
+    out = capsys.readouterr().out
+    assert "LENS DISAGREEMENTS" in out
+    assert rc == 0
+
+
+def test_missing_papr_skips_pep_lens_without_failing(tmp_path, capsys):
+    rows = curve("M", "off", [0.5, 0.05, 0.01], papr_db="")
+    rc = run(tmp_path, rows)
+    out = capsys.readouterr().out
+    assert "equal-PEP lens: SKIPPED" in out
+    assert rc == 0
+
+
+# ------------------------------------------------ paired series (Decision 4)
+
+def write_pairs(tmp_path, spec):
+    import json
+    p = tmp_path / "pairs.json"
+    p.write_text(json.dumps(spec))
+    return str(p)
+
+
+def test_identical_config_pair_that_ties_passes_the_gate(tmp_path, capsys):
+    """Same FER curve on both sides -> no Wilson-disjoint point, gate PASS."""
+    fers = [0.9, 0.5, 0.05, 0.01]
+    rows = curve("PLH-X", "off", fers, family="plh", papr_db="9.00")
+    rows += curve("X", "off", fers, papr_db="9.60")
+    pairs = write_pairs(tmp_path, [{"a": "PLH-X", "b": "X",
+                                    "config_identical": True}])
+    rc = run(tmp_path, rows, "--pairs", pairs,
+             "--frontier-exclude-family", "plh")
+    out = capsys.readouterr().out
+    assert "TIE GATE: PASS" in out
+    assert "CAVEAT" not in out
+    assert rc == 0
+
+
+def test_identical_config_pair_with_a_real_gap_fails_the_gate(tmp_path, capsys):
+    """~2 dB of curve shift at N=150 separates far beyond the Wilson interval.
+    The gate must call it an INSTRUMENT fault and the verdict must carry the
+    caveat -- while staying exit 0, per the pre-registered gate list (caveat,
+    not invalidation)."""
+    rows = curve("PLH-X", "off", [0.9, 0.9, 0.5, 0.05, 0.01], family="plh",
+                 papr_db="9.00")
+    rows += curve("X", "off", [0.5, 0.05, 0.01, 0.0, 0.0], papr_db="9.60")
+    pairs = write_pairs(tmp_path, [{"a": "PLH-X", "b": "X",
+                                    "config_identical": True}])
+    rc = run(tmp_path, rows, "--pairs", pairs,
+             "--frontier-exclude-family", "plh")
+    out = capsys.readouterr().out
+    assert "TIE GATE: FAILED" in out
+    assert "INSTRUMENT fault" in out
+    assert "CAVEAT" in out
+    assert rc == 0, "tie-gate failure is a caveat, not an invalidation"
+
+
+def test_non_identical_pair_carries_no_tie_gate(tmp_path, capsys):
+    """A real A/B (different configs) reports deltas but must not be judged
+    against the tie expectation."""
+    rows = curve("PLH-Y", "off", [0.9, 0.5, 0.05, 0.01], family="plh",
+                 papr_db="8.40")
+    rows += curve("Y", "off", [0.5, 0.05, 0.01, 0.0], papr_db="8.10")
+    pairs = write_pairs(tmp_path, [{"a": "PLH-Y", "b": "Y",
+                                    "config_identical": False}])
+    rc = run(tmp_path, rows, "--pairs", pairs,
+             "--frontier-exclude-family", "plh")
+    out = capsys.readouterr().out
+    assert "a real A/B" in out
+    assert "TIE GATE" not in out
+    assert rc == 0
+
+
+def test_pair_member_missing_from_corpus_is_said_not_dropped(tmp_path, capsys):
+    rows = curve("X", "off", [0.5, 0.05, 0.01])
+    pairs = write_pairs(tmp_path, [{"a": "GHOST", "b": "X",
+                                    "config_identical": True}])
+    rc = run(tmp_path, rows, "--pairs", pairs)
+    out = capsys.readouterr().out
+    assert "NOT IN CORPUS" in out
+    assert rc == 0
+
+
+def test_pair_deltas_report_both_lenses_and_airtime(tmp_path, capsys):
+    """Decision 4's fields: dfloor under BOTH lenses and the airtime deficit
+    must appear for a pair where both sides have floors."""
+    rows = curve("PLH-Z", "off", [0.9, 0.5, 0.05, 0.01], family="plh",
+                 papr_db="9.00", air_s="2.8260")
+    rows += curve("Z", "off", [0.5, 0.05, 0.01, 0.0], papr_db="9.60",
+                  air_s="2.6000")
+    pairs = write_pairs(tmp_path, [{"a": "PLH-Z", "b": "Z",
+                                    "config_identical": False}])
+    rc = run(tmp_path, rows, "--pairs", pairs,
+             "--frontier-exclude-family", "plh")
+    out = capsys.readouterr().out
+    assert "airtime  2.826 vs 2.600" in out
+    assert "d(avgpwr)" in out and "d(PEP)" in out
+    assert rc == 0
+
+
+def test_unreadable_pairs_file_is_incomplete_not_crash(tmp_path, capsys):
+    rows = curve("M", "off", [0.5, 0.05, 0.01])
+    rc = run(tmp_path, rows, "--pairs", str(tmp_path / "nope.json"))
+    out = capsys.readouterr().out
+    assert rc == 2
+    assert "INCOMPLETE" in out

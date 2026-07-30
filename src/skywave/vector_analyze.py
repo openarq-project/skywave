@@ -75,7 +75,8 @@ def load_sweep(path):
             bandwidth_hz=int(r["bandwidth_hz"] or 0),
             sample_rate=r.get("sample_rate", ""),
             bw_hz=r.get("bw_hz", ""),
-            nominal_bps=float(r["nominal_bps"] or 0))
+            nominal_bps=float(r["nominal_bps"] or 0),
+            papr_db=r.get("papr_db", ""))
     for k in curves:
         curves[k].sort(key=lambda t: t[0])
     return curves, meta, multi
@@ -305,7 +306,8 @@ def main(argv=None):
         w.writerow(["key", "adapter", "label", "family", "preset", "floor_db",
                     "floor_last_db", "status", "peak_goodput_bps",
                     "payload_bytes", "air_s", "bandwidth_hz", "sample_rate",
-                    "bw_hz", "nominal_bps", "points", "frames_per_point"])
+                    "bw_hz", "nominal_bps", "points", "frames_per_point",
+                    "papr_db"])
         for (key, preset), pts in sorted(curves.items()):
             lo, hi, st = floors(pts, a.target, a.onset)
             status[st] += 1
@@ -317,7 +319,7 @@ def main(argv=None):
                         f"{m['air_s']:.4f}", m["bandwidth_hz"],
                         m["sample_rate"], m["bw_hz"],
                         f"{m['nominal_bps']:.1f}", len(pts),
-                        min(p[3] for p in pts)])
+                        min(p[3] for p in pts), m["papr_db"]])
 
     bar = a.target if a.frontier_max_fer < 0 else a.frontier_max_fer
     hulls = {p: pareto(curves, p, bar) for p in presets}

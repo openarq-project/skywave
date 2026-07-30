@@ -54,6 +54,41 @@ that ship today:
 
 More are welcome.
 
+### Vector adapters (PHY mode characterization)
+
+`ModemAdapter` measures a modem as a **system** — ARQ, turnaround, CSMA, goodput over a
+real link. That is the wrong instrument for characterizing individual **modes**: an ARQ
+layer's ACKs ride the data mode, retransmission integrates over channel draws, CSMA airtime
+is charged to the mode, and a transfer deadline turns "slow" into "failed".
+
+So there is a second, parallel family: `VectorAdapter`, a **frame codec** contract with no
+stations, no link, no PTT and no wall-clock timing. It measures one-way FER vs SNR, one
+frame per trial, zero retries; goodput and floors derive from that curve analytically. The
+two families share only the channel model. Contract:
+[docs/VECTOR-ADAPTER-CONTRACT.md](docs/VECTOR-ADAPTER-CONTRACT.md).
+
+The contract is **files, not an API** — a float32 vector plus a JSON sidecar — so adapters
+are language-agnostic and need no FFI:
+
+| Adapter | Implementation | Rate |
+|---|---|---|
+| `vector_modem73` | wraps a C++ binary (`modevector`) | 48 kHz |
+| `vector_armstrong` | wraps `cargo run -p phy --example vector` (Rust) | 8 kHz |
+
+Sample rate is declared per vector, not assumed — the two shipped adapters differ by 6×,
+and both run through identical channel code. Every adapter inherits a required selftest
+gate (a clean round trip must decode every frame; a deep-noise one must decode none).
+
+```sh
+python3 -m skywave.vector_sweep  --adapter armstrong --out out/sweep.csv \
+    --presets off,good,moderate,poor --frames 150 --snr-lo -12 --snr-hi 30
+python3 -m skywave.vector_report --sweep out/sweep.csv     # gates, exit 0/1/2
+python3 -m skywave.vector_analyze --sweep out/sweep.csv --outdir out
+```
+
+Rows from different adapters can share one CSV, so modes from different modems land on a
+single Pareto frontier measured with one channel generation and one SNR convention.
+
 ## Install
 
 skywave is a `src/`-layout Python package (`skywave`), needs Python 3.11+, and

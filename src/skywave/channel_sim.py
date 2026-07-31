@@ -1095,7 +1095,10 @@ class Link:
                  # mode is real (a ladder driver once declared HD+PTT while
                  # running FD/VOX). key_duty/key_bursts differ between arms only
                  # by inference, which is not provenance.
-                 "sim_ptt": SIM_PTT, "hang_ms": HANG_MS, "key_thresh": KEY_THRESH}
+                 "sim_ptt": SIM_PTT, "hang_ms": HANG_MS, "key_thresh": KEY_THRESH,
+                 # ...and the resolved clock, for the same reason: it is the
+                 # third knob that used to mis-resolve in silence.
+                 "clock": SIM_CLOCK}
         if SIM_CLOCK == "virt_time":
             stats["virtual_s"] = VIRT_NOW_S    # drivers score virtual goodput off this
         with open(tmp, "w") as f:

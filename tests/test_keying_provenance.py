@@ -49,3 +49,13 @@ def test_hang_defaults_are_reported_not_omitted(tmp_path):
     assert set(("sim_ptt", "hang_ms", "key_thresh")) <= set(d)
     assert d["hang_ms"] == cs.HANG_MS
     assert d["key_thresh"] == cs.KEY_THRESH
+
+
+def test_resolved_clock_is_reported(tmp_path):
+    """The third knob that used to mis-resolve in silence. A corpus must be
+    able to say which clock produced it without trusting the driver."""
+    d = _stats(tmp_path, load_sim(SIM_HALF_DUPLEX=1), "rt.json")
+    assert d["clock"] == "real_time"
+    v = _stats(tmp_path, load_sim(SIM_HALF_DUPLEX=1, SIM_TRANSPORT="sock",
+                                  SIM_CLOCK="virt_time"), "vt.json")
+    assert v["clock"] == "virt_time"

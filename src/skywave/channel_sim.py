@@ -1076,7 +1076,14 @@ class Link:
                  "papr_robust_db": (20.0 * np.log10(rpeak / act_rms) if act_rms > 0 else 0.0),
                  "half_duplex": HALF_DUPLEX, "keyed_now": self.keyed, "rig_gen": RIG_GEN,
                  "key_duty": (self.keyed_blocks / self.nblocks if self.nblocks else 0.0),
-                 "key_bursts": int(self.key_bursts)}
+                 "key_bursts": int(self.key_bursts),
+                 # Keying-mode provenance: which gate actually ran, and the two
+                 # VOX parameters. A driver must read its arm back from HERE
+                 # rather than from the env it believes it set — the failure
+                 # mode is real (a ladder driver once declared HD+PTT while
+                 # running FD/VOX). key_duty/key_bursts differ between arms only
+                 # by inference, which is not provenance.
+                 "sim_ptt": SIM_PTT, "hang_ms": HANG_MS, "key_thresh": KEY_THRESH}
         if SIM_CLOCK == "virt_time":
             stats["virtual_s"] = VIRT_NOW_S    # drivers score virtual goodput off this
         with open(tmp, "w") as f:

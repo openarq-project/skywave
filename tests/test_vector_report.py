@@ -419,3 +419,19 @@ def test_unreadable_pairs_file_is_incomplete_not_crash(tmp_path, capsys):
     out = capsys.readouterr().out
     assert rc == 2
     assert "INCOMPLETE" in out
+
+
+def test_fd_forensics_from_extra_json_are_printed(tmp_path, capsys):
+    """The gate block must surface the driver's forensic record (fd_detail via
+    extra_json) instead of '[no forensics recorded]' — the E1 coarse event was
+    adjudicable only because the cell happened to be deterministic."""
+    import json as _json
+    rows = curve("M", "off", [0.5, 0.05, 0.01])
+    rows[0]["crc_errors"] = 4519
+    rows[0]["false_decode"] = 1
+    rows[0]["extra_json"] = _json.dumps({"fd_detail": "len=403:first4=00000006"})
+    rc = run(tmp_path, rows)
+    out = capsys.readouterr().out
+    assert "len=403:first4=00000006" in out
+    assert "no forensics recorded" not in out
+    assert rc == 0

@@ -139,6 +139,25 @@ def reap_stale(root, max_age_s=6 * 3600):
     return n
 
 
+def accumulate_extra(extra, k, v):
+    """Fold one non-core adapter key into the per-cell extras. Numerics SUM
+    across batches; non-numerics JOIN non-empty values with ';' — a plain
+    overwrite let a later empty batch erase an earlier batch's forensic
+    record (fd_detail), exactly the value the false-decode gate needs kept.
+    """
+    try:
+        extra[k] = extra.get(k, 0) + int(v)
+        return
+    except (TypeError, ValueError):
+        pass
+    prev = extra.get(k)
+    vs = str(v).strip()
+    if isinstance(prev, str) and prev and vs:
+        extra[k] = prev + ";" + vs
+    elif vs or not isinstance(prev, str):
+        extra[k] = vs
+
+
 def wilson(k, n, z=1.96):
     if n == 0:
         return (0.0, 1.0)
@@ -250,10 +269,7 @@ def do_mode(adapter, mode, presets, snrs, args, done, writer, wlock, stats):
                         a["n"] += d
                     for k, v in r.items():
                         if k not in CORE_KEYS:
-                            try:
-                                a["extra"][k] = a["extra"].get(k, 0) + int(v)
-                            except (TypeError, ValueError):
-                                a["extra"][k] = v
+                            accumulate_extra(a["extra"], k, v)
                     os.remove(npath)
             for p in (vec_path, side_path):
                 if os.path.exists(p):

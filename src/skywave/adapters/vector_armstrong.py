@@ -188,7 +188,16 @@ class ArmstrongVectorAdapter(VectorAdapter):
             "mean_snr_db": f("mean_snr_db"),
             "mean_ber": f("mean_ber", -1.0),
             "sync_count": i("sync_count"),
+            # Real failed-CRC count as of armstrong's crc_eval_stash — the
+            # false-accept exposure term the E1 coarse gate lacked (it read
+            # a hardcoded 0 and degenerated to zero-tolerance).
             "crc_errors": i("crc_errors"),
+            # Total CRC evaluations (fails + passes) and up-to-4 forensic
+            # records of false decodes ("len=..:first4=.."; '' when none).
+            # Non-core keys: they travel via the sweep's extra_json column,
+            # which vector_report's gate forensics already read.
+            "crc_evals": i("crc_evals"),
+            "fd_detail": r.get("fd_detail", "") or "",
             "always_cold": 1,
         }
 

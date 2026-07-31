@@ -413,3 +413,26 @@ def test_wall_s_reaches_the_row(tmp_path, monkeypatch):
     row2 = _run_one_cell(tmp_path, monkeypatch,
                          {"sigma": 0, "payload": 512, "timeout": 30})
     assert isinstance(row2["wall_s"], float) and row2["wall_s"] >= 0.0
+
+
+# ---- accumulate_extra: forensic strings must survive later empty batches ----
+
+def test_accumulate_extra_sums_numerics_and_joins_strings():
+    from skywave.vector_sweep import accumulate_extra
+    extra = {}
+    # numerics sum across batches (crc_evals)
+    accumulate_extra(extra, "crc_evals", "40")
+    accumulate_extra(extra, "crc_evals", "2")
+    assert extra["crc_evals"] == 42
+    # a forensic string is kept even when a LATER batch reports none —
+    # the overwrite bug erased fd_detail exactly when the gate needed it
+    accumulate_extra(extra, "fd_detail", "len=403:first4=00000006")
+    accumulate_extra(extra, "fd_detail", "")
+    assert extra["fd_detail"] == "len=403:first4=00000006"
+    # two real records join
+    accumulate_extra(extra, "fd_detail", "len=10:first4=AA")
+    assert extra["fd_detail"] == "len=403:first4=00000006;len=10:first4=AA"
+    # empty-only series still materializes the key as ''
+    e2 = {}
+    accumulate_extra(e2, "fd_detail", "")
+    assert e2["fd_detail"] == ""

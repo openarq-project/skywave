@@ -436,3 +436,20 @@ def test_accumulate_extra_sums_numerics_and_joins_strings():
     e2 = {}
     accumulate_extra(e2, "fd_detail", "")
     assert e2["fd_detail"] == ""
+
+
+def test_extra_json_round_trips_through_json():
+    """The sweep once serialized extras with a ';' item separator — INVALID
+    JSON that only manifests with >=2 keys (a single-key dict has no
+    separator), so every multi-key extra was silently unparseable and
+    vector_report's extras() returned {}. Pin the round trip."""
+    import json
+    payload = {"always_cold": 1, "crc_evals": 42, "fd_detail": "len=1:first4=AA",
+               "s_offset_db": "-0.120"}
+    encoded = json.dumps(payload, separators=(",", ":"))
+    assert json.loads(encoded) == payload
+    # and the exact call pattern the sweep uses on its row dict
+    from skywave import vector_sweep as vs
+    import inspect
+    src = inspect.getsource(vs)
+    assert 'separators=(";"' not in src, "the invalid-JSON separator is back"

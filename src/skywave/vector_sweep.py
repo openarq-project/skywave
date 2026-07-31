@@ -329,7 +329,7 @@ def do_mode(adapter, mode, presets, snrs, args, done, writer, wlock, stats):
             "crc_bits": mode.get("crc_bits") if mode.get("crc_bits") else "",
             "extra_json": json.dumps(
                 {**a["extra"], "s_offset_db": f"{s_offset_db:.3f}"},
-                separators=(";", ":")),
+                separators=(",", ":")),
             "batches": len(batch_list), "seed_base": args.seed,
             "cold": 1 if args.cold else 0, "host": host, "arch": arch,
             "driver_id": driver_id,

@@ -487,6 +487,18 @@ _SUN_PATH_MAX = 108 if sys.platform.startswith("linux") else 104
 # (a TO=900 cell means 900 virtual seconds), exiting with a VIRTUAL-TIMEOUT
 # marker; 0 = unbounded (the driver's wall timeout is the hang backstop).
 SIM_CLOCK = (os.environ.get("SIM_CLOCK", "real_time").strip().lower() or "real_time")
+# Validate like every other enum knob here. This one was the exception, and the
+# exception cost: SIM_CLOCK is only ever compared `== "virt_time"`, so ANY
+# unrecognised spelling silently fell through to wall-paced real_time while the
+# caller believed it had asked for the lockstep virtual clock. transport_profile
+# already enforces this set on the profile path (_VALID_CLOCKS); the environment
+# path did not, and the environment OVERRIDES the profile.
+_VALID_CLOCKS = ("real_time", "virt_time")
+if SIM_CLOCK not in _VALID_CLOCKS:
+    raise SystemExit(f"channel_sim: unknown SIM_CLOCK='{SIM_CLOCK}' "
+                     f"(expected one of {', '.join(_VALID_CLOCKS)}). Note "
+                     f"'virtual' is NOT a synonym for 'virt_time' — it used to "
+                     f"be accepted and silently meant real_time.")
 MAX_VIRTUAL_S = float(os.environ.get("SIM_MAX_VIRTUAL_S", "0").strip() or "0")
 # SIM_VIRT_MAX_RATIO: cap the virtual clock at N x wall time (0 = unlimited,
 # the default). For a modem whose protocol timers are virtual but whose

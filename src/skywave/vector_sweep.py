@@ -227,6 +227,7 @@ def do_mode(adapter, mode, presets, snrs, args, done, writer, wlock, stats):
     acc = {}
     scratch = tempfile.mkdtemp(prefix="swvec-", dir=args.scratch)
     _reg(scratch)
+    s_offset_db = 0.0  # set per batch below; 0.0 if every batch failed early
     try:
         for bi, nframes in enumerate(batch_list):
             seed = args.seed + bi * 7919
@@ -238,6 +239,11 @@ def do_mode(adapter, mode, presets, snrs, args, done, writer, wlock, stats):
             validate_sidecar(side, vector_len=vec.size)
             fs = int(side["sample_rate"])
             S = vc.clean_signal_power(vec, side)
+            # Option-A transition: record the old-S/new-S conversion offset so
+            # pre-convention floors remain convertible (the report prints it).
+            s_legacy = vc.legacy_signal_power(vec, side)
+            s_offset_db = (10.0 * math.log10(S / s_legacy)
+                           if S > 0 and s_legacy > 0 else 0.0)
 
             for preset in presets:
                 faded, _ = vc.apply_fade(vec, side, preset, seed + 101,
@@ -247,7 +253,12 @@ def do_mode(adapter, mode, presets, snrs, args, done, writer, wlock, stats):
                         continue
                     sigma = vc.sigma_for(S, fs, bw, snr)
                     npath = os.path.join(scratch, "noisy.f32")
-                    write_vector(npath, vc.add_awgn(faded, sigma, seed + 202))
+                    # Headroom guard (Option-A bundle): joint SNR-invariant
+                    # scale-down so deep-SNR noise no longer clips at the
+                    # driver's f32->i16 conversion (~0.3-0.5 dB pessimistic
+                    # below ~-8 dB SNR3000 before this).
+                    write_vector(npath, vc.apply_headroom(
+                        vc.add_awgn(faded, sigma, seed + 202)))
                     try:
                         r = adapter.decode(npath, side_path, cold=args.cold)
                     except Exception as e:                       # noqa: BLE001
@@ -316,7 +327,9 @@ def do_mode(adapter, mode, presets, snrs, args, done, writer, wlock, stats):
             "peak_dbfs": mode.get("peak_dbfs", ""),
             "papr_db": mode.get("papr_db", ""),
             "crc_bits": mode.get("crc_bits") if mode.get("crc_bits") else "",
-            "extra_json": json.dumps(a["extra"], separators=(";", ":")),
+            "extra_json": json.dumps(
+                {**a["extra"], "s_offset_db": f"{s_offset_db:.3f}"},
+                separators=(";", ":")),
             "batches": len(batch_list), "seed_base": args.seed,
             "cold": 1 if args.cold else 0, "host": host, "arch": arch,
             "driver_id": driver_id,

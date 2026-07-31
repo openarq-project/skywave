@@ -259,6 +259,17 @@ def main(argv=None):
     # is a pooling error the other gates cannot see.
     drv = Counter(r.get("driver_id", "") for r in rows)
     print(f"  driver_id      {dict(drv)}")
+    # Option-A transition: per-mode old-S/new-S conversion offsets, so floors
+    # from pre-convention corpora remain convertible while both exist.
+    offs = {}
+    for r in rows:
+        v = extras(r).get("s_offset_db")
+        if v not in (None, ""):
+            offs.setdefault(r["label"], v)
+    if offs:
+        print("  S-convention   Option-A payload-region S; new-S − old-S per "
+              "mode (dB): "
+              + ", ".join(f"{k} {v}" for k, v in sorted(offs.items())))
     seen_drv = {d for d in drv if d}
     if len(seen_drv) > 1:
         print(f"  -> INVALIDATION: {len(seen_drv)} distinct driver binaries "

@@ -66,16 +66,62 @@ def frame_tail(fs, longest):
     return max(TAIL_MIN, int(TAIL_FRACTION * max(longest, 1)), int(0.01 * fs))
 
 
-def clean_signal_power(vec, side):
-    """Mean square over frame regions only, on the pre-fade vector."""
+def _mean_square(vec, offsets, lengths):
     acc, n = 0.0, 0
-    for off, ln in zip(side["frame_offsets"], side["frame_lengths"]):
+    for off, ln in zip(offsets, lengths):
         seg = np.asarray(vec[off:off + ln], dtype=np.float64)
         acc += float(np.dot(seg, seg))
         n += seg.size
-    if n == 0:
+    return (acc / n) if n else None
+
+
+def clean_signal_power(vec, side):
+    """Mean square of the clean signal, on the pre-fade vector.
+
+    Option-A convention (owner-ratified 2026-07-31, boundary = the E1
+    pathfinder campaign): when the sidecar marks ACTIVE PAYLOAD REGIONS
+    (`payload_offsets`/`payload_lengths` — codec2 preamble+frame+postamble,
+    excluding tx-internal silences and the PLH head), S is computed over
+    those. Whole-frame S let the PLH head's energy inflate S (dS up to
+    ~0.8 dB on PLH modes) and the silence fraction dilute it, so labeled
+    SNRs were off by a mode-shape constant. Sidecars that predate the
+    convention fall back to frame regions.
+    """
+    if side.get("payload_offsets") and side.get("payload_lengths"):
+        s = _mean_square(vec, side["payload_offsets"], side["payload_lengths"])
+        if s is not None:
+            return s
+    s = _mean_square(vec, side["frame_offsets"], side["frame_lengths"])
+    if s is None:
         raise SystemExit("vector_channel: sidecar named no frame samples")
-    return acc / n
+    return s
+
+
+def legacy_signal_power(vec, side):
+    """Pre-Option-A S (whole frame regions) — kept so the sweep can record the
+    per-mode old-S/new-S conversion offset during the convention transition."""
+    s = _mean_square(vec, side["frame_offsets"], side["frame_lengths"])
+    if s is None:
+        raise SystemExit("vector_channel: sidecar named no frame samples")
+    return s
+
+
+#: i16 headroom guard (Option-A bundle): peak target after noise addition, in
+#: f32 full-scale units — the c2floor PEAK_TARGET=3000 pattern. Native TX
+#: levels peak near -6 dBFS, so at deep SNR the added noise CLIPPED at the
+#: driver's f32->i16 conversion, measuring ~0.3-0.5 dB PESSIMISTIC below
+#: ~-8 dB SNR3000.
+HEADROOM_PEAK = 3000.0 / 32768.0
+
+
+def apply_headroom(noisy):
+    """Scale the signal+noise composite DOWN (never up) so its peak fits the
+    i16 conversion with the c2floor-style margin. A joint scale is
+    SNR-invariant, so the labeled SNR is untouched."""
+    peak = float(np.max(np.abs(noisy))) if len(noisy) else 0.0
+    if peak > HEADROOM_PEAK:
+        return (noisy * (HEADROOM_PEAK / peak)).astype(noisy.dtype, copy=False)
+    return noisy
 
 
 def sigma_for(S, fs, bw_hz, snr_db):

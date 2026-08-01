@@ -51,6 +51,37 @@ def test_hang_defaults_are_reported_not_omitted(tmp_path):
     assert d["key_thresh"] == cs.KEY_THRESH
 
 
+def test_tr_geometry_is_reported_in_ms_and_in_blocks(tmp_path):
+    """Cell V1 sweeps SIM_TR_UNKEY_MS, so it must be readable back — and the
+    APPLIED block count must be readable beside the requested ms, because these
+    knobs are block-quantized. Reading the ms alone is how a sweep reports
+    distinct rungs that ran identical physics."""
+    cs = load_sim(SIM_HALF_DUPLEX=1, SIM_TR_KEY_MS=15, SIM_TR_UNKEY_MS=400)
+    d = _stats(tmp_path, cs)
+    assert d["tr_key_ms"] == 15 and d["tr_unkey_ms"] == 400
+    assert d["tr_key_blocks"] == cs.TR_KEY_BLOCKS
+    assert d["tr_unkey_blocks"] == cs.TR_UNKEY_BLOCKS
+    assert d["hang_blocks"] == cs.HANG_BLOCKS
+    assert d["block_ms"] == cs.BLOCK_MS
+
+
+def test_block_quantization_collapse_is_visible(tmp_path):
+    """The concrete trap this exists to expose: at SIM_FS=8000 one block is
+    128 ms, so 40 ms and 80 ms of hang are the SAME single block. The ms fields
+    differ (and would read as two rungs); `hang_blocks` must show they did not."""
+    a = _stats(tmp_path, load_sim(SIM_HALF_DUPLEX=1, SIM_FS=8000,
+                                  SIM_HANG_MS=40), "h40.json")
+    b = _stats(tmp_path, load_sim(SIM_HALF_DUPLEX=1, SIM_FS=8000,
+                                  SIM_HANG_MS=80), "h80.json")
+    assert a["hang_ms"] != b["hang_ms"]
+    assert a["hang_blocks"] == b["hang_blocks"] == 1
+    # ...and at 48 kHz the same two values are genuinely distinct rungs, so the
+    # field discriminates rather than always collapsing.
+    c = _stats(tmp_path, load_sim(SIM_HALF_DUPLEX=1, SIM_HANG_MS=40), "f40.json")
+    e = _stats(tmp_path, load_sim(SIM_HALF_DUPLEX=1, SIM_HANG_MS=80), "f80.json")
+    assert c["hang_blocks"] != e["hang_blocks"]
+
+
 def test_resolved_clock_is_reported(tmp_path):
     """The third knob that used to mis-resolve in silence. A corpus must be
     able to say which clock produced it without trusting the driver."""

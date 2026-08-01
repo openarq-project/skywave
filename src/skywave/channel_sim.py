@@ -1086,7 +1086,20 @@ class Link:
                  "sim_ptt": SIM_PTT, "hang_ms": HANG_MS, "key_thresh": KEY_THRESH,
                  # ...and the resolved clock, for the same reason: it is the
                  # third knob that used to mis-resolve in silence.
-                 "clock": SIM_CLOCK}
+                 "clock": SIM_CLOCK,
+                 # T/R switch geometry: the REQUESTED ms AND the APPLIED block
+                 # count, because every one of these knobs is block-quantized
+                 # (`round(ms / BLOCK_MS)`) and the two can differ a lot. One
+                 # block is 21.3 ms at the 48 kHz/1024 default but 128 ms at
+                 # SIM_FS=8000, where a sweep over 40/80/160 ms of hang collapses
+                 # to a single block — three rungs in the CSV, one physics. A
+                 # driver that reads back only the ms cannot see that; emit what
+                 # was applied so the collapse is visible in the corpus.
+                 "tr_key_ms": TR_KEY_MS, "tr_unkey_ms": TR_UNKEY_MS,
+                 "tr_jitter_ms": TR_JITTER_MS,
+                 "tr_key_blocks": TR_KEY_BLOCKS,
+                 "tr_unkey_blocks": TR_UNKEY_BLOCKS,
+                 "hang_blocks": HANG_BLOCKS, "block_ms": BLOCK_MS}
         if SIM_CLOCK == "virt_time":
             stats["virtual_s"] = VIRT_NOW_S    # drivers score virtual goodput off this
         with open(tmp, "w") as f:

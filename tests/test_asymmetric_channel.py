@@ -91,3 +91,55 @@ def test_default_link_inherits_globals():
     cs = load_sim(SIGMA=3000, TXGAIN=1.2)
     link = _link(cs)
     assert link.sigma == 3000 and link.gain == 1.2
+
+
+# --- SIM_SIGMA_BA_ONSET_S: delayed one-way blackout (V2DP-1 G2, 2026-08-15) ---
+
+def _onset_link(cs, sigma, onset_blocks, sigma_pre, seed=1):
+    return cs.Link("b->a", _FakeProc(), 0, seed, "", threading.Event(),
+                   "b", "a", cs.Keys(), None, None, 0, None, None, None, None,
+                   gain=None, sigma=sigma,
+                   sigma_onset_blocks=onset_blocks, sigma_pre=sigma_pre)
+
+
+def test_sigma_onset_requires_sigma_ba():
+    """Onset with nothing to delay is a config error, not a silent no-op."""
+    with pytest.raises(SystemExit):
+        load_sim(SIGMA=2000, SIM_SIGMA_BA_ONSET_S=60)
+
+
+def test_sigma_onset_env_plumbing():
+    cs = load_sim(SIGMA=2000, SIM_SIGMA_BA=20000, SIM_SIGMA_BA_ONSET_S=2.5)
+    assert cs.SIGMA_BA_ONSET_S == 2.5
+    assert cs.SIGMA_BA == 20000 and cs.SIGMA_AB == 2000
+    assert cs.ASYM is True
+
+
+def test_sigma_onset_switches_at_block_boundary():
+    """Before the onset block the link runs sigma_pre; from it on, sigma —
+    switched on the nblocks audio clock both run() and lockstep advance."""
+    cs = load_sim(SIGMA=2000)
+    link = _onset_link(cs, sigma=20000.0, onset_blocks=3, sigma_pre=2000.0)
+    assert link.sigma == 2000.0                      # constructed pre-onset
+    for nb, want in ((0, 2000.0), (2, 2000.0), (3, 20000.0), (7, 20000.0)):
+        link.nblocks = nb
+        link._apply_sigma_onset()
+        assert link.sigma == want, f"block {nb}"
+    # The switch drives the noise fill itself.
+    buf = np.empty(cs.NSAMP)
+    link._fill_noise(buf)
+    assert np.std(buf) == pytest.approx(20000, rel=0.1)
+    link.nblocks = 0
+    link._apply_sigma_onset()
+    link._fill_noise(buf)
+    assert np.std(buf) == pytest.approx(2000, rel=0.1)
+
+
+def test_sigma_onset_none_is_inert():
+    """Static links are byte-identical to before: the onset fields exist but
+    _apply_sigma_onset is a no-op (regression guard for every other cell)."""
+    cs = load_sim(SIGMA=3000)
+    link = _link(cs)
+    assert link.sigma_onset_blocks is None
+    link._apply_sigma_onset()
+    assert link.sigma == 3000

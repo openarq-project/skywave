@@ -465,6 +465,21 @@ SIGMA_BA = float(_sba) * SIGMA_SCALE if _sba else SIGMA
 GAIN_A = float(os.environ.get("SIM_TXGAIN_A", "").strip() or GAIN)
 GAIN_B = float(os.environ.get("SIM_TXGAIN_B", "").strip() or GAIN)
 ASYM = (SIGMA_AB != SIGMA_BA) or (GAIN_A != GAIN_B)
+# One-way blackout ONSET (V2DP-1 G2 wrongness cell, 2026-08-15): with
+# SIM_SIGMA_BA set, SIM_SIGMA_BA_ONSET_S=<seconds> delays it — the B->A
+# link runs the symmetric base SIGMA until `onset` audio-clock seconds
+# (block-quantized, switched at the next block boundary; the transition is
+# logged to stderr as scoring ground truth, like the fade schedule's). A
+# from-t=0 blackout kills the HANDSHAKE, so the cell it was built for never
+# exercised its mechanism — the onset lets the session establish on a
+# two-way channel first. Unset = byte-identical to before. Composition with
+# SIM_NOISE_VD is REFUSED at fx build (the Vd mixture is calibrated per
+# sigma; a mid-run swap would silently change the realization).
+_sba_onset = os.environ.get("SIM_SIGMA_BA_ONSET_S", "").strip()
+SIGMA_BA_ONSET_S = float(_sba_onset) if _sba_onset else None
+if SIGMA_BA_ONSET_S is not None and not _sba:
+    sys.exit("channel_sim: SIM_SIGMA_BA_ONSET_S requires SIM_SIGMA_BA "
+             "(nothing to delay)")
 # Virtual-rig stage 1 — framed unix-socket transport (see TRANSPORT in the header).
 TRANSPORT = (os.environ.get("SIM_TRANSPORT", "alsa").strip().lower() or "alsa")
 SOCK_DIR = os.environ.get("SIM_SOCK_DIR", "").strip() or f"/tmp/simsock-{os.getpid()}"
@@ -648,12 +663,22 @@ class Link:
 
     def __init__(self, name, src_proc, sink_fd, seed, stats_path, stop,
                  src_name, sink_name, keys, ptt=None, fade=None, link_delay_samp=0,
-                 rig_tx=None, rig_rx=None, fx=None, squelch=None, gain=None, sigma=None):
+                 rig_tx=None, rig_rx=None, fx=None, squelch=None, gain=None, sigma=None,
+                 sigma_onset_blocks=None, sigma_pre=None):
         self.name = name
         # Per-direction/per-station asymmetry (default = the symmetric globals, so an
         # unset knob is byte-identical to the earlier single-global behavior).
         self.gain = GAIN if gain is None else gain    # this station's TX audio drive
         self.sigma = SIGMA if sigma is None else sigma  # this direction's noise floor (RX)
+        # Delayed sigma (SIM_SIGMA_BA_ONSET_S): before block `sigma_onset_blocks`
+        # the link runs `sigma_pre` (the symmetric base); from that block on, the
+        # constructed sigma. None = static — all three fields inert, behavior
+        # byte-identical to before.
+        self.sigma_onset_blocks = sigma_onset_blocks
+        self.sigma_pre = sigma_pre
+        self.sigma_post = self.sigma
+        if sigma_onset_blocks is not None:
+            self.sigma = sigma_pre
         self.fade = fade                          # WattersonChannel or None (per-direction)
         self.rig_tx = rig_tx                      # RigBPF / fm_rig.FmPortTx or None
         self.rig_rx = rig_rx                      # RigBPF / fm_rig.FmPortRx or None
@@ -816,9 +841,28 @@ class Link:
             self._update_key(w)                       # publish this station's keying + T/R state
         return w
 
+    def _apply_sigma_onset(self):
+        """Delayed per-direction sigma (SIM_SIGMA_BA_ONSET_S): switch at the
+        block boundary, on the same audio clock both run() and lockstep
+        advance (`nblocks`). Logged once as scoring ground truth (like the
+        fade schedule's transitions). No-op when the link is static."""
+        if self.sigma_onset_blocks is None:
+            return
+        was = self.sigma
+        self.sigma = (self.sigma_post
+                      if self.nblocks >= self.sigma_onset_blocks
+                      else self.sigma_pre)
+        if self.sigma != was:
+            sys.stderr.write(
+                f"channel_sim: [{self.name}] sigma-onset at block "
+                f"{self.nblocks} (t={self.nblocks * BLOCK / FS:.1f}s): "
+                f"{was:g} -> {self.sigma:g}\n")
+            sys.stderr.flush()
+
     def deliver_block(self, w):
         """Second half of `process`: the half-duplex deliver gate + the channel
         chain (fade/foff/skew/delay/noise/BPF/AGC) into self.outbuf."""
+        self._apply_sigma_onset()
         deliver = True
         carrier_at_tx = None                      # FM squelch carrier (HD keying); None => energy detect
         if HALF_DUPLEX:
@@ -1071,6 +1115,8 @@ class Link:
                  "act_rms": act_rms, "act_rms_at_pep": act_rms_at_pep,
                  "duty": self.act_n / self.nsamp, "n": int(self.nsamp),
                  "clip_frac": self.nclip / self.nsamp,
+                 # sigma echoes the CURRENT value — post-onset that is the
+                 # blackout floor (what a validity check should read).
                  "rail_frac": self.nrail / self.nsamp, "gain": self.gain, "sigma": self.sigma,
                  "papr_db": (20.0 * np.log10(self.peak / act_rms) if act_rms > 0 else 0.0),
                  "papr_robust_db": (20.0 * np.log10(rpeak / act_rms) if act_rms > 0 else 0.0),
@@ -1102,6 +1148,11 @@ class Link:
                  "hang_blocks": HANG_BLOCKS, "block_ms": BLOCK_MS}
         if SIM_CLOCK == "virt_time":
             stats["virtual_s"] = VIRT_NOW_S    # drivers score virtual goodput off this
+        if self.sigma_onset_blocks is not None:
+            # Onset provenance (keys present only on the delayed link, so
+            # every other link's stats JSON stays byte-identical).
+            stats["sigma_onset_s"] = self.sigma_onset_blocks * BLOCK / FS
+            stats["sigma_pre"] = self.sigma_pre
         with open(tmp, "w") as f:
             json.dump(stats, f)
         os.replace(tmp, self.stats_path)
@@ -1124,10 +1175,13 @@ class SockLink(Link):
     def __init__(self, name, src_sock, sink_sock, seed, stats_path, stop,
                  src_name, sink_name, keys, ptt=None, fade=None,
                  link_delay_samp=0, rig_tx=None, rig_rx=None, fx=None,
-                 squelch=None, gain=None, sigma=None):
+                 squelch=None, gain=None, sigma=None,
+                 sigma_onset_blocks=None, sigma_pre=None):
         super().__init__(name, _NoSrc(), -1, seed, stats_path, stop,
                          src_name, sink_name, keys, ptt, fade, link_delay_samp,
-                         rig_tx, rig_rx, fx, squelch, gain=gain, sigma=sigma)
+                         rig_tx, rig_rx, fx, squelch, gain=gain, sigma=sigma,
+                         sigma_onset_blocks=sigma_onset_blocks,
+                         sigma_pre=sigma_pre)
         self.src_file = src_sock.makefile("rb")
         self.sink_sock = sink_sock
         self.tx_seq = 0
@@ -1583,6 +1637,14 @@ def build_channel_effects():
                                   RX_AGC_TARGET, RX_AGC_MAXGAIN_DB)
             _atag = RX_AGC_MODE if RX_AGC_MODE in AGC_PRESETS else "rx_agc"
             fx_desc.append(f"{_atag}={RX_AGC_ATTACK_MS:g}/{RX_AGC_RELEASE_MS:g}ms")
+        if NOISE_VD and SIGMA_BA_ONSET_S is not None:
+            # Config conflict, not a silent override (provenance doctrine):
+            # the Vd mixture is calibrated once per sigma; a mid-run swap
+            # would silently change the calibrated realization.
+            print("channel_sim: SIM_SIGMA_BA_ONSET_S + SIM_NOISE_VD is "
+                  "unsupported (per-sigma Vd calibration cannot switch "
+                  "mid-run)", file=sys.stderr, flush=True)
+            return 2
         if NOISE_VD and (SIGMA_AB > 0.0 or SIGMA_BA > 0.0):
             # Per-direction impulsive noise: each direction's mixture is calibrated to its
             # OWN floor (Vd is a shape metric; total power tracks that sigma). Default
@@ -1697,6 +1759,10 @@ def main():
         return 2
 
     closeables = []
+    # SIM_SIGMA_BA_ONSET_S -> applied block index for the B->A link (block-
+    # quantized like every timed knob; None = static, byte-identical wiring).
+    _ba_onset_blocks = (int(round(SIGMA_BA_ONSET_S * FS / BLOCK))
+                        if SIGMA_BA_ONSET_S is not None else None)
     if TRANSPORT == "sock":
         try:
             conn_a, conn_b, closeables = _sock_rig(procs)
@@ -1712,7 +1778,9 @@ def main():
         ba = SockLink("B->A", conn_b, conn_a, SEED + 22, sp_b, stop,
                       "b", "a", keys, ptt, fade_ba, LINK_DELAY_SAMP,
                       rig_ba_tx, rig_ba_rx, fx_ba,
-                      squelch=sql_ba, gain=GAIN_B, sigma=SIGMA_BA)   # B TX -> A RX
+                      squelch=sql_ba, gain=GAIN_B, sigma=SIGMA_BA,
+                      sigma_onset_blocks=_ba_onset_blocks,
+                      sigma_pre=SIGMA)   # B TX -> A RX
     else:
         alsa_err = _platform.alsa_rig_error()
         if alsa_err:
@@ -1729,7 +1797,9 @@ def main():
         ba = Link("B->A", rec_b, play_a.stdin.fileno(), SEED + 22, sp_b, stop,
                   "b", "a", keys, ptt, fade_ba, LINK_DELAY_SAMP,
                   rig_ba_tx, rig_ba_rx, fx_ba, squelch=sql_ba,
-                  gain=GAIN_B, sigma=SIGMA_BA)   # B_TX -> A_RX
+                  gain=GAIN_B, sigma=SIGMA_BA,
+                  sigma_onset_blocks=_ba_onset_blocks,
+                  sigma_pre=SIGMA)   # B_TX -> A_RX
     ab.noise_lpf = noise_lpf_ab
     ba.noise_lpf = noise_lpf_ba
     keying = "PTT" if SIM_PTT else f"VOX(thresh={KEY_THRESH:.0f})"
@@ -1751,6 +1821,10 @@ def main():
         transport += f" clock=virt_time(max={MAX_VIRTUAL_S:g}s)"
     _level_desc = (f"gain(A/B)={GAIN_A:g}/{GAIN_B:g} sigma(AB/BA)={SIGMA_AB:g}/{SIGMA_BA:g} ASYM"
                    if ASYM else f"gain={GAIN:g} sigma={SIGMA_SPEC:g}")
+    if SIGMA_BA_ONSET_S is not None:
+        # Onset provenance in the banner (echo-verify reads it): BA runs the
+        # base sigma until this audio-clock time, then the value above.
+        _level_desc += f" onset(BA)={SIGMA_BA_ONSET_S:g}s"
     if SIGMA_SCALE != 1.0:
         _level_desc += f" (x{SIGMA_SCALE:.3f}@{FS}Hz -> per-sample {SIGMA_AB:g}/{SIGMA_BA:g})"
     _prof_desc = f"profile={_PROFILE_NAME}  " if _PROFILE_NAME else ""

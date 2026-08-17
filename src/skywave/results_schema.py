@@ -129,6 +129,22 @@ integer -- record the change in the changelog below.
         overstate PAPR on runs with an aloop cold-start pop; peak_dbfs is the
         robust one.
     All four "" on pre-existing corpora. Append = no bump per the policy above.
+  results-schema/1 + max_recovered_gap (2026-08-17, GEN2 wrongness
+    adjudication): one trailing column appended --
+      * `max_recovered_gap` -- the longest no-progress span the row's transfer
+        RECOVERED from (the empirical `G_needed`): the early-out's always-on
+        harm counter. Read it against SKYW_STALL_S -- a value at or above the
+        window means the early-out WOULD have truncated a transfer that came
+        back; the pre-registered rule (owner-ratified 2026-08-17) flags any
+        row above W/2 and re-runs that tier disarmed before quoting it.
+        Distinct from `stall_s`, which is the longest flat span of any kind
+        INCLUDING the trailing one a dead transfer never recovered from.
+        "" when the curve has under two points or never gained a byte.
+        It exists because the synthetic blackout wrongness cell could not
+        produce this quantity (three failed constructions, then DIAG-RESUME
+        measured 0/8 resumes -- the premise was vacuous), so the safety
+        obligation moved from a pre-run gate to a counter on every real row.
+    "" on pre-existing corpora. Append = no bump per the policy above.
 """
 import csv
 import json
@@ -151,6 +167,7 @@ COLUMNS = [
     "progress_log", "stall_s",
     "stopped_early", "ceiling_s",
     "peak_dbfs", "papr_db",
+    "max_recovered_gap",
 ]
 
 # Per-column caster for the READER side (read_corpus). Everything is stored as text in
@@ -173,6 +190,7 @@ COLUMN_TYPES = {
     # invert "false" exactly like connected/intact above.
     "stopped_early": str, "ceiling_s": float,
     "peak_dbfs": float, "papr_db": float,
+    "max_recovered_gap": float,
 }
 
 

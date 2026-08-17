@@ -389,6 +389,53 @@ def stall_seconds(curve):
     return round(worst, 1)
 
 
+def recovered_gap_seconds(curve):
+    """Longest no-progress span this transfer RECOVERED from -- the empirical
+    `G_needed` (GEN2 wrongness adjudication, 2026-08-17).
+
+    This is the early-out's harm counter, and it exists because the synthetic
+    wrongness cell could not produce the quantity: the blackout construction
+    failed three ways (W+60 unsatisfiable by design; the ratified W-60 fired
+    6/6; and DIAG-RESUME then measured that mercury/vara never resume after
+    total loss at all -- 0/8 reps, 712-774 s of watched clear channel, corpus
+    `reviews/gen2diag-bench5-2026-08-17/`). A premise that vacuous cannot gate
+    anything, so the obligation moved here: measure, on every real campaign
+    row for free, the largest gap a transfer ACTUALLY came back from.
+
+    Distinct from stall_seconds, which is the longest flat span of ANY kind --
+    including the trailing one a dead transfer never recovers from, which for
+    a truncated row is precisely the span that killed it. Only spans ENDING IN
+    A BYTE GAIN count here.
+
+    The leading span (first tick -> first gain) IS included, deliberately: the
+    trip rule anchors its clock at the first tick too, so a modem that takes
+    longer than the window to deliver its first byte is exactly as truncatable
+    as one that stalls mid-transfer. Same axis, same convention as StallWatch,
+    so the two are directly comparable -- which is the whole point:
+
+        max_recovered_gap >= SKYW_STALL_S anywhere in a corpus means the
+        early-out WOULD have truncated a transfer that went on to recover.
+
+    Decision rule, pre-registered before the run that uses it (owner-ratified
+    2026-08-17): a row above W/2 flags its tier; that tier is re-run disarmed
+    before its numbers are quoted.
+
+    "" when the curve has fewer than two points, or when no gain ever occurred
+    (nothing was recovered, so there is no gap to report -- that row's story
+    is in stall_s).
+    """
+    if len(curve) < 2:
+        return ""
+    worst = None
+    span_start, best = curve[0]
+    for t, n in curve[1:]:
+        if n > best:
+            gap = t - span_start
+            worst = gap if worst is None else max(worst, gap)
+            span_start, best = t, n
+    return "" if worst is None else round(worst, 1)
+
+
 def write_progress_curve(path, curve):
     """Write a cell's delivery curve as a two-column CSV beside its log.
     results_schema.read_progress() is the reader half."""
@@ -778,6 +825,13 @@ def run_cell(modem, cell, rep, writer, fcsv, tag):
            # off), and the longest no-progress span in it. See parse_progress/
            # stall_seconds and the results_schema changelog.
            "progress_log": progress_log, "stall_s": stall_seconds(curve),
+           # The early-out's ALWAYS-ON harm counter (2026-08-17): the longest
+           # no-progress gap this row RECOVERED from. Read against
+           # SKYW_STALL_S -- a value at or above the window means the
+           # early-out would have killed a transfer that came back. Replaces
+           # the retired synthetic blackout wrongness cell; see
+           # recovered_gap_seconds.
+           "max_recovered_gap": recovered_gap_seconds(curve),
            # Early-out provenance (GEN2 §3.2): three-state stopped_early so a
            # scorer can tell "not armed" ("") from "armed, did not fire"
            # ("false"); ceiling_s = the budget this row ACTUALLY ran under,

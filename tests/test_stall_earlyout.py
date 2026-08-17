@@ -196,3 +196,76 @@ def test_peak_cols_blank_without_stats():
 def test_schema_carries_the_new_columns():
     for c in ("stopped_early", "ceiling_s", "peak_dbfs", "papr_db"):
         assert c in COLUMNS
+
+
+# ---- max_recovered_gap: the early-out's always-on harm counter -------------------
+#
+# Landed 2026-08-17 after the synthetic blackout wrongness cell was retired
+# (three failed constructions, then DIAG-RESUME measured 0/8 resumes -- the
+# cell's premise was vacuous for this modem population). The safety obligation
+# moved from a pre-run gate to this counter on every real campaign row:
+# max_recovered_gap >= SKYW_STALL_S anywhere means the early-out would have
+# truncated a transfer that came back.
+
+def test_recovered_gap_is_one_tick_on_a_healthy_transfer():
+    """A curve that gains every tick recovers only from the sampling interval."""
+    curve = [(0.0, 0), (5.0, 100), (10.0, 200), (15.0, 300)]
+    assert sweep_runner.recovered_gap_seconds(curve) == 5.0
+
+
+def test_recovered_gap_reports_a_stall_the_transfer_came_back_from():
+    curve = [(0.0, 0), (5.0, 100), (105.0, 200), (110.0, 300)]
+    assert sweep_runner.recovered_gap_seconds(curve) == 100.0
+
+
+def test_trailing_dead_span_is_not_a_recovered_gap():
+    """THE discriminator vs stall_s: the span that KILLED a transfer was never
+    recovered from, so it must not appear here. A truncated row's big flat
+    tail is exactly that span."""
+    curve = [(0.0, 0), (5.0, 100), (10.0, 200)] + [(t, 200) for t in range(15, 300, 5)]
+    assert sweep_runner.stall_seconds(curve) > 200          # the tail dominates
+    assert sweep_runner.recovered_gap_seconds(curve) == 5.0  # nothing came back
+
+
+def test_counter_can_differ_from_stall_s_in_both_directions():
+    """Negative control: prove the two columns are not the same number wearing
+    two names (a counter that always equals stall_s would settle nothing)."""
+    recovered = [(0.0, 0), (5.0, 10), (95.0, 20), (100.0, 30)]
+    died = [(0.0, 0), (5.0, 10), (10.0, 20), (200.0, 20)]
+    assert sweep_runner.recovered_gap_seconds(recovered) == 90.0
+    assert sweep_runner.stall_seconds(recovered) == 90.0     # same here...
+    assert sweep_runner.recovered_gap_seconds(died) == 5.0   # ...and apart here
+    assert sweep_runner.stall_seconds(died) == 190.0
+
+
+def test_leading_ramp_counts_because_the_trip_rule_counts_it():
+    """StallWatch anchors at the FIRST TICK, so a slow first byte is just as
+    truncatable as a mid-transfer stall. The counter must use the same
+    convention or the comparison against SKYW_STALL_S is meaningless."""
+    curve = [(0.0, 0), (50.0, 0), (100.0, 0), (150.0, 500), (155.0, 600)]
+    assert sweep_runner.recovered_gap_seconds(curve) == 150.0
+    w = StallWatch(150.0)
+    assert not w.feed(0.0, 0)
+    assert not w.feed(50.0, 0)
+    assert not w.feed(100.0, 0)
+    assert w.feed(150.0, 500) is False   # a GAINING tick never trips...
+    w2 = StallWatch(150.0)
+    w2.feed(0.0, 0)
+    assert w2.feed(150.0, 0)             # ...but the same gap without the gain does
+
+
+def test_recovered_gap_blank_when_nothing_was_ever_delivered():
+    """A connect-then-no-decode row recovered from nothing; its story is stall_s."""
+    assert sweep_runner.recovered_gap_seconds([(t, 0) for t in range(0, 100, 5)]) == ""
+    assert sweep_runner.recovered_gap_seconds([(0.0, 0)]) == ""
+    assert sweep_runner.recovered_gap_seconds([]) == ""
+
+
+def test_byte_regression_is_not_a_recovery():
+    """Same rule as the trip: only an INCREASE past the running peak counts."""
+    curve = [(0.0, 0), (5.0, 500), (60.0, 400), (120.0, 450), (125.0, 600)]
+    assert sweep_runner.recovered_gap_seconds(curve) == 120.0
+
+
+def test_max_recovered_gap_is_a_trailing_schema_column():
+    assert COLUMNS[-1] == "max_recovered_gap"

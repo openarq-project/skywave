@@ -1408,9 +1408,14 @@ def build_channel_effects():
         for tok in FADE_SCHEDULE.split(","):
             name, _, secs = tok.strip().partition(":")
             name = name.strip().lower()
-            if name not in watterson.PRESETS:
+            # "blackout" = total signal loss for the segment (zeros through the
+            # standard crossfade) -- the GEN2 stall-wrongness cell's mechanism.
+            # Deliberately NOT a Watterson preset: it has no delay/Doppler and
+            # is schedule-only (a static SIM_WATTERSON=blackout stays rejected).
+            if name not in watterson.PRESETS and name != "blackout":
                 print(f"channel_sim: unknown fade segment '{name}' in "
-                      f"SIM_FADE_SCHEDULE (use {list(watterson.PRESETS)})",
+                      f"SIM_FADE_SCHEDULE (use "
+                      f"{list(watterson.PRESETS) + ['blackout']})",
                       file=sys.stderr, flush=True)
                 return 2
             segs.append((name, float(secs) if secs.strip() else 0.0))

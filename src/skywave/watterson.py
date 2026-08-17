@@ -314,6 +314,12 @@ class ScheduledFade:
         self._announced = 0     # highest transition index already logged
 
     def _seg_out(self, seg, block):
+        # "blackout": total signal loss for the segment's duration (the GEN2
+        # stall-wrongness cell -- a modem silent through no fault of its own).
+        # Entered/left through the standard crossfade below, like any segment;
+        # a run that never names it is byte-identical to before.
+        if seg[0] == "blackout":
+            return np.zeros_like(block)
         ch = seg[1]
         return block if ch is None else ch.process(block)
 

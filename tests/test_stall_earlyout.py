@@ -166,6 +166,10 @@ def test_no_trip_on_a_slow_but_moving_run(tmp_path, monkeypatch):
     assert not fake.terminated
     assert row["stopped_early"] == "false"           # armed, did not fire
     assert row["intact"] == "True" or row["intact"] == "true"
+    # The harm counter must reach a REAL emitted row, not just its unit test:
+    # this run recovered from 15 s gaps under a 20 s window -- exactly the
+    # "close to W" shape the recovered-gap gate exists to catch.
+    assert row["max_recovered_gap"] == 15.0
 
 
 def test_unarmed_rows_record_blank_stopped_early(tmp_path, monkeypatch):

@@ -455,6 +455,32 @@ def stall_config():
     return stall
 
 
+def rep_range(cell):
+    """Absolute rep indices to run: rep_base .. rep_base+reps.
+
+    rep_base (default 0) exists for the T5 floor-pin escalation: a later
+    invocation ADDS reps 3..7 to a cell whose 0..2 are already in the corpus.
+    Absolute indices keep SEED = 1234 + rep*7 unique per rep and the
+    log/npstats basenames distinct from the existing rows, so escalation
+    never re-runs or supersedes collected data.
+    """
+    base = int(cell.get("rep_base", 0))
+    return range(base, base + int(cell.get("reps", 1)))
+
+
+def validate_rep_base(cell, idx, spec):
+    """Load-time guard (fail before cell 40 of an overnight run, like the
+    other spec validations): rep_base must be a non-negative integer."""
+    try:
+        base = int(cell.get("rep_base", 0))
+    except (TypeError, ValueError):
+        raise SystemExit(f"sweep_runner: cell {idx} in {spec}: rep_base must "
+                         f"be an integer (got {cell.get('rep_base')!r})")
+    if base < 0:
+        raise SystemExit(f"sweep_runner: cell {idx} in {spec}: rep_base must "
+                         f"be >= 0 (got {base})")
+
+
 def peak_cols(stats):
     """The §5.1 equal-PEP promotion: npstats robust_peak/papr_db -> schema.
 
@@ -821,6 +847,7 @@ def main():
         if bad:
             raise SystemExit(f"sweep_runner: cell {idx} in {spec}: env keys must start "
                              f"with SIM_ (got {', '.join(bad)})")
+        validate_rep_base(c, idx, spec)
     # Basename-collision fail-fast (owner review, FRINGE campaign, 2026-07-26): a cell
     # list where two (cell, rep) pairs agree on tag/sigma/watterson/payload/rep but
     # differ only by an unlabeled knob (atten_db was the case that surfaced this) write
@@ -829,7 +856,7 @@ def main():
     # a multi-hour campaign that a "label" field would have fixed for one line of JSON.
     seen = {}
     for idx, c in enumerate(cells):
-        for rep in range(c.get("reps", 1)):
+        for rep in rep_range(c):
             key = _cell_basename_declared(tag, modem, c, rep)
             if key in seen:
                 raise SystemExit(
@@ -849,7 +876,7 @@ def main():
     writer = csv.DictWriter(fcsv, fieldnames=cols)
     if new:
         writer.writeheader(); fcsv.flush()
-    n = sum(c.get("reps", 1) for c in cells)
+    n = sum(len(rep_range(c)) for c in cells)
     # Drop the versioned schema + provenance sidecar next to the corpus. Idempotent,
     # so a resumed run refreshes it. External consumers read_manifest()/read_corpus() it.
     write_manifest(out, schema=RESULTS_SCHEMA, modem=modem, tag=tag,
@@ -859,7 +886,7 @@ def main():
     between_cell_cleanup()
     i = 0
     for c in cells:
-        for rep in range(c.get("reps", 1)):
+        for rep in rep_range(c):
             i += 1
             print(f"--- run {i}/{n} ---", flush=True)
             try:

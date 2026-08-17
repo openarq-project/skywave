@@ -106,6 +106,29 @@ integer -- record the change in the changelog below.
         read it against wall_s, since a healthy transfer still reports about one tick
         interval. "" when the curve has fewer than two points.
     Append = no bump per the policy above.
+  results-schema/1 + stopped_early/ceiling_s/peak_dbfs/papr_db (2026-08-17,
+    GEN2 instrument): four trailing columns appended --
+      * `stopped_early` -- the truncating no-progress early-out's provenance
+        (sweep_runner StallWatch, armed by SKYW_STALL_S): "" = not armed,
+        "false" = armed and did not fire, "true" = fired (the run was ended
+        after SKYW_STALL_S of zero byte progress on the tick axis). THREE
+        states on purpose: a scorer must distinguish "not armed" from "armed
+        and quiet", and a censoring scorer must never read a truncated row as
+        a confirmed non-delivery at budgets past its stop (GEN2 design §3.2).
+        Stays str for the same bool("false") trap as `intact`/`connected`.
+      * `ceiling_s` -- the transfer budget this row ACTUALLY ran under (the
+        cell timeout after any adaptive-budget resolution), so a scorer never
+        infers it from spec files.
+      * `peak_dbfs` -- 20*log10(robust_peak/32767) from the row's npstats:
+        the fair-PEP peak (cold-start transient excluded) the equal-PEP
+        calibration targets, promoted so a shared calibration is VERIFIED per
+        row instead of assumed (GEN2 design §5.1 peak gate). "" when stats
+        are missing.
+      * `papr_db` -- channel_sim's papr_db passed through. ⚠ upstream computes
+        it from the RAW peak (cold-start included) over act_rms, so it can
+        overstate PAPR on runs with an aloop cold-start pop; peak_dbfs is the
+        robust one.
+    All four "" on pre-existing corpora. Append = no bump per the policy above.
 """
 import csv
 import json
@@ -126,6 +149,8 @@ COLUMNS = [
     "connected", "time_to_connect",
     "fade_units", "snr2k7",
     "progress_log", "stall_s",
+    "stopped_early", "ceiling_s",
+    "peak_dbfs", "papr_db",
 ]
 
 # Per-column caster for the READER side (read_corpus). Everything is stored as text in
@@ -144,6 +169,10 @@ COLUMN_TYPES = {
     "connected": str, "time_to_connect": float,
     "fade_units": float, "snr2k7": float,
     "progress_log": str, "stall_s": float,
+    # stopped_early stays str: three-state (""/"false"/"true"), and bool() would
+    # invert "false" exactly like connected/intact above.
+    "stopped_early": str, "ceiling_s": float,
+    "peak_dbfs": float, "papr_db": float,
 }
 
 

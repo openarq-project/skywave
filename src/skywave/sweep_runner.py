@@ -400,6 +400,75 @@ def write_progress_curve(path, curve):
     return path
 
 
+class StallWatch:
+    """The truncating no-progress early-out's trip rule (GEN2 design §3).
+
+    Fed every PROGRESS tick as it streams; trips when the latest tick sits
+    >= stall_s past the last BYTE GAIN (or past the first tick, if bytes never
+    rose). Judged purely on tick timestamps -- the bench/signal axis the budget
+    is on -- never on wall time: a dead adapter that stops ticking entirely is
+    the hard `timeout` backstop's problem, not a stall. Only an INCREASE counts
+    as progress (a tick reporting fewer bytes is an adapter artifact, not
+    delivery), and a gaining tick never trips regardless of the gap before it:
+    truncation may only ever reclaim time that produced nothing.
+    """
+
+    def __init__(self, stall_s):
+        self.stall_s = float(stall_s)
+        self._t_gain = None
+        self._best = None
+
+    def feed(self, t, n):
+        if self._t_gain is None:
+            self._t_gain, self._best = t, n
+            return False
+        if n > self._best:
+            self._best, self._t_gain = n, t
+            return False
+        return (t - self._t_gain) >= self.stall_s
+
+
+def stall_config():
+    """Validated SKYW_STALL_S (0.0 = early-out off).
+
+    Loud config errors rather than silent inertness (the calibrate-the-gate-
+    in-its-regime lesson): a stall watch without ticks NEVER fires, and a
+    window inside 2x the tick cadence would graze on ordinary gaps. Campaign-
+    wide by the same argument as SKYW_PROGRESS_S -- a per-cell window would
+    make stopped_early incomparable across the corpus. The window itself is
+    MEASURED, not guessed: the GEN2 smoke runs with the early-out disabled and
+    derives it from the curves (design §3.1), so this function never supplies
+    a default.
+    """
+    stall = float(os.environ.get("SKYW_STALL_S", "0") or "0")
+    if stall <= 0:
+        return 0.0
+    cadence = float(os.environ.get("SKYW_PROGRESS_S", "0") or "0")
+    if cadence <= 0:
+        sys.exit("SKYW_STALL_S is set but SKYW_PROGRESS_S is not: the stall "
+                 "watch reads PROGRESS ticks and can never fire without them "
+                 "(an inert gate). Set SKYW_PROGRESS_S or unset SKYW_STALL_S.")
+    if stall <= 2 * cadence:
+        sys.exit(f"SKYW_STALL_S={stall:g} must exceed 2x SKYW_PROGRESS_S="
+                 f"{cadence:g}: a window inside two tick intervals trips on "
+                 f"ordinary cadence gaps, not stalls.")
+    return stall
+
+
+def peak_cols(stats):
+    """The §5.1 equal-PEP promotion: npstats robust_peak/papr_db -> schema.
+
+    peak_dbfs is from ROBUST_PEAK (cold-start transient excluded -- the fair
+    PEP the calibration targets). papr_db is passed through as channel_sim
+    computes it, which uses the RAW peak over act_rms -- slightly conservative
+    on runs with a cold-start pop; noted in the results_schema changelog.
+    """
+    rp = float(stats.get("robust_peak", 0) or 0)
+    papr = stats.get("papr_db", "")
+    return {"peak_dbfs": round(20 * math.log10(rp / 32767.0), 2) if rp > 0 else "",
+            "papr_db": round(float(papr), 2) if str(papr) != "" else ""}
+
+
 def fade_resolved(env):
     """What channel_sim will ACTUALLY fade with: (name, delay_ms, doppler_hz).
 
@@ -519,6 +588,8 @@ def run_cell(modem, cell, rep, writer, fcsv, tag):
     env.setdefault("SIM_LOG", os.path.join(LOGDIR, base + ".sim.log"))
     env.update(cfg["extra_env"])
     kill = int(tmo) + cfg["kill_pad"]
+    stall_cfg = stall_config()      # validated once per cell; 0.0 = off
+    stall_fired = False
     attempts = 2  # one extra try, consumed ONLY on a connect-type failure (Mercury HD race)
     for att in range(attempts):
         t0 = time.time()
@@ -540,6 +611,11 @@ def run_cell(modem, cell, rep, writer, fcsv, tag):
             p = sp.Popen(["timeout", str(kill), *adapter_argv(cfg, payload, tmo)],
                         cwd=BENCH_ROOT, env=skywave.child_env(env),
                         stdout=sp.PIPE, stderr=sp.STDOUT, text=True, bufsize=1)
+            # Truncating no-progress early-out (GEN2 §3): watch the tick stream
+            # live; a trip reclaims time that was producing nothing. It NEVER
+            # extends anything -- the hard `timeout` above is untouched.
+            watch = StallWatch(stall_cfg) if stall_cfg > 0 else None
+            stall_fired = False
             chunks = []
             for raw_line in p.stdout:
                 stamped = f"[+{time.time() - t0:8.3f}] {raw_line}"
@@ -554,6 +630,22 @@ def run_cell(modem, cell, rep, writer, fcsv, tag):
                 # irrelevant next to seconds of airtime.
                 lf.flush()
                 chunks.append(stamped)
+                if watch is not None and not stall_fired:
+                    mprog = PROGRESS_RE.search(raw_line)
+                    if mprog and watch.feed(float(mprog.group(1)),
+                                            int(mprog.group(2))):
+                        stall_fired = True
+                        # Ground truth for scoring, stamped like the fade
+                        # transitions: the trip instant on both axes.
+                        lf.write(f"[+{time.time() - t0:8.3f}] STALL_EARLYOUT "
+                                 f"t={mprog.group(1)}s stall_s={stall_cfg:g}\n"
+                                 .encode("utf-8"))
+                        lf.flush()
+                        # SIGTERM the `timeout` wrapper -- it forwards TERM to
+                        # the adapter, the same signal path as the hard kill,
+                        # so teardown behavior is identical. Keep draining the
+                        # pipe until EOF; between_cell_cleanup sweeps residue.
+                        p.terminate()
             p.wait()
         el = round(time.time() - t0, 1)
         txt = "".join(chunks)
@@ -659,7 +751,17 @@ def run_cell(modem, cell, rep, writer, fcsv, tag):
            # Byte-vs-time delivery curve: the sidecar's basename ("" when ticks were
            # off), and the longest no-progress span in it. See parse_progress/
            # stall_seconds and the results_schema changelog.
-           "progress_log": progress_log, "stall_s": stall_seconds(curve)}
+           "progress_log": progress_log, "stall_s": stall_seconds(curve),
+           # Early-out provenance (GEN2 §3.2): three-state stopped_early so a
+           # scorer can tell "not armed" ("") from "armed, did not fire"
+           # ("false"); ceiling_s = the budget this row ACTUALLY ran under,
+           # so a censoring scorer never has to infer it from spec files.
+           "stopped_early": ("true" if stall_fired
+                             else ("false" if stall_cfg > 0 else "")),
+           "ceiling_s": float(tmo),
+           # Equal-PEP per-row verification (GEN2 §5.1): the shared-calibration
+           # peak gate reads these instead of trusting the calibration held.
+           **peak_cols(stats)}
     writer.writerow(row); fcsv.flush()
     lbl = f" [{label}]" if label else ""
     print(f"[{modem}]{lbl} s={sigma}({row['snr3k']}dB) {watt} p={payload} r{rep}: "

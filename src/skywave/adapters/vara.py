@@ -6,23 +6,14 @@ half-duplex channel_sim via VARA's TCP command/data ports. A faithful port of a
 hand-written VARA TNC driver onto the ModemAdapter contract, in the same shape as
 adapters/mercury.py (a TCP TNC that speaks CR-terminated commands).
 
-EXTERNAL STATION LIFECYCLE (the one way this differs from mercury/ardop). This adapter
-does NOT launch the modem processes. VARA is proprietary and slow to start, so the two
-VARA.exe instances are brought up ONCE per campaign by an
-external up/down step and PERSIST across cells; each must already be listening on its
-command port (A=8300, B=8310) with the data port at +1 (8301/8311), wired to the correct
-audio devices. Therefore:
-
-  * `start_stations` is a no-op -- the instances are already running.
-  * `wait_ready` polls the already-listening command ports.
-  * `teardown_stations` DISCONNECTs the link but does NOT kill VARA.exe (it must survive
-    to the next cell).
-
-A campaign runner that wants VARA to persist across a sweep brings the instances up before
-the first cell and down after the last (a `vara_up()`/`vara_down()` hook that also excludes
-`VARA.exe` from the between-cell kill patterns). Wiring such a hook into skywave's
-sweep_runner is a separate follow-up; this adapter owns only the per-cell connect /
-transfer / disconnect.
+STATION LIFECYCLE. As of 2026-08-18 this adapter launches and kills VARA per cell, the
+same as mercury/ardop/freedata -- see the VARA_LIFECYCLE block below for why the old
+persistent behaviour was retired and how to get it back (`SKYW_VARA_LIFECYCLE=persistent`)
+for the E5 control arm or interactive debugging. In per-run mode `start_stations` brings
+both instances up and records the startup cost; in persistent mode it is a no-op and the
+external vara_up.py/vara_down.py pair owns the lifecycle. Either way each instance must end
+up listening on its command port (A=8300, B=8310) with the data port at +1 (8301/8311),
+wired to the correct audio devices.
 
 The channel IS launched per cell (the shared `channel_sim`, base default) -- only the
 modem stations persist. SIGMA/TXGAIN/NP_STATS/SIM_* pass through to channel_sim untouched
@@ -48,6 +39,49 @@ import time
 from skywave.modem_adapter import ModemAdapter, run_adapter
 
 
+# ---------------------------------------------------------------------------
+# STATION LIFECYCLE (2026-08-18, owner-directed).
+#
+# Historically VARA.exe was launched ONCE per campaign and persisted across
+# every cell, because it is proprietary and slow to start. Every other modem
+# (mercury/ardop/freedata/armstrong) gets a FRESH process per run. That
+# asymmetry hands VARA two things nobody else gets in a comparative round: no
+# cold start, and whatever adaptation state survives a DISCONNECT -- VARA HF
+# tracks speed levels and per-link quality, so if any of it persists then its
+# reps are not independent, cell ORDER becomes a hidden variable, and the
+# scorer's median-over-reps assumes an exchangeability the data may not have.
+#
+# It also loads the box: two resident VARA.exe plus wineserver drew ~1.3 cores
+# continuously on bench5, and mercury measured 17.6 B/s there against 60.7 B/s
+# on a VARA-free bench3 running the SAME binary and the SAME skywave pin
+# (E1/E3, 2026-08-18).
+#
+# So per-run is now the default and persistence must earn its place:
+#   per-run    (default) launch before each cell, kill after -- symmetric with
+#              every other adapter.
+#   persistent (legacy)  the external vara_up.py/vara_down.py lifecycle; the
+#              control arm for the E5 state-carryover measurement, and an
+#              escape hatch for interactive debugging.
+# ---------------------------------------------------------------------------
+VARA_LIFECYCLE = (os.environ.get("SKYW_VARA_LIFECYCLE", "").strip().lower()
+                  or "per-run")
+if VARA_LIFECYCLE not in ("per-run", "persistent"):
+    raise SystemExit(f"SKYW_VARA_LIFECYCLE={VARA_LIFECYCLE!r}: expected "
+                     f"'per-run' or 'persistent'")
+
+# Launch parameters, kept identical to vara_up.py -- the wine loader is PINNED
+# to Ubuntu wine-9.0 on purpose (winehq-staging 11.13 repointed /usr/bin/wine
+# and VARA HF B wedges under staging: process up, cmd port never opens,
+# MEASURED 2026-07-19 2/2). Do not "simplify" this to bare `wine`.
+WINE_LOADER = "/usr/lib/wine/wine"
+WINE_DLL_OVERRIDES = "mscoree=d;mshtml=d"      # kills the wine-mono/.NET popups
+VARA_PREFIXES = [("/home/spinkham/.wine32", 8300),
+                 ("/home/spinkham/.wine32B", 8310)]
+VARA_START_TIMEOUT_S = 75.0                    # same ceiling as vara_up.py
+VARA_START_ATTEMPTS = 2                        # one retry: a cold wine start
+                                               # occasionally loses a port race
+
+
 class VaraAdapter(ModemAdapter):
     name = "vara"
     A_PORT, B_PORT = 8300, 8310          # A = answerer, B = caller; data ports are +1
@@ -69,14 +103,70 @@ class VaraAdapter(ModemAdapter):
 
     # ---- hooks ----
     def preclean_patterns(self):
-        # Channel-side helpers only; VARA.exe is deliberately NOT matched (it persists,
-        # managed by the external lifecycle). None of these match this adapter's cmdline.
-        return ["arecord -D plughw", "aplay -D plughw", "noise_pipe"]
+        # Channel-side helpers always. VARA.exe is matched ONLY in per-run mode:
+        # under the legacy persistent lifecycle it must survive between cells,
+        # so killing it here would break the very mode it belongs to.
+        pats = ["arecord -D plughw", "aplay -D plughw", "noise_pipe"]
+        if VARA_LIFECYCLE == "per-run":
+            pats.append("VARA.exe")
+        return pats
 
     def start_stations(self):
-        # No-op: the two VARA.exe instances are launched by the external up/down
-        # lifecycle and persist across cells. See the module docstring.
-        pass
+        """Launch both VARA instances (per-run), or no-op (persistent legacy).
+
+        Symmetric with mercury/ardop/freedata: one cold process per cell, so a
+        cell's numbers carry no state from the cell before it. Records the
+        measured startup cost per station -- that cost is the entire reason the
+        legacy mode existed, so it should be visible rather than folklore.
+        """
+        self._start_s = []
+        if VARA_LIFECYCLE == "persistent":
+            print("  vara lifecycle=persistent: stations assumed already up",
+                  flush=True)
+            return
+        for attempt in range(1, VARA_START_ATTEMPTS + 1):
+            self._kill_vara()
+            t0 = time.time()
+            for prefix, port in VARA_PREFIXES:
+                self._launch_one(prefix, port)
+            if self._ports_up(time.time() + VARA_START_TIMEOUT_S):
+                self._start_s = [round(time.time() - t0, 1)]
+                print(f"  VARA_START ok in {self._start_s[0]}s "
+                      f"(attempt {attempt})", flush=True)
+                return
+            print(f"  VARA_START attempt {attempt} FAILED (a port never "
+                  f"opened)", flush=True)
+        # Deliberately not raising: the base contract reports readiness through
+        # wait_ready, and a launch failure must surface as a normal
+        # fail_connect row rather than an exception that loses the cell.
+        print("  VARA_START GAVE UP -- stations not listening", flush=True)
+
+    def _launch_one(self, prefix, port):
+        vdir = os.path.join(prefix, "drive_c/VARA")
+        env = dict(os.environ, WINEPREFIX=prefix, WINEARCH="win32",
+                   WINEDLLOVERRIDES=WINE_DLL_OVERRIDES,
+                   DISPLAY=os.environ.get("DISPLAY", ":0"))
+        sp.Popen([WINE_LOADER, "VARA.exe"], cwd=vdir, env=env,
+                 stdout=open(f"/tmp/vara_{port}.log", "wb"), stderr=sp.STDOUT,
+                 start_new_session=True)
+
+    def _ports_up(self, deadline):
+        for _, port in VARA_PREFIXES:
+            while True:
+                try:
+                    socket.create_connection(("127.0.0.1", port),
+                                             timeout=1).close()
+                    break
+                except OSError:
+                    if time.time() >= deadline:
+                        return False
+                    time.sleep(0.5)
+        return True
+
+    def _kill_vara(self):
+        sp.run(["pkill", "-9", "-f", "VARA.exe"], stdout=sp.DEVNULL,
+               stderr=sp.DEVNULL)
+        time.sleep(1.5)
 
     def wait_ready(self, deadline):
         # VARA permits ONE client per command port and treats a client disconnect as a
@@ -163,14 +253,21 @@ class VaraAdapter(ModemAdapter):
             self.snrs.append(float(s.group(1)))
 
     def teardown_stations(self):
-        # Graceful link teardown, but leave VARA.exe running (it persists across cells).
+        # Graceful link teardown first, either way -- a DISCONNECT is how VARA
+        # is meant to end a session, and skipping it would change what the next
+        # cell sees in persistent mode.
         try:
             if self.b is not None:
                 self._snd(self.b, "DISCONNECT"); time.sleep(2)
         except OSError:
             pass
         super().teardown_stations()   # SIGTERMs self._stations -- empty here (no-op)
-        for pat in ["arecord -D plughw", "aplay -D plughw", "noise_pipe"]:
+        pats = ["arecord -D plughw", "aplay -D plughw", "noise_pipe"]
+        if VARA_LIFECYCLE == "per-run":
+            # Kill the stations too: leaving them resident is what loaded the
+            # box AND what let state cross cell boundaries.
+            pats.append("VARA.exe")
+        for pat in pats:
             sp.run(["pkill", "-9", "-f", pat], stdout=sp.DEVNULL, stderr=sp.DEVNULL)
 
     # ---- helpers ----

@@ -92,7 +92,11 @@ class VaraAdapter(ModemAdapter):
     # MFSK combs.  A cell measured at one width says nothing about another, so the width
     # has to be selectable rather than fixed at 2300.
     BW = os.environ.get("VARA_BW", "").strip() or "2300"
-    ready_timeout_s = 20.0
+    # A cold VARA start takes real time (vara_up.py polls to 75 s), and in
+    # per-run mode wait_ready IS the readiness gate -- so the deadline has to
+    # cover the launch, not just a connect to an already-listening port.
+    ready_timeout_s = (VARA_START_TIMEOUT_S + 15.0
+                       if VARA_LIFECYCLE == "per-run" else 20.0)
     connect_timeout_s = 250.0
 
     def __init__(self, cfg):
@@ -115,31 +119,33 @@ class VaraAdapter(ModemAdapter):
         """Launch both VARA instances (per-run), or no-op (persistent legacy).
 
         Symmetric with mercury/ardop/freedata: one cold process per cell, so a
-        cell's numbers carry no state from the cell before it. Records the
-        measured startup cost per station -- that cost is the entire reason the
-        legacy mode existed, so it should be visible rather than folklore.
+        cell's numbers carry no state from the cell before it.
+
+        ⚠ This method DELIBERATELY does not probe the command ports. VARA
+        permits ONE client per port and treats a client disconnect as a session
+        event, so a connect-then-close readiness probe followed by
+        wait_ready's real open hits the port twice at machine speed and trips a
+        reset right after MYCALL -- see wait_ready's comment, and the
+        2026-08-18 regression where exactly that probe made station B fail to
+        register on every vara cell. Readiness is wait_ready's job: `_connect`
+        already retries to a deadline, and the FIRST successful open is the
+        one and only open.
         """
         self._start_s = []
+        self._launch_t0 = None
         if VARA_LIFECYCLE == "persistent":
             print("  vara lifecycle=persistent: stations assumed already up",
                   flush=True)
             return
-        for attempt in range(1, VARA_START_ATTEMPTS + 1):
-            self._kill_vara()
-            t0 = time.time()
-            for prefix, port in VARA_PREFIXES:
-                self._launch_one(prefix, port)
-            if self._ports_up(time.time() + VARA_START_TIMEOUT_S):
-                self._start_s = [round(time.time() - t0, 1)]
-                print(f"  VARA_START ok in {self._start_s[0]}s "
-                      f"(attempt {attempt})", flush=True)
-                return
-            print(f"  VARA_START attempt {attempt} FAILED (a port never "
-                  f"opened)", flush=True)
-        # Deliberately not raising: the base contract reports readiness through
-        # wait_ready, and a launch failure must surface as a normal
-        # fail_connect row rather than an exception that loses the cell.
-        print("  VARA_START GAVE UP -- stations not listening", flush=True)
+        self._relaunch()
+
+    def _relaunch(self):
+        self._kill_vara()
+        self._launch_t0 = time.time()
+        for prefix, port in VARA_PREFIXES:
+            self._launch_one(prefix, port)
+        print(f"  VARA launched ({len(VARA_PREFIXES)} instances); readiness is "
+              f"wait_ready's single open", flush=True)
 
     def _launch_one(self, prefix, port):
         vdir = os.path.join(prefix, "drive_c/VARA")
@@ -149,19 +155,6 @@ class VaraAdapter(ModemAdapter):
         sp.Popen([WINE_LOADER, "VARA.exe"], cwd=vdir, env=env,
                  stdout=open(f"/tmp/vara_{port}.log", "wb"), stderr=sp.STDOUT,
                  start_new_session=True)
-
-    def _ports_up(self, deadline):
-        for _, port in VARA_PREFIXES:
-            while True:
-                try:
-                    socket.create_connection(("127.0.0.1", port),
-                                             timeout=1).close()
-                    break
-                except OSError:
-                    if time.time() >= deadline:
-                        return False
-                    time.sleep(0.5)
-        return True
 
     def _kill_vara(self):
         sp.run(["pkill", "-9", "-f", "VARA.exe"], stdout=sp.DEVNULL,
@@ -178,8 +171,27 @@ class VaraAdapter(ModemAdapter):
         # The proven original driver opens each command socket EXACTLY ONCE. Match that:
         # establish the persistent A/B command sockets HERE and let link_connect reuse
         # them (no probe, no re-open).
-        self.a = self._connect(self.A_PORT, deadline)
-        self.b = self._connect(self.B_PORT, deadline)
+        for attempt in range(1, VARA_START_ATTEMPTS + 1):
+            self.a = self._connect(self.A_PORT, deadline)
+            self.b = self._connect(self.B_PORT, deadline)
+            if self.a is not None and self.b is not None:
+                if self._launch_t0 is not None:
+                    self._start_s = [round(time.time() - self._launch_t0, 1)]
+                    print(f"  VARA_START ready in {self._start_s[0]}s "
+                          f"(attempt {attempt})", flush=True)
+                break
+            # Retrying means a FULL relaunch, never a re-open against the same
+            # process: a half-open pair is exactly the state that wedges VARA.
+            for sk in (self.a, self.b):
+                if sk is not None:
+                    sk.close()
+            self.a = self.b = None
+            if VARA_LIFECYCLE != "per-run" or attempt == VARA_START_ATTEMPTS:
+                return False
+            print(f"  VARA not ready (attempt {attempt}); relaunching",
+                  flush=True)
+            self._relaunch()
+            deadline = time.time() + self.ready_timeout_s
         if self.a is None or self.b is None:
             return False
         self.a.setblocking(False); self.b.setblocking(False)

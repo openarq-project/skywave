@@ -295,5 +295,12 @@ def format_record(rec):
     if rec.get("override") and rec.get("problems"):
         state = "OVERRIDDEN"
     dirty = " +dirty" if rec.get("dirty_tracked") else ""
+    # A directory-shaped target (FreeDATA is a source tree, not a built binary)
+    # has no bin_md5 -- capture() sets it to None. Never slice it unconditionally:
+    # this summary is a log line and must not crash a run (see the write path
+    # above, which likewise swallows OSError rather than fail a run on logging).
+    md5 = rec.get("bin_md5")
+    md5s = md5[:12] if md5 else "n/a"
+    binv = os.path.basename(rec["bin"]) if rec.get("bin") else "n/a"
     return (f"{rec['modem']} provenance: {who}{dirty} [{state}] "
-            f"bin={os.path.basename(rec['bin'])} md5={rec['bin_md5'][:12]}")
+            f"bin={binv} md5={md5s}")

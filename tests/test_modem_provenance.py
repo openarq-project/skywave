@@ -21,6 +21,7 @@ from skywave.modem_provenance import (
     PinViolation,
     ProvenanceError,
     capture,
+    format_record,
     gate,
     load_pin,
 )
@@ -202,3 +203,40 @@ def test_record_is_json_serialisable(repo, tmp_path):
     rec = gate(str(repo / "fakemodem"), modem="m",
                pin_file=_pin(tmp_path, commit=commit_of(repo)))
     json.loads(json.dumps(rec))
+
+
+# ---------- format_record (the one-line log summary) ----------
+
+def test_format_record_handles_a_directory_shaped_record():
+    """FreeDATA is a source TREE, not a built binary, so capture() sets
+    bin_md5=None (kind='tree'). format_record must not crash on that -- it did,
+    slicing None[:12], and it fired for every freedata invocation because
+    freedata was absent from stage 1 so this emit path never round-tripped.
+    Regression for the 2026-08-21 GEN2 stage-2 pre-flight crash."""
+    rec = {"modem": "freedata", "bin": "/home/x/tools/FreeDATA", "kind": "tree",
+           "bin_md5": None, "describe": "f522b46f", "commit": "f522b46f" * 5,
+           "pinned": True, "override": False, "problems": [],
+           "dirty_tracked": False}
+    line = format_record(rec)                 # must not raise
+    assert "freedata" in line and "n/a" in line and "FreeDATA" in line
+    assert "[pinned]" in line
+
+
+def test_format_record_shows_md5_for_a_binary_record():
+    rec = {"modem": "ardop", "bin": "/home/x/tools/ardop/ardopcf", "kind": "binary",
+           "bin_md5": "8b54ca3bceeed7e74d5c84500d08db54", "describe": "a7c9228",
+           "commit": "a7c9228" * 5, "pinned": True, "override": False,
+           "problems": [], "dirty_tracked": False}
+    line = format_record(rec)
+    assert "ardopcf" in line and "8b54ca3bceee" in line and "[pinned]" in line
+
+
+def test_format_record_round_trips_a_real_directory_capture(tmp_path):
+    """End-to-end: capture() on a directory target then format_record it -- the
+    exact freedata path, with no hand-built record."""
+    d = tmp_path / "FreeDATA"
+    d.mkdir()
+    rec = capture(str(d), modem="freedata")
+    assert rec["kind"] == "tree" and rec["bin_md5"] is None
+    line = format_record(rec)                 # must not raise
+    assert "freedata" in line

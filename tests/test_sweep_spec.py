@@ -34,6 +34,11 @@ def _write_spec(tmp_path, cells):
 
 
 def _run_main(monkeypatch, spec, out):
+    # These tests exercise the spec/label/fade surface, not equal-drive
+    # calibration; the loopback modem carries no txgain file. Opt out of the
+    # campaign calibration guard explicitly (that guard is covered by its own
+    # tests below).
+    monkeypatch.setenv("SKYW_ALLOW_UNCALIBRATED", "1")
     monkeypatch.setattr(sys, "argv", ["sweep_runner", "loopback", spec, out, "t"])
     return sweep_runner.main()
 
@@ -453,3 +458,37 @@ def test_extra_json_round_trips_through_json():
     import inspect
     src = inspect.getsource(vs)
     assert 'separators=(";"' not in src, "the invalid-JSON separator is back"
+
+
+# --- require_txgain_or_die: a campaign must be CALIBRATED (bench4 repl miss, 2026-08-22) ---
+
+def _clear_gain_env(monkeypatch):
+    for k in ("TXGAIN", "EQUAL_GAIN", "SKYW_ALLOW_UNCALIBRATED"):
+        monkeypatch.delenv(k, raising=False)
+
+
+def test_require_txgain_dies_when_uncalibrated_by_omission(tmp_path, monkeypatch):
+    """The exact bench4 failure: BENCH_ROOT has no results/<modem>_txgain.txt and
+    TXGAIN is unset -- must HARD-FAIL, not warn-and-run at TXGAIN=1.0."""
+    _clear_gain_env(monkeypatch)
+    monkeypatch.setattr(sweep_runner, "BENCH_ROOT", str(tmp_path))
+    with pytest.raises(SystemExit) as e:
+        sweep_runner.require_txgain_or_die("freedata")
+    assert "UNCALIBRATED" in str(e.value)
+
+
+def test_require_txgain_passes_when_txgain_file_present(tmp_path, monkeypatch):
+    _clear_gain_env(monkeypatch)
+    monkeypatch.setattr(sweep_runner, "BENCH_ROOT", str(tmp_path))
+    (tmp_path / "results").mkdir()
+    (tmp_path / "results" / "freedata_txgain.txt").write_text("1.6964")
+    sweep_runner.require_txgain_or_die("freedata")   # must not raise
+
+
+def test_require_txgain_explicit_escapes_do_not_raise(tmp_path, monkeypatch):
+    monkeypatch.setattr(sweep_runner, "BENCH_ROOT", str(tmp_path))
+    for k, v in (("TXGAIN", "1.5"), ("EQUAL_GAIN", "1"),
+                 ("SKYW_ALLOW_UNCALIBRATED", "1")):
+        _clear_gain_env(monkeypatch)
+        monkeypatch.setenv(k, v)
+        sweep_runner.require_txgain_or_die("ardop")   # each escape: must not raise

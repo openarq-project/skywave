@@ -232,6 +232,31 @@ def modem_txgain(modem):
     return open(path).read().strip()
 
 
+def require_txgain_or_die(modem):
+    """A campaign run must be CALIBRATED. Refuse to run silently uncalibrated:
+    that is exactly how bench4's repl/bridge blocks (2026-08-22) ran at
+    TXGAIN=1.0 -- BENCH_ROOT defaulted to the CWD (not the campaign root), so
+    results/<modem>_txgain.txt did not resolve, and the old code WARNED and ran
+    on, silently breaking the equal-drive cross-modem comparison. Now it stops.
+    Escapes (all explicit): TXGAIN in env (caller set the drive), EQUAL_GAIN=1
+    (deliberate matched-1.0), or SKYW_ALLOW_UNCALIBRATED=1 (a deliberate
+    connectivity smoke where drive level does not matter)."""
+    if ("TXGAIN" in os.environ or os.environ.get("EQUAL_GAIN", "0").strip() == "1"):
+        return
+    path = os.path.join(BENCH_ROOT, "results", f"{modem}_txgain.txt")
+    if os.path.exists(path):
+        return
+    msg = (f"no {path} and TXGAIN unset -- would run {modem} UNCALIBRATED at "
+           f"TXGAIN=1.0, silently breaking the equal-drive comparison. Fix: set "
+           f"BENCH_ROOT to the campaign root (or run from it) so "
+           f"results/{modem}_txgain.txt resolves; or pass TXGAIN=<gain>; or set "
+           f"SKYW_ALLOW_UNCALIBRATED=1 for a DELIBERATE uncalibrated smoke.")
+    if os.environ.get("SKYW_ALLOW_UNCALIBRATED", "0").strip() == "1":
+        print(f"WARNING (SKYW_ALLOW_UNCALIBRATED=1): {msg}", flush=True)
+        return
+    raise SystemExit(f"sweep_runner: {msg}")
+
+
 # Channel ladder for --calibrate-pep-stressed: clean drives the modem to its fastest
 # mode, AWGN and fading push it down through its slower/robust modes, so the max TX peak
 # across the ladder reflects the whole mode set -- not just the clean-channel mode.
@@ -872,11 +897,7 @@ def main():
     modem, spec, out = sys.argv[1], sys.argv[2], sys.argv[3]
     tag = sys.argv[4] if len(sys.argv) > 4 else "sw"
     resolve_adapter(modem)          # fail fast with the known-modem list on a typo
-    if ("TXGAIN" not in os.environ and os.environ.get("EQUAL_GAIN", "0").strip() != "1"
-            and not os.path.exists(os.path.join(BENCH_ROOT, "results", f"{modem}_txgain.txt"))):
-        print(f"WARNING: no results/{modem}_txgain.txt -- running uncalibrated at TXGAIN=1.0; "
-              f"run `sweep_runner.py --calibrate-pep {modem}` for a fair cross-modem comparison",
-              flush=True)
+    require_txgain_or_die(modem)
     cells = json.load(open(spec))
     # Fail fast on a malformed spec BEFORE any cell runs -- a bad env key surfacing at
     # cell 40 of an overnight campaign wastes the night. Cell env is restricted to

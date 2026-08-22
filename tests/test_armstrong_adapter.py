@@ -109,3 +109,22 @@ def test_sock_channel_sim_gets_default_pace_cap(monkeypatch, sock_dir):
     monkeypatch.setenv("SIM_VIRT_MAX_RATIO", "1")         # explicit export wins
     ad.launch_channel()
     assert envs[-1].get("SIM_VIRT_MAX_RATIO") == "1", envs[-1]
+
+
+def test_bitrate_and_sn_telemetry_match_armstrongs_wire_format(monkeypatch, sock_dir):
+    """armstrong emits `BITRATE {tx} {rx}` (two bare ints) and `SN {snr}` --
+    NOT the VARA/mercury `BITRATE (n) NNN BPS`. Regression for 2026-08-22: the
+    copied-from-mercury regex never matched, so peak_bitrate read 0 for every
+    armstrong row. group 1 = applied TX rate."""
+    ad = _mk_adapter(monkeypatch, sock_dir)
+    ad.scan_telemetry("A", "BITRATE 846 49")
+    ad.scan_telemetry("A", "SN 12.3")
+    ad.scan_telemetry("A", "BITRATE 421 49")
+    assert ad.modes == [846, 421]            # applied TX rate, not 0
+    assert ad.peak_bitrate() == 846
+    assert ad.snrs == [12.3]
+    # the old VARA/mercury shape must NOT be what armstrong parsing depends on;
+    # armstrong never emits parens, and a bare `BITRATE 0 0` (idle) is still read
+    ad2 = _mk_adapter(monkeypatch, sock_dir)
+    ad2.scan_telemetry("A", "BITRATE 0 0")
+    assert ad2.modes == [0]

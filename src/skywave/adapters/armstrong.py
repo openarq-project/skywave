@@ -265,7 +265,13 @@ class ArmstrongAdapter(ModemAdapter):
         return bytes(recv)
 
     def scan_telemetry(self, station, line):
-        m = re.search(r"BITRATE \(\d+\) (\d+) BPS", line)
+        # armstrong's wire format is `BITRATE {tx} {rx}` -- two bare integers
+        # (applied TX rate, armed RX rate; link_telemetry.rs:123/138), NOT the
+        # VARA/mercury `BITRATE (n) NNN BPS` shape. The old regex demanded parens
+        # + a BPS suffix and never matched, so self.modes stayed empty and
+        # peak_bitrate() read 0 for EVERY armstrong row (2026-08-22). Take group 1
+        # = the applied TX rate (the mode armstrong is transmitting at).
+        m = re.search(r"BITRATE (\d+) (\d+)", line)
         if m:
             self.modes.append(int(m.group(1)))
         s = re.search(r"\bSN ([0-9.]+)", line)

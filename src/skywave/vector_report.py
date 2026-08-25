@@ -303,33 +303,43 @@ def main(argv=None):
     for r in rows:
         key = f"{r['adapter']}:{r['label']}" if multi else r["label"]
         w = inum(r, "crc_bits", 0) or None
-        e = per_mode.setdefault(key, {"n": 0, "k": 0, "w": w})
+        # list_size: how many candidate decodes a list decoder (e.g. CA-SCL)
+        # checks per frame. Each checked candidate is an independent shot at
+        # a false CRC pass, so the expected false-decode count scales with L,
+        # not just the CRC width -- a generic gate with no L factor flags
+        # ANY list decoder (L>1) as anomalous by construction, regardless of
+        # how healthy it is. Default 1 (a single-candidate decoder, or an
+        # older corpus/adapter that predates this column) reproduces the
+        # prior behavior exactly -- fully backward compatible.
+        L = inum(r, "list_size", 1)
+        e = per_mode.setdefault(key, {"n": 0, "k": 0, "w": w, "L": L})
         e["n"] += inum(r, "crc_errors") + inum(r, "false_decode")
         e["k"] += inum(r, "false_decode")
         if w:
-            per_width[w][0] += inum(r, "crc_errors") + inum(r, "false_decode")
-            per_width[w][1] += inum(r, "false_decode")
+            per_width[(w, L)][0] += inum(r, "crc_errors") + inum(r, "false_decode")
+            per_width[(w, L)][1] += inum(r, "false_decode")
     tested = sum(1 for e in per_mode.values() if e["n"] > 0)
     m = max(1, tested)
     tot_fd = sum(e["k"] for e in per_mode.values())
 
     print(f"  false_decode       {tot_fd} event(s) in {len(fd_cells)} cell(s) "
           f"of {len(rows)}")
-    print(f"  gate               per-mode Poisson upper tail vs CRC width, "
-          f"alpha={FD_ALPHA}, Bonferroni x{m} mode(s) tested")
-    for w in sorted(per_width):
-        n, k = per_width[w]
-        lam = n * 2.0 ** -w
+    print(f"  gate               per-mode Poisson upper tail vs CRC width x "
+          f"list_size, alpha={FD_ALPHA}, Bonferroni x{m} mode(s) tested")
+    for w, L in sorted(per_width):
+        n, k = per_width[(w, L)]
+        lam = n * L * 2.0 ** -w
+        lbl = f"CRC-{w}" + (f" xL{L}" if L != 1 else "")
         p = poisson_sf(k, lam)
-        print(f"    CRC-{w:<2d} evals={n:<8d} expected={lam:.4g}  observed={k}"
+        print(f"    {lbl:<10} evals={n:<8d} expected={lam:.4g}  observed={k}"
               f"  p={p:.4g}")
-        # One aggregate test per width, uncorrected: catches a DIFFUSE fault that
-        # every per-mode test would individually absorb.
+        # One aggregate test per (width, list_size), uncorrected: catches a
+        # DIFFUSE fault that every per-mode test would individually absorb.
         if p < FD_ALPHA:
-            print(f"    -> INVALIDATION: the CRC-{w} arm as a whole admits more "
-                  f"false decodes than its width explains (p={p:.4g} < "
-                  f"{FD_ALPHA}).")
-            fail.append(f"false decodes (CRC-{w} aggregate)")
+            print(f"    -> INVALIDATION: the {lbl} arm as a whole admits more "
+                  f"false decodes than its width/list-size explains (p={p:.4g} "
+                  f"< {FD_ALPHA}).")
+            fail.append(f"false decodes ({lbl} aggregate)")
     for key, e in sorted(per_mode.items(), key=lambda kv: -kv[1]["k"]):
         if e["k"] == 0:
             continue
@@ -339,12 +349,13 @@ def main(argv=None):
                   "a CRC width. Have the adapter report crc_bits for this mode.")
             fail.append(f"false decodes ({key}, unknown CRC width)")
             continue
-        lam = e["n"] * 2.0 ** -e["w"]
+        lam = e["n"] * e["L"] * 2.0 ** -e["w"]
         p = poisson_sf(e["k"], lam)
         padj = min(1.0, p * m)
         verdict = ("INVALIDATION" if padj < FD_ALPHA
-                   else "within CRC-width chance")
-        print(f"    {key} (CRC-{e['w']}): evals={e['n']} expected={lam:.4g} "
+                   else "within CRC-width/list-size chance")
+        lbl = f"CRC-{e['w']}" + (f" xL{e['L']}" if e["L"] != 1 else "")
+        print(f"    {key} ({lbl}): evals={e['n']} expected={lam:.4g} "
               f"observed={e['k']}  p={p:.4g} p_adj={padj:.4g}  -> {verdict}")
         for r in fd_cells:
             k2 = f"{r['adapter']}:{r['label']}" if multi else r["label"]

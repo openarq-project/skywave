@@ -86,6 +86,12 @@ FIELDS = [
     # false_decode gate; empty means the adapter did not report one and the gate
     # falls back to zero tolerance for that mode.
     "crc_bits",
+    # Number of candidate decodes a list decoder (e.g. CA-SCL) checks per
+    # frame -- each is an independent shot at a false CRC pass, so the
+    # false_decode gate's expectation is lam = n * list_size * 2**-crc_bits.
+    # Empty/absent means 1 (a single-candidate decoder); fully backward
+    # compatible with corpora that predate this column.
+    "list_size",
     "extra_json", "batches", "seed_base", "cold", "host", "arch",
     # Content hash of the driver binary. host+arch pin the machine, not the
     # executable; a mid-campaign driver swap would otherwise look clean.
@@ -327,6 +333,7 @@ def do_mode(adapter, mode, presets, snrs, args, done, writer, wlock, stats):
             "peak_dbfs": mode.get("peak_dbfs", ""),
             "papr_db": mode.get("papr_db", ""),
             "crc_bits": mode.get("crc_bits") if mode.get("crc_bits") else "",
+            "list_size": mode.get("list_size") if mode.get("list_size") else "",
             "extra_json": json.dumps(
                 {**a["extra"], "s_offset_db": f"{s_offset_db:.3f}"},
                 separators=(",", ":")),

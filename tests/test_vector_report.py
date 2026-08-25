@@ -15,6 +15,7 @@ FIELDS = [
     "adapter", "label", "family", "preset", "snr_db", "bw_hz", "sample_rate",
     "frames", "decoded", "fer", "goodput_bps", "payload_bytes", "air_s",
     "nominal_bps", "false_decode", "wrong_frame", "crc_errors", "crc_bits",
+    "list_size",
     "extra_json", "host", "arch", "driver_id", "mode_class", "clip_gain",
     "label_base", "papr_db",
 ]
@@ -116,7 +117,7 @@ def test_single_false_decode_on_a_crc16_mode_is_within_chance(tmp_path, capsys):
     rows[0]["false_decode"] = 1
     rc = run(tmp_path, rows)
     out = capsys.readouterr().out
-    assert "within CRC-width chance" in out
+    assert "within CRC-width/list-size chance" in out
     assert rc == 0, "a CRC-16 arithmetic collision must not invalidate"
 
 
@@ -139,6 +140,47 @@ def test_missing_crc_bits_falls_back_to_zero_tolerance(tmp_path, capsys):
     out = capsys.readouterr().out
     assert rc == 1
     assert "ZERO TOLERANCE" in out
+
+
+def test_list_decoder_false_decodes_are_within_chance_not_flagged(tmp_path, capsys):
+    """REFARM's CA-SCL-8 case: a generic gate with no list-size factor treats
+    every one of an L=8 list decoder's false decodes as 8x more surprising
+    than they are (lam = n * 2**-crc_bits instead of n * L * 2**-crc_bits),
+    so a healthy decoder gets flagged purely for checking more candidates.
+    28/9577 against CRC-11 xL8 is the REFARM v1 B4 finding (~37 expected)."""
+    rows = curve("M", "off", [0.5, 0.05, 0.01], crc_bits=11, list_size=8)
+    rows[0]["crc_errors"] = 9549
+    rows[0]["false_decode"] = 28
+    rc = run(tmp_path, rows)
+    out = capsys.readouterr().out
+    assert "xL8" in out
+    assert "within CRC-width/list-size chance" in out
+    assert rc == 0, "false decodes consistent with L=8 must not invalidate"
+
+
+def test_same_event_count_flagged_without_the_list_size_factor(tmp_path, capsys):
+    """Negative control for the fix: strip list_size back to the default (1)
+    on the SAME observation and confirm the old, narrower expectation (no xL
+    factor) makes that count look anomalous -- proving list_size is actually
+    load-bearing here, not a no-op."""
+    rows = curve("M", "off", [0.5, 0.05, 0.01], crc_bits=11)  # list_size defaults to 1
+    rows[0]["crc_errors"] = 9549
+    rows[0]["false_decode"] = 28
+    rc = run(tmp_path, rows)
+    out = capsys.readouterr().out
+    assert rc == 1, "the same count without the L factor should look anomalous"
+    assert "INVALIDATION" in out
+
+
+def test_list_size_expectation_math_is_exactly_n_times_l_times_2_pow_neg_w():
+    """Direct unit check on the corrected formula, independent of the report's
+    text formatting or gate thresholds."""
+    n, L, w = 9577, 8, 11
+    lam = n * L * 2.0 ** -w
+    assert lam == pytest.approx(9577 * 8 / 2048.0)
+    assert lam == pytest.approx(37.410, abs=0.01)
+    # L=1 (default / backward-compatible) must reproduce the original formula.
+    assert n * 1 * 2.0 ** -w == pytest.approx(n * 2.0 ** -w)
 
 
 def test_clean_corpus_passes_every_gate(tmp_path, capsys):

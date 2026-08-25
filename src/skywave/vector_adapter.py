@@ -202,6 +202,15 @@ class VectorAdapter(abc.ABC):
         adjudicates the payload -- not a stronger check applied at some other
         layer, and not a narrower header check. Omit it if genuinely unknown;
         the scorer then falls back to zero tolerance for that mode and says so.
+
+        `list_size` (optional, default 1) is the number of candidate decodes
+        a LIST decoder (e.g. CA-SCL) checks against the CRC per frame. Each
+        checked candidate is an independent shot at a false CRC pass, so the
+        false_decode gate's expectation scales as
+        `n * list_size * 2**-crc_bits`, not just `n * 2**-crc_bits` -- report
+        it for any list-decoding mode or the gate will flag every one of its
+        false decodes as anomalous by construction, regardless of L. Omit it
+        (or report 1) for a single-candidate decoder.
         """
 
     @abc.abstractmethod

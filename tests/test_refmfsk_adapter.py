@@ -47,15 +47,20 @@ def test_polar_roundtrip_high_snr(label):
 @pytest.mark.parametrize("label", list(MODES))
 @pytest.mark.parametrize("preset", ["good", "moderate", "poor"])
 def test_fading_roundtrip_high_snr_needs_alignment_search(label, preset):
-    """Regression pin for the frame-alignment finding: vector_channel's
-    Watterson fading stage delays its whole output by a fixed
-    (HILBERT_TAPS-1)//2 samples relative to the sidecar's frame_offsets (any
-    preset other than "off" goes through the Hilbert-filtered path; "off"
-    does not). A decode() that read exactly [offset, offset+length) with no
-    alignment search would see near-total symbol confusion under EVERY
-    fading preset even at very high SNR (empirically ~7/8 and ~15/16 wrong
-    -- i.e. pure chance -- for M=8/M=16 before this was fixed). At 25 dB
-    with a benign preset this must now recover essentially everything."""
+    """Regression pin for the frame-alignment finding, now fixed AT THE
+    SOURCE (2026-08-25): vector_channel's Watterson fading stage used to
+    delay its whole output by a fixed (HILBERT_TAPS-1)//2 samples relative to
+    the sidecar's frame_offsets (any preset other than "off" went through the
+    Hilbert-filtered path; "off" did not), which a decode() reading exactly
+    [offset, offset+length) with no alignment search saw as near-total
+    symbol confusion under EVERY fading preset even at very high SNR
+    (empirically ~7/8 and ~15/16 wrong -- i.e. pure chance -- for M=8/M=16).
+    `apply_fade` now compensates the group delay itself, so this adapter's
+    two-way `_align_and_demod` pick is a cheap guard rather than a load-
+    bearing correction (see `_SYNC_GDELAY`'s updated docstring) -- kept
+    because it costs one extra alignment try and catches any residual/edge
+    misalignment for free. This test still pins the outcome: at 25 dB with a
+    benign preset this must recover essentially everything."""
     ad = build()
     with tempfile.TemporaryDirectory() as td:
         vec_path, side_path = ad.encode(label, 60, seed=17, outdir=td)

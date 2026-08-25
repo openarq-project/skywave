@@ -73,8 +73,11 @@ POSITIONAL, not content-addressed (documented deviation, same rationale as
 by construction -- a wrong nibble collides with some other frame's expected
 value about 1 time in 16 by chance). `decoded` at position i requires BOTH
 CRC-11 pass and the recovered nibble equal to `expected(i)`'s low nibble;
-`crc_bits: 11` is reported so vector_report's false-decode gate is armed
-correctly.
+`crc_bits: 11` and `list_size: 8` (this decoder's CA-SCL list width) are both
+reported so vector_report's false-decode gate is armed with the right
+expectation (lam = n * list_size * 2**-crc_bits); without list_size the gate
+would flag every one of this decoder's false decodes as anomalous purely
+because it checks 8 candidates per frame instead of 1.
 
 Pre-registered gates B1-B5 live in the design doc; this file exists to pass
 them, not to re-litigate them.
@@ -88,24 +91,26 @@ import numpy as np
 from skywave.vector_adapter import VectorAdapter, gen_payload
 from skywave.vector_channel import HILBERT_TAPS as _HILBERT_TAPS
 
-# Coarse-alignment compensation for a shared-harness property, not a REFARM
-# design choice: skywave.vector_channel's Watterson fading stage is a causal
-# FIR Hilbert filter, so ANY preset other than "off" delays its whole output
-# by exactly (HILBERT_TAPS-1)//2 samples relative to the frame_offsets the
-# sidecar declares -- documented in docs/VECTOR-ADAPTER-CONTRACT.md ("Group
-# delay ... identical across all cells, so it biases nothing") but only
-# actually harmless to a receiver that either (a) never sees fading, or
-# (b) re-acquires timing itself. A truly frame-synchronous, no-acquisition
-# receiver (this one, by design -- see the module docstring) reading exactly
-# [offset, offset+length) under a fading preset instead reads ~76% of the
-# PREVIOUS symbol and ~24% of the current one for ref_s's geometry, which
-# is indistinguishable from noise-limited failure until you plot argmax(s)
-# against truth(s-1) and see it line up. Since HILBERT_TAPS is a single
-# shared constant (not per-mode, per-preset, or per-call), the true content
-# sits at EXACTLY one of two candidate offsets -- 0 (preset "off") or this
-# gdelay (any fading preset) -- so a two-way blind pick, scored on the data
-# symbols' own peak-vs-runner-up margin (no dedicated preamble, no ground
-# truth needed), resolves it. See `_align_and_demod`.
+# HISTORICAL NOTE (fixed 2026-08-25, kept as a cheap guard): skywave.vector_
+# channel's Watterson fading stage used to be a causal FIR Hilbert filter
+# whose raw output delayed the WHOLE vector by exactly (HILBERT_TAPS-1)//2
+# samples relative to the frame_offsets the sidecar declares, for ANY preset
+# other than "off". A truly frame-synchronous, no-acquisition receiver (this
+# one, by design -- see the module docstring) reading exactly
+# [offset, offset+length) under a fading preset used to instead read ~76% of
+# the PREVIOUS symbol and ~24% of the current one for ref_s's geometry --
+# indistinguishable from noise-limited failure until you plot argmax(s)
+# against truth(s-1) and see it line up.
+#
+# `vector_channel.apply_fade` now compensates this AT THE SOURCE (trims the
+# leading gdelay samples of its own output, pads the tail), so frame_offsets
+# are trustworthy again for both "off" and any fading preset and this
+# two-way pick should trivially always choose shift=0. It is kept -- not
+# removed -- as a near-free guard: one extra alignment try per frame costs
+# nothing against the SCL decode cost, and it would silently absorb any
+# future regression of the same shape (or a harness/preset combination this
+# adapter hasn't been run against) instead of reading as noise-limited
+# failure again. See `_align_and_demod`.
 _SYNC_GDELAY = (_HILBERT_TAPS - 1) // 2
 
 FS = 8000.0
@@ -516,12 +521,14 @@ def _demod_burst(mode, burst):
 
 
 def _align_and_demod(mode, window):
-    """Try both candidate whole-burst alignments (see _SYNC_GDELAY) and keep
-    whichever the data symbols themselves back more strongly. `window` must
-    be at least burst_len + _SYNC_GDELAY samples (shorter windows -- e.g.
-    right at the end of a vector with no trailing margin -- just skip the
-    shifted candidate, matching a preset "off" vector where it can never
-    win anyway)."""
+    """Try both candidate whole-burst alignments (see _SYNC_GDELAY -- now a
+    cheap guard, not a load-bearing correction, since vector_channel fixed
+    the group delay at the source) and keep whichever the data symbols
+    themselves back more strongly. `window` must be at least
+    burst_len + _SYNC_GDELAY samples (shorter windows -- e.g. right at the
+    end of a vector with no trailing margin -- just skip the shifted
+    candidate, matching a preset "off" vector where it can never win
+    anyway)."""
     burst_len = mode.samp_per_sym * mode.data_syms
     best = None
     candidates = [0]
@@ -555,6 +562,7 @@ class RefMfskAdapter(VectorAdapter):
                 "mode_id": mode.mode_id,
                 "family": "ref-mfsk-polar",
                 "crc_bits": 11,
+                "list_size": LIST_SIZE,
                 "payload_bytes": 1,
                 "sample_rate": int(FS),
                 "air_s": side["frame_lengths"][0] / FS,

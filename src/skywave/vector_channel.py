@@ -40,9 +40,18 @@ correlation ~e^-44. Frame i is faded at virtual fade-time i*stride with the
 Hilbert history zeroed -- exact, because the signal preceding every frame really
 is silence.
 
-Group delay: the applicator's output is the input delayed by the Hilbert group
-delay (127 samples at 255 taps), uniformly for every frame and cell. Identical
-across all cells, so it biases nothing.
+Group delay: `WattersonChannel.process()` (see watterson.py) is a causal FIR
+Hilbert filter, so its raw output is the input delayed by the Hilbert group
+delay (127 samples at 255 taps). Left uncompensated, that shifts every FADED
+frame 127 samples later than the sidecar's declared frame_offsets while the
+"off" (AWGN-only) path has no such shift -- so a frame-synchronous receiver
+that trusts the sidecar reads a smeared boundary under any fading preset and
+nothing under "off". Fixed 2026-08-25: `apply_fade` below fetches
+`HILBERT_TAPS//2` extra samples of trailing context per frame, feeds the
+whole thing through `process()`, then drops the first `gdelay` output
+samples before writing into `out[a:b]` -- this is a pure re-slice (trim
+head, the tail already had margin), so the Watterson physics per sample are
+untouched; only which output sample lands at which absolute index changes.
 """
 import argparse
 import json
@@ -155,15 +164,26 @@ def apply_fade(vec, side, preset, seed, filter_mode="milstd"):
     ch = WattersonChannel(fs, delay_ms, doppler_hz, dur_s, seed,
                           hilbert_taps=HILBERT_TAPS, filter_mode=filter_mode)
     stride_samples = int(round(stride_s * fs))
+    gdelay = ch.gdelay  # Hilbert group delay in samples; see module docstring
 
     gains_db = []
     for i in range(n):
         a = offsets[i]
         b = min(a + lengths[i] + tail, out.size)
-        block = np.asarray(vec[a:b], dtype=np.float64)
+        # Fetch gdelay EXTRA trailing samples so that after process() delays
+        # everything by gdelay, dropping its first gdelay output samples
+        # restores exact alignment with [a, b) -- a pure re-slice, not a
+        # resample: process()'s own physics (fade draw, multipath, hf_gain)
+        # are computed identically either way.
+        b_ext = min(b + gdelay, out.size)
+        block = np.asarray(vec[a:b_ext], dtype=np.float64)
         ch.t = i * stride_samples
         ch.hist[:] = 0.0
-        faded = ch.process(block).copy()
+        faded_full = ch.process(block)
+        want = b - a
+        faded = faded_full[gdelay:gdelay + want]
+        if faded.size < want:              # only at the very end of the vector
+            faded = np.pad(faded, (0, want - faded.size))
         out[a:b] = faded
         clean = np.asarray(vec[a:a + lengths[i]], dtype=np.float64)
         cp = float(np.dot(clean, clean))

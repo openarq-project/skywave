@@ -164,6 +164,70 @@ class FmPortRx:
         return mono
 
 
+class FmDeviationLimit:
+    """TX deviation limiting: the audio drives an FM modulator with a hard
+    deviation ceiling, and audio peaks above it are clipped.
+
+    This is the stage that makes PAPR *cost* something on FM. On HF a high-PAPR
+    waveform is penalised against a PEP-limited PA; on FM the penalty is
+    different in kind -- deviation is a hard, legally-bounded ceiling, and audio
+    peaks that would exceed it are simply flattened, so a high-PAPR waveform
+    either clips or has to back its drive off and lose SNR. It also sits AFTER
+    pre-emphasis in a real transmitter, which matters: pre-emphasis raises the
+    high-frequency peaks, so an emphasized path clips a given waveform harder
+    than a flat one does.
+
+    Parameterized by HEADROOM, not by an absolute level: `headroom_db` is how
+    far the deviation ceiling sits above the signal's RMS. That makes the knob
+    directly comparable across modes -- a mode whose PAPR is below the headroom
+    is untouched, one above it clips, and the difference IS the PAPR penalty.
+    An absolute ceiling would silently mean a different thing for every mode.
+
+    `kind`:
+      hard  -- ideal limiter, np.clip. The pessimistic reading, and what DART's
+               own hostile-path cell used (`--clip 0.08`).
+      soft  -- tanh knee reaching the same asymptote, a compressor rather than a
+               clipper. Real radios sit between the two; run both if a verdict
+               turns on it.
+
+    Reference level is supplied by the caller (`set_reference`) rather than
+    measured per block, so the limiter does not chase the signal's own envelope
+    -- a per-block AGC would defeat the entire measurement.
+    """
+
+    def __init__(self, fs, headroom_db, kind="hard"):
+        if kind not in ("hard", "soft"):
+            raise ValueError(f"unknown limiter kind '{kind}' (use hard|soft)")
+        self.fs = fs
+        self.headroom_db = float(headroom_db)
+        self.kind = kind
+        self.ceiling = None
+
+    def set_reference(self, rms):
+        """Set the ceiling from a reference RMS (measured over the signal's
+        active regions by the caller, so inter-burst silence cannot dilute it)."""
+        self.ceiling = float(rms) * (10.0 ** (self.headroom_db / 20.0))
+        return self.ceiling
+
+    def process(self, mono):
+        if self.ceiling is None:
+            raise RuntimeError("FmDeviationLimit.set_reference() first")
+        c = self.ceiling
+        if c <= 0:
+            return mono
+        if self.kind == "hard":
+            return np.clip(mono, -c, c)
+        return c * np.tanh(mono / c)
+
+    def clipped_fraction(self, mono):
+        """Fraction of samples at or beyond the ceiling -- the diagnostic that
+        says whether a cell actually exercised the limiter. A drive-policy cell
+        that reports 0 here measured nothing."""
+        if self.ceiling is None or self.ceiling <= 0:
+            return 0.0
+        return float(np.mean(np.abs(mono) >= self.ceiling))
+
+
 class SquelchGate:
     """Time-gated RX audio mute (the FM port design's port-profile table):
     models carrier-squelch attack (open_ms after carrier up; +tone_ms CTCSS

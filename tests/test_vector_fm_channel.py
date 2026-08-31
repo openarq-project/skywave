@@ -327,3 +327,99 @@ def test_determinism(tmp_path):
               snr_db=6.0, seed=42)
         outs.append(read_vector(op))
     assert np.array_equal(outs[0], outs[1]), "same seed must be byte-identical"
+
+
+# ---- deviation limiting --------------------------------------------------
+
+def test_limiter_engages_only_below_the_modes_papr():
+    """The headroom knob has to mean the same thing across modes, which is the
+    whole reason it is specified in dB above RMS rather than as an absolute
+    level. Above the signal's own PAPR nothing should clip."""
+    from skywave.vector_fm_channel import apply_deviation_limit
+    n, flen, gap = 6, 8000, 2000
+    rng = np.random.default_rng(3)
+    vec, offs, lens = _tone_frames(n, flen, gap)
+    # give it a real crest factor: noise-like bursts, not a pure tone
+    for a, l in zip(offs, lens):
+        vec[a:a + l] = 0.15 * rng.standard_normal(l)
+    side = _sidecar(offs, lens)
+    inb = np.concatenate([vec[a:a + l] for a, l in zip(offs, lens)])
+    papr = 20 * np.log10(np.max(np.abs(inb)) / np.sqrt(np.mean(inb ** 2)))
+    _, frac_hi, _ = apply_deviation_limit(vec, side, FS, papr + 3)
+    _, frac_lo, _ = apply_deviation_limit(vec, side, FS, papr - 6)
+    assert frac_hi == 0.0, f"clipped {frac_hi} above the signal's PAPR"
+    assert frac_lo > 0.01, f"barely clipped {frac_lo} at 6 dB below PAPR"
+
+
+def test_limiter_reference_ignores_inter_frame_silence():
+    """Reference RMS comes from the sidecar's active regions. If it were taken
+    over the whole vector, the gap length the encoder happened to choose would
+    change how hard every cell clips."""
+    from skywave.vector_fm_channel import apply_deviation_limit
+    out = []
+    for gap in (1000, 20000):
+        vec, offs, lens = _tone_frames(4, 8000, gap, amp=0.3)
+        _, _, ceiling = apply_deviation_limit(_ := vec, _sidecar(offs, lens),
+                                              FS, 6.0)
+        out.append(ceiling)
+    assert abs(out[0] - out[1]) / out[0] < 0.01, (
+        f"ceiling moved with gap length: {out}")
+
+
+def test_soft_and_hard_limiters_differ_but_share_the_ceiling():
+    from skywave.vector_fm_channel import apply_deviation_limit
+    rng = np.random.default_rng(1)
+    vec, offs, lens = _tone_frames(4, 8000, 1000)
+    for a, l in zip(offs, lens):
+        vec[a:a + l] = 0.2 * rng.standard_normal(l)
+    side = _sidecar(offs, lens)
+    hard, _, c1 = apply_deviation_limit(vec, side, FS, 3.0, "hard")
+    soft, _, c2 = apply_deviation_limit(vec, side, FS, 3.0, "soft")
+    assert abs(c1 - c2) < 1e-12
+    assert float(np.max(np.abs(hard))) <= c1 * 1.000001
+    assert float(np.max(np.abs(soft))) < c1, "tanh only approaches the asymptote"
+    assert not np.allclose(hard, soft)
+
+
+# ---- carrier frequency offset --------------------------------------------
+
+def test_cfo_shifts_a_tone_by_the_requested_amount():
+    from skywave.vector_fm_channel import apply_cfo
+    n = 1 << 15
+    t = np.arange(n) / FS
+    x = np.sin(2 * np.pi * 1500.0 * t)
+    y, d = apply_cfo(x, FS, 40.0)
+    assert d > 0, "FreqShift is Hilbert-based and must report a group delay"
+
+    def peak(v):
+        # settle past the Hilbert transient before measuring
+        v = np.asarray(v[2 * d:], dtype=np.float64)
+        m = v.size
+        sp = np.abs(np.fft.rfft(v * np.hanning(m)))
+        return np.fft.rfftfreq(m, 1 / FS)[int(np.argmax(sp))]
+
+    got = peak(y) - peak(x)
+    assert abs(got - 40.0) < 5.0, f"tone moved {got:.1f} Hz, wanted +40"
+
+
+def test_cfo_is_delay_aligned_like_the_ports():
+    """Uncorrected, FreqShift's Hilbert delay would move every frame off its
+    sidecar offset -- and only in cells with CFO enabled, so it would read as
+    a CFO effect."""
+    from skywave.vector_fm_channel import apply_cfo
+    mark_at, mlen = 8000, 400
+    vec = np.zeros(24000)
+    t = np.arange(mlen) / FS
+    vec[mark_at:mark_at + mlen] = 0.5 * np.sin(2 * np.pi * 1200.0 * t)
+    find = lambda y: int(np.argmax(np.convolve(y ** 2, np.ones(mlen), "valid")))
+    y, d = apply_cfo(vec, FS, 10.0)
+    assert len(y) == len(vec)
+    assert abs(find(y) - mark_at) <= 8, (
+        f"marker moved {find(y) - mark_at} samples (gdelay {d})")
+
+
+def test_zero_cfo_is_a_passthrough():
+    from skywave.vector_fm_channel import apply_cfo
+    x = np.random.default_rng(0).standard_normal(4000) * 0.1
+    y, d = apply_cfo(x, FS, 0.0)
+    assert d == 0 and np.allclose(x, y), "off must cost nothing and change nothing"

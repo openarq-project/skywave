@@ -18,6 +18,18 @@ CHAIN ORDER -- MATCHES THE LINK PATH, WHICH IS THE POINT
     tx audio -> rig_tx (FmPortTx) -> fade (FmFade) -> [delay] ->
                 + noise * fade.noise_gain -> rig_rx (FmPortRx) -> squelch
 
+This module inserts two further stages the link path resolves separately, in
+their physical positions:
+
+    ... FmPortTx -> [FmDeviationLimit] -> {measure S} -> [FreqShift] -> FmFade ...
+
+The deviation limiter sits AFTER pre-emphasis, because that is where it sits in
+a real transmitter and it matters: pre-emphasis raises high-frequency peaks, so
+an emphasized path clips a given waveform harder than a flat one. S is measured
+AFTER the limiter -- clipping changes the power actually presented to the
+channel, and a pre-limiter S would label a clipped cell with the SNR of a
+signal that was never transmitted.
+
 This module reproduces that order. If it did not, a mode characterized on the
 vector path and the same mode run on the link path would be two different
 experiments wearing one name.
@@ -141,7 +153,7 @@ import sys
 
 import numpy as np
 
-from skywave import fm_channel, fm_rig
+from skywave import fm_channel, fm_rig, rig_effects
 from skywave.vector_adapter import load_sidecar, read_vector, write_vector
 from skywave.vector_channel import (add_awgn, apply_headroom,
                                     clean_signal_power, frame_tail, sigma_for)
@@ -227,6 +239,38 @@ def apply_rx_port(vec, fs, port, order=6, deemph_corner_hz=75.0):
 
     d = port_delay(make, fs)
     return _run_aligned(make, vec, d), d
+
+
+def apply_deviation_limit(vec, side, fs, headroom_db, kind="hard"):
+    """TX deviation limiting. -> (out, clipped_fraction, ceiling).
+
+    The reference RMS comes from the sidecar's active regions, so inter-burst
+    silence cannot dilute it and the headroom knob means the same thing
+    whatever gap the encoder chose.
+    """
+    ref = float(np.sqrt(clean_signal_power(vec, side)))
+    lim = fm_rig.FmDeviationLimit(fs, headroom_db, kind)
+    ceiling = lim.set_reference(ref)
+    frac = lim.clipped_fraction(np.asarray(vec, dtype=np.float64))
+    return lim.process(np.asarray(vec, dtype=np.float64)), frac, ceiling
+
+
+def apply_cfo(vec, fs, foff_hz, hilbert_taps=255):
+    """Static carrier-frequency offset, delay-aligned to the sidecar.
+
+    FreqShift is Hilbert-based and delays its output by the filter's group
+    delay, the same trap the port chain has: uncorrected it would shift every
+    frame off its declared offset, and only in the cells where CFO is on. Pad,
+    filter, drop the first gdelay samples -- a pure re-slice.
+    """
+    if not foff_hz:
+        return np.asarray(vec, dtype=np.float64).copy(), 0
+    fx = rig_effects.FreqShift(fs, float(foff_hz), hilbert_taps=hilbert_taps)
+    d = fx.gdelay
+    x = np.asarray(vec, dtype=np.float64)
+    padded = np.concatenate([x, np.zeros(d, dtype=np.float64)])
+    y = np.asarray(fx.process(padded), dtype=np.float64)
+    return y[d:d + x.size], d
 
 
 # --------------------------------------------------------------------------
@@ -398,7 +442,8 @@ def apply(vector_path, sidecar_path, out_path, port="micspk", fade="off",
           band="2m", snr_db=0.0, bw_hz=2500.0, seed=1, order=6,
           ctcss_hz=0.0, ctcss_amp=0.0, shadow_sigma_db=0.0, shadow_tau_s=0.0,
           squelch=False, squelch_open_ms=30.0, squelch_tone_ms=0.0,
-          squelch_carrier="frames", report_path=None):
+          squelch_carrier="frames", headroom_db=None, limit_kind="hard",
+          foff_hz=0.0, report_path=None):
     """TX port -> measure S -> fade -> AWGN -> RX port -> squelch -> headroom.
 
     -> info dict. Chain order matches `channel_sim.Link.deliver_block`; see the
@@ -413,8 +458,13 @@ def apply(vector_path, sidecar_path, out_path, port="micspk", fade="off",
     spec = resolve_fade(fade, band)
 
     tx, d_tx = apply_tx_port(vec, fs, port, order, ctcss_hz, ctcss_amp)
-    S = clean_signal_power(tx, side)          # post-port, pre-fade (see above)
+    clip_frac, ceiling = 0.0, None
+    if headroom_db is not None:
+        tx, clip_frac, ceiling = apply_deviation_limit(
+            tx, side, fs, headroom_db, limit_kind)
+    S = clean_signal_power(tx, side)      # post-port, post-limiter, pre-fade
     sigma = sigma_for(S, fs, bw_hz, snr_db)
+    tx, d_cfo = apply_cfo(tx, fs, foff_hz)
     faded, gains_db, ngain = apply_fm_fade(tx, side, spec, seed,
                                            shadow_sigma_db, shadow_tau_s)
     noisy = add_awgn_shaped(faded, sigma, seed + 1,
@@ -440,7 +490,10 @@ def apply(vector_path, sidecar_path, out_path, port="micspk", fade="off",
         "shadow_tau_s": shadow_tau_s,
         "snr_db": snr_db, "bw_hz": bw_hz, "sample_rate": fs,
         "signal_power": S, "sigma": sigma,
-        "tx_port_delay": d_tx, "rx_port_delay": d_rx,
+        "tx_port_delay": d_tx, "rx_port_delay": d_rx, "cfo_delay": d_cfo,
+        "headroom_db": headroom_db, "limit_kind": limit_kind if headroom_db is not None else None,
+        "clipped_fraction": clip_frac, "clip_ceiling": ceiling,
+        "foff_hz": foff_hz,
         "ctcss_hz": ctcss_hz,
         "squelch": bool(squelch),
         "fade_seed": seed, "noise_seed": seed + 1,
@@ -482,13 +535,20 @@ def main():
     ap.add_argument("--squelch-tone-ms", type=float, default=0.0)
     ap.add_argument("--squelch-carrier", default="frames",
                     choices=("frames", "energy"))
+    ap.add_argument("--headroom-db", type=float, default=None,
+                    help="TX deviation ceiling above the signal RMS; below the "
+                         "mode's PAPR it clips. Omit for no limiting.")
+    ap.add_argument("--limit-kind", default="hard", choices=("hard", "soft"))
+    ap.add_argument("--foff-hz", type=float, default=0.0,
+                    help="static carrier-frequency offset")
     ap.add_argument("--report", default="")
     a = ap.parse_args()
 
     info = apply(a.inp, a.sidecar, a.out, a.port, a.fade, a.band, a.snr, a.bw,
                  a.seed, a.order, a.ctcss_hz, a.ctcss_amp, a.shadow_sigma_db,
                  a.shadow_tau_s, a.squelch, a.squelch_open_ms,
-                 a.squelch_tone_ms, a.squelch_carrier, a.report or None)
+                 a.squelch_tone_ms, a.squelch_carrier, a.headroom_db,
+                 a.limit_kind, a.foff_hz, a.report or None)
     g = info["frame_gain_db"]
     msg = (f"vector_fm_channel: port={info['port']} "
            f"fade={info['fade_desc'] or 'off'}"

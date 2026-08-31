@@ -423,3 +423,53 @@ def test_zero_cfo_is_a_passthrough():
     x = np.random.default_rng(0).standard_normal(4000) * 0.1
     y, d = apply_cfo(x, FS, 0.0)
     assert d == 0 and np.allclose(x, y), "off must cost nothing and change nothing"
+
+
+# ---- codec-in-the-loop -----------------------------------------------------
+
+def test_codec_stage_is_transparent_for_an_identity_runner():
+    """A pass-through codec must change nothing and report zero lag, or every
+    codec cell would carry an unattributed offset."""
+    import shutil
+    from skywave.vector_fm_channel import apply_codec
+    x = np.random.default_rng(0).standard_normal(20000) * 0.1
+    out, lag = apply_codec(x, FS, lambda i, o: shutil.copyfile(i, o))
+    assert lag == 0
+    assert np.allclose(np.asarray(out, np.float32), np.asarray(x, np.float32),
+                       atol=1e-6)
+
+
+def test_codec_stage_measures_and_removes_a_known_delay():
+    """The lag is MEASURED, not taken from a codec's nominal figure: filterbank
+    delay and the caller's framing both contribute, and a frame-synchronous
+    receiver reading the sidecar needs the real one."""
+    from skywave.vector_adapter import read_vector, write_vector
+    from skywave.vector_fm_channel import apply_codec
+    D = 73          # the delay HTCommander measured for SBC, and we reproduce
+
+    def delaying(i, o):
+        v = np.asarray(read_vector(i), dtype=np.float64)
+        write_vector(o, np.concatenate([np.zeros(D), v])[:v.size])
+
+    mark, mlen = 6000, 300
+    x = np.zeros(20000)
+    t = np.arange(mlen) / FS
+    x[mark:mark + mlen] = 0.5 * np.sin(2 * np.pi * 1200.0 * t)
+    out, lag = apply_codec(x, FS, delaying)
+    assert lag == D, f"measured lag {lag}, planted {D}"
+    found = int(np.argmax(np.convolve(np.asarray(out) ** 2,
+                                      np.ones(mlen), "valid")))
+    assert abs(found - mark) <= 4, "marker not restored to its sidecar offset"
+
+
+def test_codec_stage_preserves_length():
+    from skywave.vector_adapter import read_vector, write_vector
+    from skywave.vector_fm_channel import apply_codec
+
+    def truncating(i, o):
+        v = np.asarray(read_vector(i), dtype=np.float64)
+        write_vector(o, v[:-500])          # codecs drop a partial last frame
+
+    x = np.random.default_rng(1).standard_normal(20000) * 0.1
+    out, _ = apply_codec(x, FS, truncating)
+    assert out.size == x.size, "stage must return a vector the sidecar still fits"

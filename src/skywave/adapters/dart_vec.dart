@@ -41,6 +41,11 @@ import 'dart:typed_data';
 
 import 'dart_constellation.dart';
 import 'dart_modem.dart';
+import 'dart_preamble.dart';
+import 'sbc_decoder.dart';
+import 'sbc_encoder.dart';
+import 'sbc_enums.dart';
+import 'sbc_frame.dart';
 import 'dart_ofdm.dart';
 
 const int kSampleRate = 32000;
@@ -277,6 +282,7 @@ void _cmdDecode(Map<String, String> a) {
   DartModem? warm;
   final out = <Map<String, dynamic>>[];
   int syncCount = 0;
+  int preambleCount = 0;
   for (int i = 0; i < offsets.length; i++) {
     final from = math.max(0, offsets[i] - lead);
     final to = math.min(vec.length, offsets[i] + lengths[i] + trail);
@@ -284,20 +290,42 @@ void _cmdDecode(Map<String, String> a) {
     // cold: a receiver with NO memory of the previous frame. Constructed
     // fresh, never reset -- a reset can leave last-good state behind.
     final modem = cold ? DartModem() : (warm ??= DartModem());
+    // STAGE SPLIT. `decode()` returning null conflates three different
+    // failures: the correlator never found a preamble, the preamble was found
+    // but the 297 ms mode-0 header did not decode, or the payload ran off the
+    // end of the buffer. Reporting one flag for all three cannot answer "which
+    // stage is the bottleneck", which is the question this instrument exists
+    // for. detectPreamble() is the modem's own public detector, so asking it
+    // first costs one extra correlation and separates stage 1 from stage 2.
+    PreambleDetection? det;
+    try {
+      det = modem.detectPreamble(pcm);
+    } catch (_) {
+      det = null;
+    }
+    final bool found = det != null && det.position >= 0;
+    if (found) preambleCount++;
     DartDecodeResult? r;
     try {
-      r = modem.decode(pcm);
+      r = modem.decode(pcm, detection: found ? det : null);
     } catch (_) {
       r = null;
     }
     if (r == null) {
-      out.add({'frame': i, 'sync': false});
+      out.add({
+        'frame': i,
+        'sync': false,
+        'preamble_found': found,
+        'detect_corr': found ? det.correlation : null,
+      });
       continue;
     }
     syncCount++;
     out.add({
       'frame': i,
       'sync': true,
+      'preamble_found': found,
+      'detect_corr': found ? det.correlation : null,
       'crc_ok': r.crcOk,
       'mode_index': r.header.modeIndex,
       'seq': r.header.seqNum,
@@ -312,8 +340,85 @@ void _cmdDecode(Map<String, String> a) {
   }
   stdout.writeln(jsonEncode({
     'frames': offsets.length,
+    'preamble_count': preambleCount,
     'sync_count': syncCount,
     'results': out,
+  }));
+}
+
+// -------------------------------------------------------------- sbc codec
+
+/// PCM -> SBC -> PCM round trip, using HTCommander's own SBC implementation.
+///
+/// This is the Bluetooth hop skywave otherwise cannot model. Every DART frame
+/// crosses SBC TWICE -- app->radio on transmit and radio->app on receive -- and
+/// the two directions are NOT symmetric: the app encodes at bitpool 40 with SNR
+/// allocation for data frames, while the radio's outgoing stream is fixed at
+/// bitpool 18 by its firmware and (presumably) loudness allocation. The return
+/// path is the lower-quality direction and nothing in the app can change it.
+///
+/// Why it matters more than a bitrate figure suggests: SBC is a SUBBAND codec,
+/// 8 subbands of 2000 Hz each at 32 kHz, and it allocates bits per subband. All
+/// nine of DART's subcarriers fall in just TWO of them -- 500..1750 Hz in
+/// subband 0 and 2000..2500 Hz in subband 1 -- so the allocation decides the
+/// quantization noise on either side of a 2000 Hz step that sits right through
+/// the middle of the signal. That is exactly the cross-carrier SNR tilt that
+/// DFT-spread precoding converts into a uniform per-symbol penalty.
+void _cmdSbc(Map<String, String> a) {
+  final vec = _readF32(a['in']!);
+  final frame = SbcFrame()
+    ..frequency = SbcFrequency.freq32K
+    ..mode = SbcMode.mono
+    ..blocks = int.parse(a['blocks'] ?? '16')
+    ..subbands = int.parse(a['subbands'] ?? '8')
+    ..bitpool = int.parse(a['bitpool'] ?? '40')
+    ..allocationMethod = (a['alloc'] ?? 'snr') == 'loudness'
+        ? SbcBitAllocationMethod.loudness
+        : SbcBitAllocationMethod.snr;
+
+  final enc = SbcEncoder();
+  final dec = SbcDecoder();
+  final int per = frame.blocks * frame.subbands;
+  final out = Float64List(vec.length);
+  int written = 0;
+  int frames = 0, failed = 0;
+  for (int off = 0; off < vec.length; off += per) {
+    final buf = Int16List(per);
+    for (int i = 0; i < per; i++) {
+      final int j = off + i;
+      if (j >= vec.length) break;
+      final int v = (vec[j] * 32768.0).round();
+      buf[i] = v > 32767 ? 32767 : (v < -32768 ? -32768 : v);
+    }
+    final encoded = enc.encode(buf, null, frame);
+    if (encoded == null) {
+      failed++;
+      continue;
+    }
+    final r = dec.decode(encoded);
+    if (!r.success) {
+      failed++;
+      continue;
+    }
+    frames++;
+    for (int i = 0; i < r.pcmLeft.length && written < out.length; i++) {
+      out[written++] = r.pcmLeft[i] / 32768.0;
+    }
+  }
+  _writeF32(a['out']!, out);
+  stdout.writeln(jsonEncode({
+    'frames': frames,
+    'failed': failed,
+    'samples_in': vec.length,
+    'samples_out': written,
+    // Analysis+synthesis filterbank delay, from the codec itself.
+    'delay_samples': frame.getDelay(),
+    'frame_bytes': frame.getFrameSize(),
+    'bitrate_bps': frame.getBitrate(),
+    'bitpool': frame.bitpool,
+    'alloc': frame.allocationMethod == SbcBitAllocationMethod.snr
+        ? 'snr'
+        : 'loudness',
   }));
 }
 
@@ -351,6 +456,9 @@ void main(List<String> argv) {
       break;
     case 'decode':
       _cmdDecode(a);
+      break;
+    case 'sbc':
+      _cmdSbc(a);
       break;
     default:
       stderr.writeln('dart_vec: unknown command $cmd');

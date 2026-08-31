@@ -55,6 +55,14 @@ from skywave.vector_adapter import (VectorAdapter, VectorContractError,
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 ENTRYPOINT = os.path.join(HERE, "dart_vec.dart")
+#: SBC sources, copied alongside so the shim can model the Bluetooth hop with
+#: the app's OWN codec rather than a lookalike. Same clean-room property as the
+#: hamlib files: dart:math / dart:typed_data only.
+SBC_FILES = (
+    "sbc_bit_stream.dart", "sbc_decoder.dart", "sbc_decoder_tables.dart",
+    "sbc_encoder.dart", "sbc_encoder_tables.dart", "sbc_enums.dart",
+    "sbc_frame.dart", "sbc_tables.dart",
+)
 #: The DART sources this adapter needs. Anything else in hamlib/ is not copied.
 HAMLIB_FILES = (
     "dart_constellation.dart", "dart_fsk.dart", "dart_ldpc.dart",
@@ -111,6 +119,7 @@ class DartVectorAdapter(VectorAdapter):
             raise VectorContractError("DART_PAYLOAD_BYTES must be > 0")
         self._modes = None
         self._build = None
+        self.have_sbc = False
 
     # ---- build -----------------------------------------------------------
 
@@ -124,6 +133,17 @@ class DartVectorAdapter(VectorAdapter):
         os.makedirs(os.path.join(d, "bin"), exist_ok=True)
         for f in HAMLIB_FILES:
             shutil.copy2(os.path.join(self.hamlib, f), os.path.join(d, "bin", f))
+        # Flat alongside the hamlib files: the SBC sources import each other
+        # by bare filename, exactly as the hamlib ones do.
+        sbc_src = os.path.join(os.path.dirname(self.hamlib), "sbc")
+        if os.path.isdir(sbc_src):
+            got = 0
+            for f in SBC_FILES:
+                src = os.path.join(sbc_src, f)
+                if os.path.isfile(src):
+                    shutil.copy2(src, os.path.join(d, "bin", f))
+                    got += 1
+            self.have_sbc = got == len(SBC_FILES)
         shutil.copy2(ENTRYPOINT, os.path.join(d, "bin", "dart_vec.dart"))
         with open(os.path.join(d, "pubspec.yaml"), "w") as f:
             f.write('name: dart_vec\nenvironment:\n  sdk: ">=3.0.0 <4.0.0"\n')
@@ -224,12 +244,17 @@ class DartVectorAdapter(VectorAdapter):
         out = self._run(args)
 
         decoded = wrong_frame = false_decode = crc_errors = duplicates = 0
+        hdr_fail = 0
         snr_sum = evm_sum = corr_sum = drift_sum = 0.0
         nq = ndrift = 0
         seen = set()
         import base64
         for r in out["results"]:
             if not r.get("sync"):
+                # preamble found but decode() still failed => the 297 ms mode-0
+                # header is what broke, not acquisition
+                if r.get("preamble_found"):
+                    hdr_fail += 1
                 continue
             if r.get("snr_db") is not None:
                 snr_sum += float(r["snr_db"])
@@ -265,6 +290,11 @@ class DartVectorAdapter(VectorAdapter):
             "duplicates": duplicates,
             "crc_errors": crc_errors,
             "sync_count": int(out.get("sync_count", 0)),
+            # Stage decomposition: preamble_count >= sync_count >= decoded.
+            # preamble_count - sync_count is header loss; sync_count - decoded
+            # (minus crc_errors) is payload loss.
+            "preamble_count": int(out.get("preamble_count", 0)),
+            "header_fail": hdr_fail,
         }
         if nq:
             res["mean_snr_db"] = snr_sum / nq      # a CORE key: weighted properly
@@ -288,6 +318,19 @@ class DartVectorAdapter(VectorAdapter):
             res["drift_n"] = ndrift
             res["drift_sum_mdeg"] = int(round(drift_sum * 1000))
         return res
+
+    def sbc_roundtrip(self, in_path, out_path, bitpool=40, alloc="snr",
+                      blocks=16, subbands=8):
+        """PCM -> SBC -> PCM through HTCommander's own codec. -> info dict.
+
+        Direction matters and is the caller's to set: app->radio is bitpool 40
+        with SNR allocation (what the app sends for data frames); radio->app is
+        bitpool 18, fixed by the radio firmware, and its allocation method is
+        signalled per frame rather than chosen by the app.
+        """
+        return self._run(["sbc", "--in", in_path, "--out", out_path,
+                          "--bitpool", str(bitpool), "--alloc", alloc,
+                          "--blocks", str(blocks), "--subbands", str(subbands)])
 
     def __del__(self):
         if getattr(self, "_build", None):

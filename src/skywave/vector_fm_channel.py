@@ -149,7 +149,9 @@ in f32 full-scale and converts, because the vector path is f32.
 """
 import argparse
 import json
+import os
 import sys
+import tempfile
 
 import numpy as np
 
@@ -271,6 +273,59 @@ def apply_cfo(vec, fs, foff_hz, hilbert_taps=255):
     padded = np.concatenate([x, np.zeros(d, dtype=np.float64)])
     y = np.asarray(fx.process(padded), dtype=np.float64)
     return y[d:d + x.size], d
+
+
+def apply_codec(vec, fs, runner, tmpdir=None, max_lag=4096):
+    """Round-trip the vector through a lossy audio CODEC. -> (out, lag).
+
+    This is the Bluetooth hop, and it is the stage that separates a bench from
+    the path DART actually runs on: every frame crosses SBC twice, app->radio
+    and radio->app, and the two directions are not symmetric.
+
+    `runner(in_path, out_path)` does the round trip; skywave stays codec-
+    agnostic and the adapter supplies the backend (the DART adapter uses
+    HTCommander's own Dart SBC, so the app-side encode is the real one rather
+    than a lookalike). Any PCM-in/PCM-out codec works -- SBC, a vocoder, Opus.
+
+    Why a codec is not just "more noise": a subband codec quantizes per
+    subband, so its noise is SHAPED, and at 32 kHz with 8 subbands the band
+    edges land at 2000 Hz intervals. A waveform whose carriers straddle a
+    subband boundary gets a STEP in SNR through the middle of itself, which is
+    exactly what DFT-spread precoding converts into a uniform per-symbol
+    penalty. Modelling it as AWGN would miss the mechanism entirely.
+
+    The lag is MEASURED by cross-correlation rather than taken from the codec's
+    nominal figure: filterbank delay and the caller's framing both contribute,
+    and a frame-synchronous receiver reading the sidecar needs the real one.
+    Trimmed as a pure re-slice, as with the port chain.
+    """
+    import subprocess  # noqa: F401  (runner may shell out; kept explicit)
+    d = tmpdir or tempfile.mkdtemp(prefix="skyw-codec-")
+    ip = os.path.join(d, "codec_in.f32")
+    op = os.path.join(d, "codec_out.f32")
+    x = np.asarray(vec, dtype=np.float64)
+    write_vector(ip, x)
+    runner(ip, op)
+    y = np.asarray(read_vector(op), dtype=np.float64)
+    if y.size == 0:
+        raise SystemExit("vector_fm_channel: codec produced an empty vector")
+    n = min(x.size, y.size, max_lag * 8)
+    xc = x[:n] - x[:n].mean()
+    yc = y[:n] - y[:n].mean()
+    c = np.correlate(yc, xc, mode="full")
+    lo = max(0, (n - 1) - max_lag)
+    hi = min(c.size, (n - 1) + max_lag + 1)
+    lag = int(np.argmax(np.abs(c[lo:hi]))) + lo - (n - 1)
+    out = np.zeros_like(x)
+    if lag >= 0:
+        m = min(x.size, y.size - lag)
+        if m > 0:
+            out[:m] = y[lag:lag + m]
+    else:
+        m = min(x.size + lag, y.size)
+        if m > 0:
+            out[-lag:-lag + m] = y[:m]
+    return out, lag
 
 
 # --------------------------------------------------------------------------
@@ -443,7 +498,7 @@ def apply(vector_path, sidecar_path, out_path, port="micspk", fade="off",
           ctcss_hz=0.0, ctcss_amp=0.0, shadow_sigma_db=0.0, shadow_tau_s=0.0,
           squelch=False, squelch_open_ms=30.0, squelch_tone_ms=0.0,
           squelch_carrier="frames", headroom_db=None, limit_kind="hard",
-          foff_hz=0.0, report_path=None):
+          foff_hz=0.0, codec_tx=None, codec_rx=None, report_path=None):
     """TX port -> measure S -> fade -> AWGN -> RX port -> squelch -> headroom.
 
     -> info dict. Chain order matches `channel_sim.Link.deliver_block`; see the
@@ -457,6 +512,10 @@ def apply(vector_path, sidecar_path, out_path, port="micspk", fade="off",
     fs = int(side["sample_rate"])
     spec = resolve_fade(fade, band)
 
+    # app -> radio codec hop, BEFORE the radio's own audio shaping
+    lag_tx = lag_rx = 0
+    if codec_tx is not None:
+        vec, lag_tx = apply_codec(vec, fs, codec_tx)
     tx, d_tx = apply_tx_port(vec, fs, port, order, ctcss_hz, ctcss_amp)
     clip_frac, ceiling = 0.0, None
     if headroom_db is not None:
@@ -476,6 +535,9 @@ def apply(vector_path, sidecar_path, out_path, port="micspk", fade="off",
                              "(data9600 is the squelchless discriminator tap)")
         rx = apply_squelch(rx, side, fs, squelch_open_ms, squelch_tone_ms,
                            seed=seed, carrier=squelch_carrier)
+    # radio -> app codec hop, LAST: the radio encodes what it demodulated.
+    if codec_rx is not None:
+        rx, lag_rx = apply_codec(rx, fs, codec_rx)
     write_vector(out_path, apply_headroom(rx))
 
     info = {
@@ -494,6 +556,8 @@ def apply(vector_path, sidecar_path, out_path, port="micspk", fade="off",
         "headroom_db": headroom_db, "limit_kind": limit_kind if headroom_db is not None else None,
         "clipped_fraction": clip_frac, "clip_ceiling": ceiling,
         "foff_hz": foff_hz,
+        "codec_tx": codec_tx is not None, "codec_rx": codec_rx is not None,
+        "codec_lag_tx": lag_tx, "codec_lag_rx": lag_rx,
         "ctcss_hz": ctcss_hz,
         "squelch": bool(squelch),
         "fade_seed": seed, "noise_seed": seed + 1,

@@ -45,6 +45,7 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 import numpy as np
 
 from skywave import vector_channel as vc
+from skywave import vector_fm_channel as vfm
 from skywave.vector_adapter import (load_sidecar, read_vector, validate_sidecar,
                                     write_vector)
 from skywave.watterson import PRESETS
@@ -92,6 +93,10 @@ FIELDS = [
     # Empty/absent means 1 (a single-candidate decoder); fully backward
     # compatible with corpora that predate this column.
     "list_size",
+    # FM stage (empty on HF rows). `preset` carries the FM fade string when
+    # fm_port is set, so these say WHICH channel that preset was resolved on --
+    # an FM row and an HF row with the same preset name are not the same cell.
+    "fm_port", "fm_fade_kind", "fm_band", "fm_shadow", "fm_squelch",
     "extra_json", "batches", "seed_base", "cold", "host", "arch",
     # Content hash of the driver binary. host+arch pin the machine, not the
     # executable; a mid-campaign driver swap would otherwise look clean.
@@ -244,16 +249,34 @@ def do_mode(adapter, mode, presets, snrs, args, done, writer, wlock, stats):
             vec = read_vector(vec_path)
             validate_sidecar(side, vector_len=vec.size)
             fs = int(side["sample_rate"])
-            S = vc.clean_signal_power(vec, side)
+            # FM: the TX port shapes the signal BEFORE it reaches the channel,
+            # so S -- and therefore every labeled SNR -- must be measured on the
+            # port-shaped vector. Measuring it pre-port would carry a mode-shape
+            # constant, the same error the Option-A ruling removed on HF.
+            # See vector_fm_channel's docstring.
+            base = vec
+            if args.fm_port:
+                base, _ = vfm.apply_tx_port(vec, fs, args.fm_port,
+                                            args.fm_order, args.fm_ctcss_hz,
+                                            args.fm_ctcss_amp)
+            S = vc.clean_signal_power(base, side)
             # Option-A transition: record the old-S/new-S conversion offset so
             # pre-convention floors remain convertible (the report prints it).
-            s_legacy = vc.legacy_signal_power(vec, side)
+            s_legacy = vc.legacy_signal_power(base, side)
             s_offset_db = (10.0 * math.log10(S / s_legacy)
                            if S > 0 and s_legacy > 0 else 0.0)
 
             for preset in presets:
-                faded, _ = vc.apply_fade(vec, side, preset, seed + 101,
-                                         args.filter)
+                fm_spec = None
+                if args.fm_port:
+                    fm_spec = vfm.resolve_fade(preset, args.fm_band)
+                    faded, _, ngain = vfm.apply_fm_fade(
+                        base, side, fm_spec, seed + 101,
+                        args.fm_shadow_sigma_db, args.fm_shadow_tau_s)
+                else:
+                    faded, _ = vc.apply_fade(vec, side, preset, seed + 101,
+                                             args.filter)
+                    ngain = None
                 for snr in snrs:
                     if (label, preset, round(snr, 3)) in done:
                         continue
@@ -263,8 +286,23 @@ def do_mode(adapter, mode, presets, snrs, args, done, writer, wlock, stats):
                     # scale-down so deep-SNR noise no longer clips at the
                     # driver's f32->i16 conversion (~0.3-0.5 dB pessimistic
                     # below ~-8 dB SNR3000 before this).
-                    write_vector(npath, vc.apply_headroom(
-                        vc.add_awgn(faded, sigma, seed + 202)))
+                    if args.fm_port:
+                        # Link-path order: noise enters BEFORE the RX port, so
+                        # de-emphasis shapes the noise too. The RX port cannot
+                        # be hoisted out of the SNR loop for that reason.
+                        noisy = vfm.add_awgn_shaped(
+                            faded, sigma, seed + 202,
+                            ngain if fm_spec and fm_spec[0] == "ionosnc" else None)
+                        noisy, _ = vfm.apply_rx_port(noisy, fs, args.fm_port,
+                                                     args.fm_order)
+                        if args.fm_squelch:
+                            noisy = vfm.apply_squelch(
+                                noisy, side, fs, args.fm_squelch_open_ms,
+                                seed=seed + 303,
+                                carrier=args.fm_squelch_carrier)
+                    else:
+                        noisy = vc.add_awgn(faded, sigma, seed + 202)
+                    write_vector(npath, vc.apply_headroom(noisy))
                     try:
                         r = adapter.decode(npath, side_path, cold=args.cold)
                     except Exception as e:                       # noqa: BLE001
@@ -306,12 +344,18 @@ def do_mode(adapter, mode, presets, snrs, args, done, writer, wlock, stats):
         fer = 1.0 - k / n if n else 1.0
         lo, hi = wilson(n - k, n)
         spec = PRESETS.get(preset)
+        fm_spec = vfm.resolve_fade(preset, args.fm_band) if args.fm_port else None
         row = {
             "adapter": adapter.name, "label": label,
             "family": mode.get("family", ""), "mode_id": mode.get("mode_id", ""),
             "preset": preset,
-            "delay_ms": spec[0] if spec else "", "doppler_hz": spec[1] if spec else "",
-            "filter_mode": args.filter if spec else "",
+            # Tier-A FM is a FLAT fade -- there is deliberately no tapped
+            # delay line in the FM bench -- so delay_ms stays empty on FM rows
+            # and doppler_hz comes from the resolved FM spec.
+            "delay_ms": "" if args.fm_port else (spec[0] if spec else ""),
+            "doppler_hz": (fm_spec[1] if fm_spec else "") if args.fm_port
+                          else (spec[1] if spec else ""),
+            "filter_mode": "" if args.fm_port else (args.filter if spec else ""),
             "snr_db": f"{snr:.2f}", "bw_hz": f"{bw:.0f}",
             "sample_rate": mode.get("sample_rate", ""),
             "frames": n, "decoded": k, "fer": f"{fer:.6f}",
@@ -334,6 +378,12 @@ def do_mode(adapter, mode, presets, snrs, args, done, writer, wlock, stats):
             "papr_db": mode.get("papr_db", ""),
             "crc_bits": mode.get("crc_bits") if mode.get("crc_bits") else "",
             "list_size": mode.get("list_size") if mode.get("list_size") else "",
+            "fm_port": args.fm_port,
+            "fm_fade_kind": (fm_spec[0] if fm_spec else "off") if args.fm_port else "",
+            "fm_band": args.fm_band if (args.fm_port and fm_spec) else "",
+            "fm_shadow": (f"{args.fm_shadow_sigma_db:g}:{args.fm_shadow_tau_s:g}"
+                          if args.fm_port and args.fm_shadow_sigma_db > 0 else ""),
+            "fm_squelch": (1 if args.fm_squelch else 0) if args.fm_port else "",
             "extra_json": json.dumps(
                 {**a["extra"], "s_offset_db": f"{s_offset_db:.3f}"},
                 separators=(",", ":")),
@@ -371,6 +421,23 @@ def main(argv=None):
                     help="reference noise bandwidth Hz; 0 = each mode's own")
     ap.add_argument("--gap-ms", type=int, default=300)
     ap.add_argument("--filter", default="milstd")
+    # --- FM stage (vector_fm_channel). Setting --fm-port switches the channel
+    # from Watterson+AWGN to port + Tier-A FM fade + AWGN, and reinterprets
+    # --presets as FM fade specs (off | fixed | pedestrian | mobile-urban |
+    # mobile-highway | ionos:<d>:<r> | ionosnc:<d>:<r>:<sn0> | rayleigh:<fD> |
+    # rice:<fD>[:<K>] | static).
+    ap.add_argument("--fm-port", default="", choices=("",) + vfm.PORTS,
+                    help="enable the FM stage on this port profile")
+    ap.add_argument("--fm-band", default="2m", choices=list(vfm.fm_channel.BANDS))
+    ap.add_argument("--fm-order", type=int, default=6)
+    ap.add_argument("--fm-ctcss-hz", type=float, default=0.0)
+    ap.add_argument("--fm-ctcss-amp", type=float, default=0.0)
+    ap.add_argument("--fm-shadow-sigma-db", type=float, default=0.0)
+    ap.add_argument("--fm-shadow-tau-s", type=float, default=0.0)
+    ap.add_argument("--fm-squelch", action="store_true")
+    ap.add_argument("--fm-squelch-open-ms", type=float, default=30.0)
+    ap.add_argument("--fm-squelch-carrier", default="frames",
+                    choices=("frames", "energy"))
     ap.add_argument("--seed", type=int, default=4242)
     ap.add_argument("--jobs", type=int, default=max(1, (os.cpu_count() or 4) - 2))
     ap.add_argument("--batch-seconds", type=float, default=300.0)
@@ -444,6 +511,26 @@ def main(argv=None):
 
     presets = [p.strip() for p in a.presets.split(",") if p.strip()]
     snrs = frange(a.snr_lo, a.snr_hi, a.snr_step)
+
+    if a.fm_port:
+        # Resolve every fade spec BEFORE any cell runs: a typo must fail at
+        # startup, not produce a campaign missing one arm. Same reasoning as
+        # validate_sidecar checking on the first cell.
+        for p in presets:
+            try:
+                vfm.resolve_fade(p, a.fm_band)
+            except (ValueError, SystemExit) as e:
+                log(f"vector_sweep: bad --presets entry '{p}' for the FM "
+                    f"stage: {e}")
+                return 2
+        if a.fm_squelch and a.fm_port != "micspk":
+            log("vector_sweep: --fm-squelch is a micspk stage "
+                "(data9600 is the squelchless discriminator tap)")
+            return 2
+        log(f"vector_sweep: FM stage on port={a.fm_port} band={a.fm_band}"
+            + (f" shadow={a.fm_shadow_sigma_db:g}dB/{a.fm_shadow_tau_s:g}s"
+               if a.fm_shadow_sigma_db > 0 else "")
+            + (" squelch" if a.fm_squelch else ""))
 
     err = check_schema(a.out)
     if err:

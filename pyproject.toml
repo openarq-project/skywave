@@ -47,7 +47,7 @@ skywave-score-transitions = "skywave.score_transitions:main"
 where = ["src"]
 
 [tool.setuptools.package-data]
-"skywave.adapters" = ["*.conf"]
+"skywave.adapters" = ["*.conf", "*.dart"]
 
 [tool.pytest.ini_options]
 pythonpath = ["src"]

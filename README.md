@@ -74,9 +74,10 @@ are language-agnostic and need no FFI:
 |---|---|---|
 | `vector_modem73` | wraps a C++ binary (`modevector`) | 48 kHz |
 | `vector_armstrong` | wraps `cargo run -p phy --example vector` (Rust) | 8 kHz |
+| `vector_dart` | wraps HTCommander's DART modem (Dart; set `DART_SRC`, `DART_SDK`) | 32 kHz |
 
-Sample rate is declared per vector, not assumed — the two shipped adapters differ by 6×,
-and both run through identical channel code. Every adapter inherits a required selftest
+Sample rate is declared per vector, not assumed — the shipped adapters span 8, 32 and
+48 kHz, and all run through identical channel code. Every adapter inherits a required selftest
 gate (a clean round trip must decode every frame; a deep-noise one must decode none).
 
 ```sh

@@ -97,6 +97,11 @@ FIELDS = [
     # fm_port is set, so these say WHICH channel that preset was resolved on --
     # an FM row and an HF row with the same preset name are not the same cell.
     "fm_port", "fm_fade_kind", "fm_band", "fm_shadow", "fm_squelch",
+    # Squelch/limiter provenance. fm_clipped_fraction is the honest witness for
+    # a drive-policy arm: an arm that reports 0.0 there did not clip, so it
+    # measured nothing and must not be scored as the clipping cell.
+    "fm_squelch_tone_ms", "fm_deviation_headroom_db", "fm_clipped_fraction",
+    "fm_deviation_ceiling",
     # Stage decomposition, when the adapter reports it: which STAGE lost the
     # frame. preamble_count >= sync_count >= decoded, so
     # (preamble_count - sync_count) is header loss and the rest is payload.
@@ -265,6 +270,9 @@ def do_mode(adapter, mode, presets, snrs, args, done, writer, wlock, stats):
     scratch = tempfile.mkdtemp(prefix="swvec-", dir=args.scratch)
     _reg(scratch)
     s_offset_db = 0.0  # set per batch below; 0.0 if every batch failed early
+    # Same reason as s_offset_db: set per batch, and the row is emitted even
+    # when every batch failed early, so these must exist before the try.
+    clip_frac, clip_ceiling = "", ""
     try:
         for bi, nframes in enumerate(batch_list):
             seed = args.seed + bi * 7919
@@ -287,6 +295,17 @@ def do_mode(adapter, mode, presets, snrs, args, done, writer, wlock, stats):
                 base, _ = vfm.apply_tx_port(base, fs, args.fm_port,
                                             args.fm_order, args.fm_ctcss_hz,
                                             args.fm_ctcss_amp)
+                # TX deviation limiting sits AFTER pre-emphasis and BEFORE S,
+                # matching vector_fm_channel.run()'s order exactly: a real TX
+                # limits what emphasis already peaked, and S must be measured
+                # on what actually goes out or every labelled SNR carries the
+                # limiter's loss as a hidden constant. Hoisted out of the
+                # preset/SNR loops because it depends on neither.
+                if args.fm_deviation_headroom_db is not None:
+                    base, cf, ceil = vfm.apply_deviation_limit(
+                        base, side, fs, args.fm_deviation_headroom_db,
+                        args.fm_deviation_kind)
+                    clip_frac, clip_ceiling = f"{cf:.6f}", f"{ceil:.4f}"
             S = vc.clean_signal_power(base, side)
             # Option-A transition: record the old-S/new-S conversion offset so
             # pre-convention floors remain convertible (the report prints it).
@@ -326,14 +345,24 @@ def do_mode(adapter, mode, presets, snrs, args, done, writer, wlock, stats):
                         if args.fm_squelch:
                             noisy = vfm.apply_squelch(
                                 noisy, side, fs, args.fm_squelch_open_ms,
+                                args.fm_squelch_tone_ms,
                                 seed=seed + 303,
                                 carrier=args.fm_squelch_carrier)
+                    else:
+                        # NOT an `elif` on codec_rx: this else belongs to
+                        # `if args.fm_port` above and is the HF path's noise
+                        # step. It was briefly stolen by the codec block
+                        # (52bfc62), which silently discarded the ENTIRE FM RX
+                        # chain -- rx port AND squelch -- on every campaign
+                        # that did not pass --codec-rx. Caught because a
+                        # squelch arm scored bit-identical to squelch-off.
+                        noisy = vc.add_awgn(faded, sigma, seed + 202)
                     if args.codec_rx:
-                        # LAST: the radio encodes what it demodulated.
+                        # LAST: the radio encodes what it demodulated. Applies
+                        # ON TOP of whichever chain ran above, never instead
+                        # of one.
                         noisy, _ = vfm.apply_codec(
                             noisy, fs, _codec(adapter, args.codec_rx))
-                    else:
-                        noisy = vc.add_awgn(faded, sigma, seed + 202)
                     write_vector(npath, vc.apply_headroom(noisy))
                     try:
                         r = adapter.decode(npath, side_path, cold=args.cold)
@@ -420,6 +449,14 @@ def do_mode(adapter, mode, presets, snrs, args, done, writer, wlock, stats):
             "fm_shadow": (f"{args.fm_shadow_sigma_db:g}:{args.fm_shadow_tau_s:g}"
                           if args.fm_port and args.fm_shadow_sigma_db > 0 else ""),
             "fm_squelch": (1 if args.fm_squelch else 0) if args.fm_port else "",
+            "fm_squelch_tone_ms": (args.fm_squelch_tone_ms
+                                   if args.fm_port and args.fm_squelch else ""),
+            "fm_deviation_headroom_db": (args.fm_deviation_headroom_db
+                                         if args.fm_port and
+                                         args.fm_deviation_headroom_db
+                                         is not None else ""),
+            "fm_clipped_fraction": clip_frac,
+            "fm_deviation_ceiling": clip_ceiling,
             "codec_tx": args.codec_tx, "codec_rx": args.codec_rx,
             "extra_json": json.dumps(
                 {**a["extra"], "s_offset_db": f"{s_offset_db:.3f}"},
@@ -473,6 +510,24 @@ def main(argv=None):
     ap.add_argument("--fm-shadow-tau-s", type=float, default=0.0)
     ap.add_argument("--fm-squelch", action="store_true")
     ap.add_argument("--fm-squelch-open-ms", type=float, default=30.0)
+    # CTCSS tone-squelch adds decode time on TOP of carrier detect, and it
+    # costs that time SIMPLEX -- there need not be a repeater in the path.
+    # Without this the sweep could only ever model carrier squelch.
+    ap.add_argument("--fm-squelch-tone-ms", type=float, default=0.0,
+                    help="additional CTCSS tone-decode delay before the "
+                         "squelch opens (TIA-603 class: 80-200 ms). Applies "
+                         "on top of --fm-squelch-open-ms.")
+    # TX deviation limiting. Parameterised by HEADROOM above the signal's own
+    # RMS rather than an absolute level, so the knob means the same thing
+    # across modes: below a mode's PAPR it clips, above it does not, and the
+    # difference IS the PAPR penalty.
+    ap.add_argument("--fm-deviation-headroom-db", type=float, default=None,
+                    help="TX deviation ceiling above signal RMS, in dB. "
+                         "Omitted = no limiting. Every row reports "
+                         "clipped_fraction; an arm reporting 0.0 there "
+                         "measured nothing.")
+    ap.add_argument("--fm-deviation-kind", default="hard",
+                    choices=("hard", "soft"))
     ap.add_argument("--fm-squelch-carrier", default="frames",
                     choices=("frames", "energy"))
     # Codec-in-the-loop. The runner is ADAPTER-supplied (only the adapter knows

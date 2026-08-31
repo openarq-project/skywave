@@ -332,6 +332,30 @@ class DartVectorAdapter(VectorAdapter):
                           "--bitpool", str(bitpool), "--alloc", alloc,
                           "--blocks", str(blocks), "--subbands", str(subbands)])
 
+    def codec_runner(self, spec):
+        """`--codec-tx`/`--codec-rx` spec -> a runner for apply_codec.
+
+        Spec is `key=value` pairs: bitpool, alloc (snr|loudness), blocks,
+        subbands. The two directions are asymmetric and neither default is
+        universal, so both are stated explicitly at the campaign:
+            --codec-tx bitpool=40,alloc=snr        (app -> radio)
+            --codec-rx bitpool=18,alloc=loudness   (radio -> app, firmware-set)
+        """
+        kw = {}
+        for part in str(spec).split(","):
+            part = part.strip()
+            if not part:
+                continue
+            if "=" not in part:
+                raise VectorContractError(
+                    f"DART codec spec {spec!r}: expected key=value, got {part!r}")
+            k, v = part.split("=", 1)
+            k = k.strip()
+            if k not in ("bitpool", "alloc", "blocks", "subbands"):
+                raise VectorContractError(f"DART codec spec: unknown key {k!r}")
+            kw[k] = v.strip() if k == "alloc" else int(v)
+        return lambda i, o: self.sbc_roundtrip(i, o, **kw)
+
     def __del__(self):
         if getattr(self, "_build", None):
             shutil.rmtree(self._build, ignore_errors=True)

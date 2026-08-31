@@ -97,6 +97,14 @@ FIELDS = [
     # fm_port is set, so these say WHICH channel that preset was resolved on --
     # an FM row and an HF row with the same preset name are not the same cell.
     "fm_port", "fm_fade_kind", "fm_band", "fm_shadow", "fm_squelch",
+    # Stage decomposition, when the adapter reports it: which STAGE lost the
+    # frame. preamble_count >= sync_count >= decoded, so
+    # (preamble_count - sync_count) is header loss and the rest is payload.
+    # This is the distinction that separates "could not find it" from "found
+    # it, could not read it", and one flag for both hid DART's real bottleneck
+    # through two rounds of review. Empty for adapters that do not report it.
+    "preamble_count", "header_fail",
+    "codec_tx", "codec_rx",
     "extra_json", "batches", "seed_base", "cold", "host", "arch",
     # Content hash of the driver binary. host+arch pin the machine, not the
     # executable; a mid-campaign driver swap would otherwise look clean.
@@ -179,6 +187,23 @@ def wilson(k, n, z=1.96):
     return (max(0.0, c - h), min(1.0, c + h))
 
 
+def _codec(adapter, spec):
+    """Turn an adapter-interpreted codec spec into a runner for apply_codec.
+
+    Only the adapter knows which codec its modem actually crosses, so the
+    framework stays codec-agnostic and asks. An adapter that does not implement
+    `codec_runner` fails loudly here rather than silently ignoring the flag --
+    a campaign that thought it had a codec in the loop and did not would be
+    unattributable afterwards.
+    """
+    fn = getattr(adapter, "codec_runner", None)
+    if fn is None:
+        raise SystemExit(
+            f"vector_sweep: adapter '{adapter.name}' has no codec_runner(), so "
+            f"--codec-tx/--codec-rx cannot be honoured (spec {spec!r})")
+    return fn(spec)
+
+
 def load_adapter(name):
     mod = importlib.import_module(f"skywave.adapters.vector_{name}")
     return mod.build()
@@ -221,7 +246,8 @@ def batches_for(air_s, frames, budget_s):
 
 
 CORE_KEYS = {"frames", "decoded", "false_decode", "wrong_frame", "duplicates",
-             "mean_snr_db", "mean_ber", "sync_count", "crc_errors"}
+             "mean_snr_db", "mean_ber", "sync_count", "crc_errors",
+             "preamble_count", "header_fail"}
 
 
 def do_mode(adapter, mode, presets, snrs, args, done, writer, wlock, stats):
@@ -255,8 +281,10 @@ def do_mode(adapter, mode, presets, snrs, args, done, writer, wlock, stats):
             # constant, the same error the Option-A ruling removed on HF.
             # See vector_fm_channel's docstring.
             base = vec
+            if args.codec_tx:
+                base, _ = vfm.apply_codec(base, fs, _codec(adapter, args.codec_tx))
             if args.fm_port:
-                base, _ = vfm.apply_tx_port(vec, fs, args.fm_port,
+                base, _ = vfm.apply_tx_port(base, fs, args.fm_port,
                                             args.fm_order, args.fm_ctcss_hz,
                                             args.fm_ctcss_amp)
             S = vc.clean_signal_power(base, side)
@@ -300,6 +328,10 @@ def do_mode(adapter, mode, presets, snrs, args, done, writer, wlock, stats):
                                 noisy, side, fs, args.fm_squelch_open_ms,
                                 seed=seed + 303,
                                 carrier=args.fm_squelch_carrier)
+                    if args.codec_rx:
+                        # LAST: the radio encodes what it demodulated.
+                        noisy, _ = vfm.apply_codec(
+                            noisy, fs, _codec(adapter, args.codec_rx))
                     else:
                         noisy = vc.add_awgn(faded, sigma, seed + 202)
                     write_vector(npath, vc.apply_headroom(noisy))
@@ -312,10 +344,12 @@ def do_mode(adapter, mode, presets, snrs, args, done, writer, wlock, stats):
                     a = acc.setdefault((preset, snr), dict(
                         frames=0, decoded=0, false_decode=0, wrong_frame=0,
                         duplicates=0, sync_count=0, crc_errors=0,
+                        preamble_count=0, header_fail=0,
                         snr_sum=0.0, ber_sum=0.0, n=0, extra={}))
                     a["frames"] += int(r.get("frames", nframes))
                     for k in ("decoded", "false_decode", "wrong_frame",
-                              "duplicates", "sync_count", "crc_errors"):
+                              "duplicates", "sync_count", "crc_errors",
+                              "preamble_count", "header_fail"):
                         a[k] += int(r.get(k, 0))
                     d = int(r.get("decoded", 0))
                     if d:
@@ -367,6 +401,8 @@ def do_mode(adapter, mode, presets, snrs, args, done, writer, wlock, stats):
             "false_decode": a["false_decode"], "wrong_frame": a["wrong_frame"],
             "duplicates": a["duplicates"], "sync_count": a["sync_count"],
             "crc_errors": a["crc_errors"],
+            "preamble_count": a["preamble_count"] or "",
+            "header_fail": a["header_fail"] or "",
             "mean_snr_db": f"{a['snr_sum'] / a['n']:.2f}" if a["n"] else "",
             "mean_ber": f"{a['ber_sum'] / a['n']:.5f}" if a["n"] else "",
             "mode_class": mode.get("mode_class", "production"),
@@ -384,6 +420,7 @@ def do_mode(adapter, mode, presets, snrs, args, done, writer, wlock, stats):
             "fm_shadow": (f"{args.fm_shadow_sigma_db:g}:{args.fm_shadow_tau_s:g}"
                           if args.fm_port and args.fm_shadow_sigma_db > 0 else ""),
             "fm_squelch": (1 if args.fm_squelch else 0) if args.fm_port else "",
+            "codec_tx": args.codec_tx, "codec_rx": args.codec_rx,
             "extra_json": json.dumps(
                 {**a["extra"], "s_offset_db": f"{s_offset_db:.3f}"},
                 separators=(",", ":")),
@@ -438,6 +475,15 @@ def main(argv=None):
     ap.add_argument("--fm-squelch-open-ms", type=float, default=30.0)
     ap.add_argument("--fm-squelch-carrier", default="frames",
                     choices=("frames", "energy"))
+    # Codec-in-the-loop. The runner is ADAPTER-supplied (only the adapter knows
+    # which codec its modem crosses), so these take an adapter-interpreted spec
+    # rather than a command line. DART: "bitpool=40,alloc=snr" app->radio and
+    # "bitpool=18,alloc=loudness" radio->app -- the two directions are not
+    # symmetric and the return path is the one the app cannot change.
+    ap.add_argument("--codec-tx", default="",
+                    help="adapter codec spec for the transmit hop")
+    ap.add_argument("--codec-rx", default="",
+                    help="adapter codec spec for the receive hop")
     ap.add_argument("--seed", type=int, default=4242)
     ap.add_argument("--jobs", type=int, default=max(1, (os.cpu_count() or 4) - 2))
     ap.add_argument("--batch-seconds", type=float, default=300.0)

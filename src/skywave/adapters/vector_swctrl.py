@@ -29,10 +29,22 @@ alphabet, both stated here rather than discovered later:
 2. THE DEFAULT IS TAU-GATED, NOT FORCED CHOICE. A 5-ary forced choice is right
    ~20% of the time on pure noise, so the inherited `selftest()`'s negative leg
    ("deep noise decodes NOTHING") cannot pass against a forced-choice detector
-   no matter how healthy it is. This adapter therefore applies the frozen
-   per-rung thresholds in `scripts/swctrl_tau_v1.json` by default and records
-   `tau` in every row. Set SWCTRL_FORCED_CHOICE=1 for the ungated
-   word-error-rate number -- and then do not run the inherited selftest.
+   no matter how healthy it is. This adapter therefore passes `--tau frozen`
+   by default: the instrument gates at armstrong's PRODUCTION per-rung freeze
+   (`ctrl::rx::frozen_tau`, T0..T3) and reports the number it used, which is
+   recorded as `tau` / `tau_table` in every row. Set SWCTRL_FORCED_CHOICE=1
+   for the ungated word-error-rate number -- and then do not run the
+   inherited selftest. SWCTRL_TAU_TABLE=<json> gates at an explicit table
+   instead (recorded by basename).
+
+   WHY THE TABLE IS NO LONGER SEARCHED FOR (2026-09-01): this adapter used to
+   walk up from the binary looking for `scripts/swctrl_tau_v1.json` -- the
+   Phase-A table for the PRE-fold statistic (T1 tau 3.211). The in-tree
+   instrument runs the production DPDI fold, whose pure-noise mean at T1 is
+   about 5.3, so that gate passed 44 of 50 noise windows. The FM-CTRL step-1
+   pilot ran that way and was filed as "tau = 0". A gate the adapter finds by
+   path is a gate nobody chose; the production value is the only one that
+   means anything against the production statistic.
 
 WHAT THE COLUMNS MEAN HERE:
   decoded       correct word delivered (above tau, when gated)
@@ -41,9 +53,9 @@ WHAT THE COLUMNS MEAN HERE:
                 so it is the column that matters most, not a footnote.
   erasures      below tau: no delivery. Costs a turnaround, not correctness.
 
-TAU IS PROVISIONAL. The shipped table was frozen for Phase-A scoring and is
-NOT final for spec or registry purposes; it was calibrated on one traffic pool
-at one geometry (SEG_CHIPS=168). Treat a tau-gated delivery curve as a
+TAU IS PROVISIONAL. The production freeze carries its own caveat (calibrated
+at a narrow search span; see `frozen_tau`'s doc in ctrl/src/rx.rs) and is NOT
+final for spec or registry purposes. Treat a tau-gated delivery curve as a
 measurement AT THAT TAU, and report the forced-choice curve beside it -- the
 two differ by several dB and the gap is a real design cost, not noise.
 """
@@ -56,35 +68,12 @@ import subprocess
 from skywave.vector_adapter import VectorAdapter, VectorContractError
 
 HERE = os.path.dirname(os.path.abspath(__file__))
-TAU_BASENAME = "swctrl_tau_v1.json"
 
-
-def _tau_candidates(binary):
-    """Where to look for the frozen tau table, in order.
-
-    The install step COPIES this file into skywave's adapters/ directory, so
-    anything resolved relative to __file__ stops working exactly when the
-    documented workflow is followed -- which is how this was first written and
-    how it broke. The binary is the reliable anchor: SWCTRL_VECTOR is required
-    anyway, and it lives at <kit>/target/release/examples/swctrl_vector, so
-    walking up from it finds the kit's scripts/ wherever the kit was unpacked.
-    The __file__-relative path stays last so running from inside the kit,
-    un-copied, still works.
-    """
-    out = []
-    env = os.environ.get("SWCTRL_TAU_TABLE")
-    if env:
-        out.append(env)
-    if binary:
-        d = os.path.dirname(os.path.abspath(binary))
-        for _ in range(5):
-            d = os.path.dirname(d)
-            if not d or d == "/":
-                break
-            out.append(os.path.join(d, "scripts", TAU_BASENAME))
-    out.append(os.path.join(HERE, "..", "scripts", TAU_BASENAME))
-    out.append(os.path.join(HERE, TAU_BASENAME))
-    return out
+# What the instrument is told when no explicit table is given: gate at
+# armstrong's production per-rung freeze. The instrument resolves the number
+# from the sidecar's rung and echoes it back in the summary row.
+TAU_FROZEN = "frozen"
+TAU_FROZEN_TABLE = "frozen_tau(ctrl::rx)"
 
 
 class SwctrlVectorAdapter(VectorAdapter):
@@ -95,30 +84,21 @@ class SwctrlVectorAdapter(VectorAdapter):
         if not self.binary or not os.path.isfile(self.binary):
             raise VectorContractError(
                 "no `swctrl_vector` binary. Build it with:\n"
-                "  cargo build --release --example swctrl_vector\n"
-                "in the swctrl-kit checkout, then set SWCTRL_VECTOR to "
+                "  cargo build --release -p ctrl --example swctrl_vector\n"
+                "in the armstrong checkout, then set SWCTRL_VECTOR to "
                 "target/release/examples/swctrl_vector.")
         self.forced_choice = (forced_choice if forced_choice is not None
                               else bool(os.environ.get("SWCTRL_FORCED_CHOICE")))
+        # An explicit table is the ONLY way a JSON file reaches the gate.
         self.tau = {}
         self.tau_path = None
-        tried = [tau_path] if tau_path else _tau_candidates(self.binary)
-        for cand in tried:
-            if cand and os.path.isfile(cand):
-                with open(cand) as f:
-                    self.tau = {k: v["tau_r"]
-                                for k, v in json.load(f)["tau"].items()}
-                self.tau_path = os.path.abspath(cand)
-                break
-        if self.tau_path is None and not self.forced_choice:
-            raise VectorContractError(
-                "no frozen tau table found. Looked in:\n  "
-                + "\n  ".join(str(t) for t in tried)
-                + "\nSet SWCTRL_TAU_TABLE to the kit's "
-                  f"scripts/{TAU_BASENAME}, or set SWCTRL_FORCED_CHOICE=1 "
-                  "deliberately. Gated is the default because a 5-ary forced "
-                  "choice is right ~20% of the time on noise, so the choice "
-                  "must be explicit rather than defaulted into.")
+        explicit = tau_path or os.environ.get("SWCTRL_TAU_TABLE")
+        if explicit and not self.forced_choice:
+            if not os.path.isfile(explicit):
+                raise VectorContractError(f"SWCTRL_TAU_TABLE not found: {explicit}")
+            with open(explicit) as f:
+                self.tau = {k: v["tau_r"] for k, v in json.load(f)["tau"].items()}
+            self.tau_path = os.path.abspath(explicit)
         self._modes = None
 
     def _run(self, args):
@@ -141,16 +121,29 @@ class SwctrlVectorAdapter(VectorAdapter):
         return h.hexdigest()[:12]
 
     def tau_for(self, label):
-        """0.0 means forced choice. An unknown label under gating is an ERROR,
+        """What to pass as `--tau`: 0.0 = forced choice, a number from an
+        explicit table, or `frozen` (the instrument resolves the production
+        value itself). An unknown label under an explicit table is an ERROR,
         not a silent fall-back to forced choice: the two produce curves several
-        dB apart and nothing downstream would show which one you got."""
+        dB apart and nothing downstream would show which one you got. Under
+        `frozen` the instrument applies the same rule (P32/T4/T5 refuse)."""
         if self.forced_choice:
             return 0.0
+        if self.tau_path is None:
+            return TAU_FROZEN
         if label not in self.tau:
             raise VectorContractError(
-                f"no frozen tau for rung {label!r} (have: {sorted(self.tau)}). "
-                "Add one or set SWCTRL_FORCED_CHOICE=1 deliberately.")
+                f"no tau for rung {label!r} in {self.tau_path} (have: "
+                f"{sorted(self.tau)}). Add one or set SWCTRL_FORCED_CHOICE=1 "
+                "deliberately.")
         return self.tau[label]
+
+    def tau_table_name(self):
+        if self.forced_choice:
+            return ""
+        if self.tau_path is None:
+            return TAU_FROZEN_TABLE
+        return os.path.basename(self.tau_path)
 
     # ---- contract --------------------------------------------------------
 
@@ -243,12 +236,16 @@ class SwctrlVectorAdapter(VectorAdapter):
             # preserves precision and makes a multi-batch cell show its parts
             # rather than a silently wrong single number. `s_offset_db` in the
             # sweep itself uses the same trick.
-            "tau": f"{tau:.4f}",
-            "gated": "no" if tau <= 0 else "yes",
+            # The number the INSTRUMENT used (it resolves `frozen` itself and
+            # echoes the value), never the request.
+            "tau": f'{fl("tau"):.4f}',
+            "gated": "no" if fl("tau") <= 0 else "yes",
             # WHICH table produced that tau. A gated curve is a measurement at
             # a specific threshold; a row that records the number but not its
-            # source cannot be re-scored later.
-            "tau_table": os.path.basename(self.tau_path) if self.tau_path else "",
+            # source cannot be re-scored later. `tau_source` is the
+            # instrument's own word for it (forced / explicit / frozen_tau).
+            "tau_table": self.tau_table_name(),
+            "tau_source": r.get("tau_source", ""),
             # Floor-normalised detection statistic and the winner/runner-up
             # ratio: the soft evidence a tau policy is built from. Carried so a
             # re-scoring at a different tau does not need a re-run.

@@ -102,6 +102,10 @@ FIELDS = [
     # measured nothing and must not be scored as the clipping cell.
     "fm_squelch_tone_ms", "fm_deviation_headroom_db", "fm_clipped_fraction",
     "fm_deviation_ceiling",
+    # Squelch ENGAGEMENT witness (vector_fm_channel.squelch_mute_stats): the
+    # muted head per burst, measured. A squelch row with mean 0 ms is VOID.
+    "fm_squelch_muted_frames", "fm_squelch_mean_mute_ms",
+    "fm_squelch_tail_ms", "fm_squelch_block_ms",
     # Stage decomposition, when the adapter reports it: which STAGE lost the
     # frame. preamble_count >= sync_count >= decoded, so
     # (preamble_count - sync_count) is header loss and the rest is payload.
@@ -233,11 +237,41 @@ def load_done(path):
         return done
     with open(path) as f:
         for r in csv.DictReader(f):
+            # The resume key must name the ARM, not just the cell: port, gate,
+            # squelch and limiter all change the row, and a key on
+            # (label, preset, snr) alone made a second arm appended to the same
+            # --out skip every cell as "done" -- a corpus that looks complete
+            # and is missing a whole leg (FM-CTRL pre-reg review, 2026-09-01).
             try:
-                done.add((r["label"], r["preset"], round(float(r["snr_db"]), 3)))
+                tt = json.loads(r.get("extra_json") or "{}").get("tau_table", "")
+            except ValueError:
+                tt = ""
+            try:
+                done.add((r["label"], r["preset"], round(float(r["snr_db"]), 3),
+                          r.get("fm_port", ""), r.get("fm_squelch", ""),
+                          r.get("fm_squelch_tone_ms", ""),
+                          r.get("fm_deviation_headroom_db", ""), str(tt)))
             except (KeyError, ValueError):
                 continue
     return done
+
+
+def arm_fields(args, adapter=None):
+    """The arm-identifying row fields, in the exact string form the CSV
+    carries them (csv writes str(v)), so `done_key` matches `load_done`."""
+    fm = bool(args.fm_port)
+    sq = str((1 if args.fm_squelch else 0) if fm else "")
+    tone = str(args.fm_squelch_tone_ms if fm and args.fm_squelch else "")
+    hr = str(args.fm_deviation_headroom_db
+             if fm and args.fm_deviation_headroom_db is not None else "")
+    tt = ""
+    if adapter is not None and hasattr(adapter, "tau_table_name"):
+        tt = str(adapter.tau_table_name())
+    return (args.fm_port or "", sq, tone, hr, tt)
+
+
+def done_key(args, adapter, label, preset, snr):
+    return (label, preset, round(snr, 3)) + arm_fields(args, adapter)
 
 
 def batches_for(air_s, frames, budget_s):
@@ -259,7 +293,7 @@ def do_mode(adapter, mode, presets, snrs, args, done, writer, wlock, stats):
     label = mode["label"]
     air = float(mode["air_s"])
     wanted = [(p, s) for p in presets for s in snrs
-              if (label, p, round(s, 3)) not in done]
+              if done_key(args, adapter, label, p, s) not in done]
     if not wanted:
         stats["skipped"] += len(presets) * len(snrs)
         return
@@ -273,6 +307,7 @@ def do_mode(adapter, mode, presets, snrs, args, done, writer, wlock, stats):
     # Same reason as s_offset_db: set per batch, and the row is emitted even
     # when every batch failed early, so these must exist before the try.
     clip_frac, clip_ceiling = "", ""
+    mute_frames, mute_ms = "", ""
     try:
         for bi, nframes in enumerate(batch_list):
             seed = args.seed + bi * 7919
@@ -325,7 +360,7 @@ def do_mode(adapter, mode, presets, snrs, args, done, writer, wlock, stats):
                                              args.filter)
                     ngain = None
                 for snr in snrs:
-                    if (label, preset, round(snr, 3)) in done:
+                    if done_key(args, adapter, label, preset, snr) in done:
                         continue
                     sigma = vc.sigma_for(S, fs, bw, snr)
                     npath = os.path.join(scratch, "noisy.f32")
@@ -343,11 +378,17 @@ def do_mode(adapter, mode, presets, snrs, args, done, writer, wlock, stats):
                         noisy, _ = vfm.apply_rx_port(noisy, fs, args.fm_port,
                                                      args.fm_order)
                         if args.fm_squelch:
+                            pre_sq = noisy
                             noisy = vfm.apply_squelch(
                                 noisy, side, fs, args.fm_squelch_open_ms,
                                 args.fm_squelch_tone_ms,
+                                tail_ms=args.fm_squelch_tail_ms,
                                 seed=seed + 303,
-                                carrier=args.fm_squelch_carrier)
+                                carrier=args.fm_squelch_carrier,
+                                block_ms=args.fm_squelch_block_ms)
+                            ms = vfm.squelch_mute_stats(pre_sq, noisy, side, fs)
+                            mute_frames = str(ms["muted_frames"])
+                            mute_ms = f'{ms["mean_mute_ms"]:.1f}'
                     else:
                         # NOT an `elif` on codec_rx: this else belongs to
                         # `if args.fm_port` above and is the HF path's noise
@@ -457,6 +498,12 @@ def do_mode(adapter, mode, presets, snrs, args, done, writer, wlock, stats):
                                          is not None else ""),
             "fm_clipped_fraction": clip_frac,
             "fm_deviation_ceiling": clip_ceiling,
+            "fm_squelch_muted_frames": mute_frames,
+            "fm_squelch_mean_mute_ms": mute_ms,
+            "fm_squelch_tail_ms": (args.fm_squelch_tail_ms
+                                   if args.fm_port and args.fm_squelch else ""),
+            "fm_squelch_block_ms": (args.fm_squelch_block_ms
+                                    if args.fm_port and args.fm_squelch else ""),
             "codec_tx": args.codec_tx, "codec_rx": args.codec_rx,
             "extra_json": json.dumps(
                 {**a["extra"], "s_offset_db": f"{s_offset_db:.3f}"},
@@ -513,6 +560,16 @@ def main(argv=None):
     # CTCSS tone-squelch adds decode time on TOP of carrier detect, and it
     # costs that time SIMPLEX -- there need not be a repeater in the path.
     # Without this the sweep could only ever model carrier squelch.
+    ap.add_argument("--fm-squelch-tail-ms", type=float, default=0.0,
+                    help="squelch HANG time after carrier drop (ms): a noise "
+                         "tail, then mute. 0 = mute immediately. The "
+                         "ctrl detector draws its floor from the trailing "
+                         "burst-free region, so this decides whether a gated "
+                         "row can be scored at all (t_infinite witness).")
+    ap.add_argument("--fm-squelch-block-ms", type=float,
+                    default=vfm.SQUELCH_BLOCK_MS,
+                    help="squelch state-machine block (ms); attack time is "
+                         "quantized to it. 32 = DART's 1024 @ 32 kHz.")
     ap.add_argument("--fm-squelch-tone-ms", type=float, default=0.0,
                     help="additional CTCSS tone-decode delay before the "
                          "squelch opens (TIA-603 class: 80-200 ms). Applies "
@@ -649,7 +706,7 @@ def main(argv=None):
     ncells = len(modes) * len(presets) * len(snrs)
     todo_audio = sum(float(m["air_s"]) * a.frames for m in modes
                      for p in presets for s in snrs
-                     if (m["label"], p, round(s, 3)) not in done)
+                     if done_key(a, adapter, m["label"], p, s) not in done)
     est = todo_audio / (PER_CORE_REALTIME * max(a.jobs, 1))
     log(f"vector_sweep: adapter={adapter.name} | {len(modes)} modes x "
         f"{len(presets)} presets x {len(snrs)} SNR = {ncells} cells")

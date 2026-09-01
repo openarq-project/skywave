@@ -473,3 +473,50 @@ def test_codec_stage_preserves_length():
     x = np.random.default_rng(1).standard_normal(20000) * 0.1
     out, _ = apply_codec(x, FS, truncating)
     assert out.size == x.size, "stage must return a vector the sidecar still fits"
+
+
+def test_squelch_block_is_time_based_so_30ms_engages_at_8k():
+    """At 8 kHz a fixed 1024-sample block was 128 ms: round(30/128) = 0 made
+    a 30 ms carrier squelch a NO-OP on the burst (found 2026-09-01, in the
+    FM-CTRL pre-reg review). The block is now 32 ms at any rate."""
+    from skywave.vector_fm_channel import (apply_squelch, squelch_block,
+                                           squelch_mute_stats, SQUELCH_BLOCK)
+    assert squelch_block(32000) == SQUELCH_BLOCK      # DART path unchanged
+    assert squelch_block(8000) == 256
+    fs, flen, gap = 8000, 2044, 2400
+    for off in (13332, 20479, 20480):                 # three block phases
+        vec = np.zeros(off + flen + gap, dtype=np.float32)
+        vec[off:off + flen] = 0.5
+        side = {"frame_offsets": [off], "frame_lengths": [flen]}
+        # The realized attack is wait_blocks*block - phase, so at the 32 ms
+        # default a 30 ms request lands anywhere in (0, 32] ms depending on
+        # the burst's phase in the block. A cell that pre-registers an
+        # attack time pins a block SMALL against it (FM-CTRL: 4 ms) and reads
+        # the witness; at 4 ms the realization is within one block.
+        out = apply_squelch(vec, side, fs, open_ms=30.0, carrier="frames",
+                            block_ms=4.0)
+        st = squelch_mute_stats(vec, out, side, fs)
+        assert st["muted_frames"] == 1, (off, st)
+        assert 26.0 <= st["mean_mute_ms"] <= 34.0, (off, st)
+        # default block: engages (not the old no-op) but phase-coarse
+        outd = apply_squelch(vec, side, fs, open_ms=30.0, carrier="frames")
+        std = squelch_mute_stats(vec, outd, side, fs)
+        assert 0.0 < std["mean_mute_ms"] <= 32.0, (off, std)
+        # the legacy sample-count block at 8 kHz: the no-op, witnessed
+        out0 = apply_squelch(vec, side, fs, open_ms=30.0, carrier="frames",
+                             block=1024)
+        st0 = squelch_mute_stats(vec, out0, side, fs)
+        assert st0["muted_frames"] == 0 and st0["mean_mute_ms"] == 0.0
+
+
+def test_squelch_mute_stats_reads_the_head_only():
+    from skywave.vector_fm_channel import squelch_mute_stats
+    fs = 8000
+    before = np.ones(4000, dtype=np.float32)
+    after = before.copy()
+    after[1000:1000 + 240] = 0.0            # 30 ms muted head of frame 1
+    side = {"frame_offsets": [0, 1000, 3000], "frame_lengths": [500, 1500, 500]}
+    st = squelch_mute_stats(before, after, side, fs)
+    assert st["muted_frames"] == 1
+    assert abs(st["mean_mute_ms"] - 10.0) < 1e-6   # 30 ms over 3 frames
+    assert st["max_mute_ms"] == 30.0 and st["min_mute_ms"] == 0.0

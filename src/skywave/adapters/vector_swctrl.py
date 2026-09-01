@@ -203,9 +203,20 @@ class SwctrlVectorAdapter(VectorAdapter):
         with open(sidecar_path) as f:
             label = json.load(f)["label"]
         tau = self.tau_for(label)
-        out = self._run(["rx", "--in", os.path.abspath(vector_path),
-                         "--sidecar", os.path.abspath(sidecar_path),
-                         "--tau", str(tau)])
+        args = ["rx", "--in", os.path.abspath(vector_path),
+                "--sidecar", os.path.abspath(sidecar_path),
+                "--tau", str(tau),
+                # Per-frame outcomes beside the vector, for forensics
+                # (squelch phase, t per frame). The batch scratch keeps them
+                # when the sweep is run with --scratch.
+                "--per-frame", os.path.join(os.path.dirname(
+                    os.path.abspath(vector_path)), "frames.csv")]
+        # Foreign-key leg: arm the detector for a key the words were NOT
+        # generated under. Rows carry tx_key/rx_key so the leg is visible.
+        rx_key = os.environ.get("SWCTRL_RX_KEY")
+        if rx_key:
+            args += ["--key", str(int(rx_key, 0))]
+        out = self._run(args)
         rows = list(csv.DictReader(io.StringIO(out)))
         if not rows:
             raise VectorContractError("swctrl_vector rx produced no row")
@@ -246,6 +257,22 @@ class SwctrlVectorAdapter(VectorAdapter):
             # instrument's own word for it (forced / explicit / frozen_tau).
             "tau_table": self.tau_table_name(),
             "tau_source": r.get("tau_source", ""),
+            "tx_key": r.get("tx_key", ""),
+            "rx_key": r.get("rx_key", ""),
+            # Raw detector outcomes (ints, summed across batches): frames the
+            # detector returned SOMETHING for, and frames it returned nothing
+            # for (also counted in erasures). Under a gate, a null-leg row
+            # needs the two apart.
+            "detections": i("detections"),
+            "no_detection": i("no_detection"),
+            # Frames whose floor estimate was ZERO, so t = +inf and the gate
+            # could not erase them. That happens when the trailing burst-free
+            # reference region is muted -- a squelched FM gap is exactly that
+            # -- and a gated row with t_infinite > 0 delivered every such
+            # frame ungated. VOID under any gated bar.
+            "t_infinite": i("t_infinite"),
+            "void": ("t_infinite_under_gate"
+                     if fl("tau") > 0 and i("t_infinite") > 0 else ""),
             # Floor-normalised detection statistic and the winner/runner-up
             # ratio: the soft evidence a tau policy is built from. Carried so a
             # re-scoring at a different tau does not need a re-run.

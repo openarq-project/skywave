@@ -169,8 +169,26 @@ SHADOW_COHERENCE_UNITS = 3.0
 DELAY_PROBE_LEN = 4096
 #: int16 full scale -- SquelchGate speaks int16, this module speaks f32.
 I16_FS = 32768.0
-#: Block size for the squelch state machine (its timing is block-quantized).
+#: Squelch state-machine block, in MILLISECONDS. Its timing is
+#: block-quantized, so the block must be set by TIME, not by sample count: a
+#: fixed 1024 samples was 32 ms at DART's 32 kHz and 128 ms at the 8 kHz modem
+#: rate, where `round(30 / 128) = 0` made a 30 ms carrier squelch a NO-OP on
+#: the burst and the 150/250 ms classes realize as 0-128 / 128-256 ms
+#: depending on which sample of the block the burst starts on (found by the
+#: FM-CTRL pre-reg review, 2026-09-01; the 32 kHz tests never saw it).
+#: 32 ms keeps every 32 kHz result bit-identical (1024 samples). The realized
+#: attack is `wait_blocks * block - phase`, so at 32 ms a 30 ms request lands
+#: anywhere in (0, 32] ms by burst phase: a cell that pre-registers an attack
+#: time must pin a block SMALL against it (`--fm-squelch-block-ms 4`) and
+#: read the `squelch_mute_stats` witness rather than the requested value.
+SQUELCH_BLOCK_MS = 32.0
+#: The 32 kHz block, kept for callers that named it.
 SQUELCH_BLOCK = 1024
+
+
+def squelch_block(fs, block_ms=SQUELCH_BLOCK_MS):
+    """Samples per squelch block at `fs` for a `block_ms` block."""
+    return max(16, int(round(fs * block_ms / 1000.0)))
 
 PORTS = ("micspk", "data9600")
 DETERMINISTIC_KINDS = ("ionos", "ionosnc")
@@ -451,7 +469,7 @@ def add_awgn_shaped(vec, sigma, seed, noise_gain=None):
 # squelch
 # --------------------------------------------------------------------------
 
-def carrier_from_frames(side, total, block=SQUELCH_BLOCK):
+def carrier_from_frames(side, total, block):
     """Per-block carrier flags from the sidecar's frame regions.
 
     A keyed FM carrier is up for the whole burst regardless of audio content,
@@ -469,8 +487,13 @@ def carrier_from_frames(side, total, block=SQUELCH_BLOCK):
 
 def apply_squelch(vec, side, fs, open_ms=30.0, tone_ms=0.0, tail_ms=0.0,
                   tail_amp=2000.0 / I16_FS, thresh=800.0 / I16_FS,
-                  seed=0, carrier="frames", block=SQUELCH_BLOCK):
-    """Gated squelch over the vector. `thresh`/`tail_amp` are f32 full-scale."""
+                  seed=0, carrier="frames", block=None,
+                  block_ms=SQUELCH_BLOCK_MS):
+    """Gated squelch over the vector. `thresh`/`tail_amp` are f32 full-scale.
+    `block` (samples) overrides `block_ms`; the default is time-based so the
+    attack quantization is the same at every sample rate."""
+    if block is None:
+        block = squelch_block(fs, block_ms)
     gate = fm_rig.SquelchGate(fs, block, open_ms, tone_ms, tail_ms,
                               tail_amp=tail_amp * I16_FS,
                               thresh=thresh * I16_FS, seed=seed)
@@ -487,6 +510,35 @@ def apply_squelch(vec, side, fs, open_ms=30.0, tone_ms=0.0, tail_ms=0.0,
             g = gate.process(chunk, bool(flags[bi]))
         out[lo:hi] = g
     return out
+
+
+def squelch_mute_stats(before, after, side, fs):
+    """Engagement witness for a squelch arm: how much of each burst's HEAD the
+    gate actually muted, measured on the frame regions (never the gaps, which
+    a carrier-derived squelch mutes by construction). A squelch row whose mean
+    muted head is 0 ms did not exercise the squelch and is VOID, not a datum
+    -- the quantization no-op above produced exactly such rows while the
+    provenance columns said "squelch on, 30 ms".
+
+    Returns {muted_frames, mean_mute_ms, min_mute_ms, max_mute_ms}: the count
+    of frames with any muted head, and the leading muted run per frame in ms.
+    """
+    before = np.asarray(before); after = np.asarray(after)
+    runs = []
+    for off, ln in zip(side["frame_offsets"], side["frame_lengths"]):
+        b = before[off:off + ln]; a = after[off:off + ln]
+        muted = (a == 0) & (b != 0)
+        # leading run only: the attack window sits at the head
+        run = int(np.argmin(muted)) if not muted.all() else int(muted.size)
+        if muted.size and not muted[0]:
+            run = 0
+        runs.append(1000.0 * run / fs)
+    if not runs:
+        return {"muted_frames": 0, "mean_mute_ms": 0.0,
+                "min_mute_ms": 0.0, "max_mute_ms": 0.0}
+    return {"muted_frames": int(sum(1 for r in runs if r > 0)),
+            "mean_mute_ms": float(np.mean(runs)),
+            "min_mute_ms": float(min(runs)), "max_mute_ms": float(max(runs))}
 
 
 # --------------------------------------------------------------------------

@@ -257,8 +257,12 @@ class SwctrlVectorAdapter(VectorAdapter):
             # instrument's own word for it (forced / explicit / frozen_tau).
             "tau_table": self.tau_table_name(),
             "tau_source": r.get("tau_source", ""),
-            "tx_key": r.get("tx_key", ""),
-            "rx_key": r.get("rx_key", ""),
+            # HEX, deliberately: the sweep's accumulate_extra int()s any
+            # numeric-looking value and SUMS it across batches, which would
+            # turn key 49374 into 98748 on a two-batch cell. Hex fails int()
+            # and takes the join-with-';' path instead.
+            "tx_key": f"0x{int(r['tx_key']):04x}" if r.get("tx_key") else "",
+            "rx_key": f"0x{int(r['rx_key']):04x}" if r.get("rx_key") else "",
             # Raw detector outcomes (ints, summed across batches): frames the
             # detector returned SOMETHING for, and frames it returned nothing
             # for (also counted in erasures). Under a gate, a null-leg row

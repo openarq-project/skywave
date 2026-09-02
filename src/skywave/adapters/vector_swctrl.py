@@ -275,6 +275,11 @@ class SwctrlVectorAdapter(VectorAdapter):
             # for (also counted in erasures). Under a gate, a null-leg row
             # needs the two apart.
             "detections": i("detections"),
+            # Identity statistic in the ROW: frames a consumer would act on
+            # at --margin-floor (right word / wrong word), out of frames.
+            "actionable_ok": i("actionable_ok"),
+            "actionable_wrong": i("actionable_wrong"),
+            "margin_floor": r.get("margin_floor", ""),
             "no_detection": i("no_detection"),
             # Frames whose floor estimate was ZERO, so t = +inf and the gate
             # could not erase them. That happens when the trailing burst-free

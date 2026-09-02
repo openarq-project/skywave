@@ -150,7 +150,14 @@ class SwctrlVectorAdapter(VectorAdapter):
     def list_modes(self):
         if self._modes is not None:
             return self._modes
-        rows = list(csv.DictReader(io.StringIO(self._run(["list"]))))
+        # SWCTRL_EXTRA_MODES=C1082,C1518: free-length chip words (the F4
+        # head, T2 + declared attack) the sweep must know about, or a
+        # --select label for them is skipped silently.
+        args = ["list"]
+        extra = os.environ.get("SWCTRL_EXTRA_MODES", "").strip()
+        if extra:
+            args += ["--extra", extra]
+        rows = list(csv.DictReader(io.StringIO(self._run(args))))
         out = []
         for r in rows:
             out.append({

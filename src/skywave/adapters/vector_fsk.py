@@ -95,7 +95,7 @@ class FskVectorAdapter(VectorAdapter):
             "rms_dbfs": float(r["rms_dbfs"]), "peak_dbfs": float(r["peak_dbfs"]),
             "papr_db": float(r["papr_db"]), "preamble_ms": int(r["preamble_ms"]),
             "modulation": r["modulation"],
-            "code": r.get("code", "none"), "e_bits": int(r.get("e_bits", "0") or 0),
+            "code": r.get("code", "none"), "e_bits": f"e{int(r.get('e_bits', '0') or 0)}",
         } for r in rows]
         return self._modes
 
@@ -137,7 +137,8 @@ class FskVectorAdapter(VectorAdapter):
         return {
             "frames": i("frames"), "decoded": i("decoded"),
             # coded bodies: a finished-but-wrong decode (no CRC => delivered)
-            "false_decode": i("wrong_frames"), "sync_count": i("sync_count"),
+            "false_decode": i("wrong_frames"), "wrong_frame": i("wrong_frames"),
+            "sync_count": i("sync_count"),
             "crc_errors": i("crc_errors"),
             # The sweep weights mean_ber by decoded frames; decoded frames
             # have zero dibit errors by definition here, so the honest head
@@ -151,10 +152,16 @@ class FskVectorAdapter(VectorAdapter):
             "mean_matched": f'{fl("mean_matched"):.2f}',
             "uw_key": f"0x{i('uw_key'):04x}", "rx_uw_key": f"0x{i('rx_uw_key'):04x}",
             "preamble_ms": f"p{i('preamble_ms')}",
-            "code": r.get("code", "none"), "e_bits": f"{i('e_bits')}",
+            # `e_bits` is a per-group CONSTANT: non-numeric so the sweep joins
+            # rather than SUMS it across batches (the review caught the sum).
+            "code": r.get("code", "none"), "e_bits": f"e{i('e_bits')}",
             "wrong_frames": i("wrong_frames"),
+            # per-batch means are strings: the sweep ';'-joins them, one per
+            # batch; a scorer averages the pieces
             "mean_iters": f'{fl("mean_iters"):.2f}',
             "timing": r.get("timing", "sync"),
+            # frames dropped by a body window past the vector end (counts SUM)
+            "truncated": i("truncated"),
         }
 
 

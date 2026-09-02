@@ -140,13 +140,31 @@ class ArmstrongAdapter(ModemAdapter):
                 self._no_web = []
         return self._no_web
 
+    @staticmethod
+    def station_log(station, env=None):
+        """Where a station's own process log (stdout+stderr, RUST_LOG=info)
+        goes for THIS cell. Under sweep_runner every cell exports NP_STATS
+        as `<logs dir>/<cell base>.npstats`, so the station logs land beside
+        the cell's other artifacts as `<cell base>.armA.log` / `.armB.log`
+        and survive the harvest (armstrong's always-on `session summary`
+        line lives there). Before 2026-09-02 they went to fixed /tmp files
+        that every cell overwrote — a campaign kept only its LAST cell's
+        story. Outside a sweep (no NP_STATS) the /tmp fallback stands."""
+        env = os.environ if env is None else env
+        stats = (env.get("NP_STATS") or "").strip()
+        if not stats:
+            return f"/tmp/arm{station}.log"
+        base = stats[:-len(".npstats")] if stats.endswith(".npstats") else stats
+        return f"{base}.arm{station}.log"
+
     def start_stations(self):
+        log_a, log_b = self.station_log("A"), self.station_log("B")
         if self.sock:
-            self._launch_sock("W1CAL", self.A_PORT, "a", "/tmp/armA.log")   # A caller/sender
-            self._launch_sock("W1ANS", self.B_PORT, "b", "/tmp/armB.log")   # B answerer/receiver
+            self._launch_sock("W1CAL", self.A_PORT, "a", log_a)   # A caller/sender
+            self._launch_sock("W1ANS", self.B_PORT, "b", log_b)   # B answerer/receiver
         else:
-            self._launch_alsa("W1CAL", self.A_PORT, self.A_TX, self.A_RX, "/tmp/armA.log")
-            self._launch_alsa("W1ANS", self.B_PORT, self.B_TX, self.B_RX, "/tmp/armB.log")
+            self._launch_alsa("W1CAL", self.A_PORT, self.A_TX, self.A_RX, log_a)
+            self._launch_alsa("W1ANS", self.B_PORT, self.B_TX, self.B_RX, log_b)
 
     def _host_sock_flags(self, port):
         # Older armstrong builds (pre-e4e158d) bind a host-API unix socket at a

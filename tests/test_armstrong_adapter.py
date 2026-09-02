@@ -128,3 +128,19 @@ def test_bitrate_and_sn_telemetry_match_armstrongs_wire_format(monkeypatch, sock
     ad2 = _mk_adapter(monkeypatch, sock_dir)
     ad2.scan_telemetry("A", "BITRATE 0 0")
     assert ad2.modes == [0]
+
+
+def test_station_log_follows_np_stats_cell_base_and_falls_back_to_tmp():
+    """Per-cell station logs (2026-09-02): under sweep_runner NP_STATS names
+    the cell, so A/B process logs land beside the cell's artifacts and
+    survive the harvest; with no NP_STATS the historical /tmp path stands."""
+    env = {"NP_STATS": "/root/logs/wdp_armstrong_s0_off_p32768_r0.npstats"}
+    assert ArmstrongAdapter.station_log("A", env) == \
+        "/root/logs/wdp_armstrong_s0_off_p32768_r0.armA.log"
+    assert ArmstrongAdapter.station_log("B", env) == \
+        "/root/logs/wdp_armstrong_s0_off_p32768_r0.armB.log"
+    # NP_STATS_DIR form (no .npstats suffix): still beside the stats prefix.
+    env = {"NP_STATS": "/np/armstrong_s0_r0"}
+    assert ArmstrongAdapter.station_log("A", env) == "/np/armstrong_s0_r0.armA.log"
+    assert ArmstrongAdapter.station_log("A", {}) == "/tmp/armA.log"
+    assert ArmstrongAdapter.station_log("B", {"NP_STATS": "  "}) == "/tmp/armB.log"

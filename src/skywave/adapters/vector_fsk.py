@@ -15,12 +15,24 @@ the search window AND every payload dibit right; `sync_count` = UW found;
 compared to the contract generator, so a wrong-offset sync shows as a synced-
 but-not-decoded frame, i.e. `crc_errors`). No FEC, no CRC: `crc_bits` = 0.
 
+Coded-body labels (cell B2.3, `-LTE13/-LTE12/-LTE34/-RCS13/-RCS12/-RCS34`)
+carry a turbo codeword instead: `decoded` = the payload bits decode exactly,
+`false_decode` = `wrong_frames` (a decode that finished WRONG; there is no
+CRC in this instrument, so it would have been delivered), `mean_ber` = raw
+dibit error rate against the sent codeword, `mean_iters` = decoder
+iterations per synced frame. FSK_TIMING=oracle (+ FSK_POS_BIAS samples)
+reads the body at the sidecar offset with no head search, so the tone
+head's sync knee cannot mask the code's.
+
 Env:
   FSK_VECTOR       path to the binary
   FSK_UW_KEY       TX unique-word key (0 = the v0 constant UW; default 0)
   FSK_RX_UW_KEY    if set, the RECEIVER's UW key -- the foreign-key arm
   FSK_PAYLOAD_BYTES payload size (default 40)
   FSK_SYNC_MIN     matched-symbol threshold of 32 (default 28)
+  FSK_TIMING       sync (default) | oracle -- see above
+  FSK_POS_BIAS     oracle timing bias in samples (default 0; pin from a
+                   high-SNR `mean_pos_bias` of the same port/geometry)
 """
 import csv
 import io
@@ -47,6 +59,10 @@ class FskVectorAdapter(VectorAdapter):
         self.uw_key = int(os.environ.get("FSK_UW_KEY", "0"), 0)
         self.rx_uw_key = os.environ.get("FSK_RX_UW_KEY")
         self.sync_min = int(os.environ.get("FSK_SYNC_MIN", "28"))
+        self.timing = os.environ.get("FSK_TIMING", "sync")
+        if self.timing not in ("sync", "oracle"):
+            raise VectorContractError(f"FSK_TIMING must be sync|oracle, not {self.timing!r}")
+        self.pos_bias = int(os.environ.get("FSK_POS_BIAS", "0"))
         self._modes = None
 
     def _run(self, args):
@@ -79,6 +95,7 @@ class FskVectorAdapter(VectorAdapter):
             "rms_dbfs": float(r["rms_dbfs"]), "peak_dbfs": float(r["peak_dbfs"]),
             "papr_db": float(r["papr_db"]), "preamble_ms": int(r["preamble_ms"]),
             "modulation": r["modulation"],
+            "code": r.get("code", "none"), "e_bits": int(r.get("e_bits", "0") or 0),
         } for r in rows]
         return self._modes
 
@@ -96,7 +113,8 @@ class FskVectorAdapter(VectorAdapter):
     def decode(self, vector_path, sidecar_path, cold=False):
         args = ["rx", "--in", os.path.abspath(vector_path),
                 "--sidecar", os.path.abspath(sidecar_path),
-                "--sync-min", str(self.sync_min)]
+                "--sync-min", str(self.sync_min),
+                "--timing", self.timing, "--pos-bias", str(self.pos_bias)]
         if self.rx_uw_key is not None:
             args += ["--uw-key", str(int(self.rx_uw_key, 0))]
         rows = list(csv.DictReader(io.StringIO(self._run(args))))
@@ -118,7 +136,8 @@ class FskVectorAdapter(VectorAdapter):
 
         return {
             "frames": i("frames"), "decoded": i("decoded"),
-            "false_decode": 0, "sync_count": i("sync_count"),
+            # coded bodies: a finished-but-wrong decode (no CRC => delivered)
+            "false_decode": i("wrong_frames"), "sync_count": i("sync_count"),
             "crc_errors": i("crc_errors"),
             # The sweep weights mean_ber by decoded frames; decoded frames
             # have zero dibit errors by definition here, so the honest head
@@ -132,6 +151,10 @@ class FskVectorAdapter(VectorAdapter):
             "mean_matched": f'{fl("mean_matched"):.2f}',
             "uw_key": f"0x{i('uw_key'):04x}", "rx_uw_key": f"0x{i('rx_uw_key'):04x}",
             "preamble_ms": f"p{i('preamble_ms')}",
+            "code": r.get("code", "none"), "e_bits": f"{i('e_bits')}",
+            "wrong_frames": i("wrong_frames"),
+            "mean_iters": f'{fl("mean_iters"):.2f}',
+            "timing": r.get("timing", "sync"),
         }
 
 

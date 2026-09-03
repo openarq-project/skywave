@@ -638,6 +638,8 @@ def run_cell(modem, cell, rep, writer, fcsv, tag):
         env["SIM_FADE_DOPPLER_HZ"] = str(cell["fade_doppler_hz"])
     if "atten_db" in cell:
         env["SIM_ATTEN_DB"] = str(cell["atten_db"])
+    if "atten_schedule" in cell:
+        env["SIM_ATTEN_SCHEDULE"] = str(cell["atten_schedule"])
     env["SEED"] = str(1234 + rep * 7)
     # Signal-time budget parity: bound the run at the cell timeout in VIRTUAL seconds.
     # Only the lockstep sock loop reads SIM_MAX_VIRTUAL_S, so this is inert on the
@@ -841,6 +843,13 @@ def run_cell(modem, cell, rep, writer, fcsv, tag):
     # SNR by exactly the attenuation. Correct it here rather than in the accumulator, so
     # the TX-stats/PAPR pipeline (calibration, etc.) stays untouched.
     atten_db = float(env.get("SIM_ATTEN_DB", "0.0") or "0.0")
+    sched = env.get("SIM_ATTEN_SCHEDULE", "").strip()
+    if sched:
+        # A stepped schedule: the row carries its HOLD value (the last segment,
+        # where a transfer spends its tail) and the transitions are ground truth
+        # in the sim log. The cell's label names the arm.
+        from skywave.channel_sim import parse_atten_schedule
+        atten_db = parse_atten_schedule(sched)[-1][0]
     if atten_db:
         snr = round(snr - atten_db, 1)
     row = {"modem": modem, "tag": tag, "sigma": sigma, "snr3k": snr,

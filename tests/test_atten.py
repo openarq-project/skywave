@@ -55,3 +55,51 @@ def test_sweep_runner_snr3k_correction_matches_the_attenuation():
     base = snr3k_measured(act_rms, sigma)
     corrected = round(base - atten_db, 1)
     assert round(base - corrected, 1) == atten_db
+
+
+# ---- SIM_ATTEN_SCHEDULE: the stepped path loss (FM cell B2.1's wrongness arm) ----
+
+def _block_rms(o):
+    return float((o.astype("float64") ** 2).mean()) ** 0.5
+
+
+def test_atten_schedule_steps_at_the_boundary_and_holds(capsys):
+    import math
+    cs = load_sim(SIGMA="0", SIM_ATTEN_SCHEDULE="0:{:.6f},6:0".format(3 * 1024 / 48000))
+    assert cs.ATTEN_SCHEDULE == [(0.0, 3 * 1024 / 48000), (6.0, 0.0)]
+    link = make_link(cs)
+    outs = []
+    for k in range(6):
+        link.nblocks = k                 # run()/lockstep advance this after each block
+        outs.append(feed(link, tone_block(cs, block_index=k)))
+    r = [_block_rms(o) for o in outs]
+    # Blocks 0..2 are the clean lead (equal RMS), blocks 3.. are 6.00 dB down and hold.
+    assert abs(20 * math.log10(r[0] / r[1])) < 0.05
+    assert abs(20 * math.log10(r[0] / r[3]) - 6.0) < 0.05
+    assert abs(20 * math.log10(r[3] / r[5])) < 0.05
+    err = capsys.readouterr().err
+    assert "[atten-schedule" in err and "0 -> 6" in err, err
+
+
+def test_atten_schedule_first_segment_is_the_static_value():
+    cs = load_sim(SIGMA="0", SIM_ATTEN_SCHEDULE="12:0")
+    link = make_link(cs)
+    r12 = _block_rms(feed(link, tone_block(cs)))
+    cs0 = load_sim(SIGMA="0", SIM_ATTEN_DB="12")
+    r_static = _block_rms(feed(make_link(cs0), tone_block(cs0)))
+    assert abs(r12 - r_static) < 1e-6
+
+
+def test_atten_schedule_rejects_a_static_atten_alongside_and_bad_tokens():
+    import pytest
+    with pytest.raises(SystemExit):
+        load_sim(SIGMA="0", SIM_ATTEN_SCHEDULE="0:10,6:0", SIM_ATTEN_DB="3")
+    with pytest.raises(SystemExit):
+        load_sim(SIGMA="0", SIM_ATTEN_SCHEDULE="0:10,:0")
+    load_sim(SIGMA="0")  # leave the module static for the other tests
+
+
+def test_sweep_row_stamps_the_hold_value_of_a_schedule():
+    from skywave.channel_sim import parse_atten_schedule
+    assert parse_atten_schedule("0:40,6:0")[-1][0] == 6.0
+    assert parse_atten_schedule("6:40,0:0")[-1][0] == 0.0

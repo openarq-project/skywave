@@ -34,6 +34,13 @@ Env:
            and before the delay line and AWGN (level(gain->clip)->[fade]->ATTEN->
            [delay]->+AWGN). Reaches deeper SNR than SIGMA alone can (SIGMA vs int16
            rails), and every modem takes the same dB so equal-PEP fairness is preserved.
+  SIM_ATTEN_SCHEDULE  stepped path loss on the same stage: "<db>:<seconds>,<db>:<seconds>,
+           ...", last seconds 0 = hold for the rest (the SIM_FADE_SCHEDULE grammar).
+           Steps at a block boundary on the per-direction audio clock and logs each
+           transition to stderr ("[atten-schedule A->B] t=40.00s 0 -> 6") as scoring
+           ground truth. Mutually exclusive with SIM_ATTEN_DB (exit 2). The wrongness-arm
+           construction for a rate walk: a clean lead, then the channel pulled out from
+           under a placement (FM cell B2.1, 2026-09-03).
            Does NOT touch TXGAIN or the TX-stats accumulator (_accum runs pre-ATTEN, in
            tx_shape()) — a consumer of act_rms must subtract SIM_ATTEN_DB from any SNR it
            derives from act_rms/SIGMA, or its SNR will read high by exactly this amount.
@@ -123,6 +130,31 @@ SIGMA = float(os.environ.get("SIGMA", "0.0").strip() or "0.0")
 # fold this into TXGAIN. See module docstring for the correctness trap on derived SNR.
 ATTEN_DB = float(os.environ.get("SIM_ATTEN_DB", "0.0").strip() or "0.0")
 ATTEN = 10.0 ** (-ATTEN_DB / 20.0)
+
+
+def parse_atten_schedule(text):
+    """`"<db>:<seconds>,..."` -> [(db, seconds), ...]; the last entry's seconds may be
+    0 (= hold). Raises ValueError on a malformed token so the caller can exit 2 with
+    the offending text (a silent default would make a wrongness arm quietly static)."""
+    segs = []
+    for tok in text.split(","):
+        db, _, secs = tok.strip().partition(":")
+        if not db.strip():
+            raise ValueError(f"empty segment in SIM_ATTEN_SCHEDULE {text!r}")
+        segs.append((float(db), float(secs) if secs.strip() else 0.0))
+    if any(sec < 0 for _, sec in segs):
+        raise ValueError(f"negative segment length in SIM_ATTEN_SCHEDULE {text!r}")
+    return segs
+
+
+_atten_sched = os.environ.get("SIM_ATTEN_SCHEDULE", "").strip()
+if _atten_sched and ATTEN_DB != 0.0:
+    sys.exit("channel_sim: SIM_ATTEN_SCHEDULE and SIM_ATTEN_DB are mutually exclusive "
+             "(the schedule's first segment is the static value)")
+try:
+    ATTEN_SCHEDULE = parse_atten_schedule(_atten_sched) if _atten_sched else None
+except ValueError as e:
+    sys.exit(f"channel_sim: {e}")
 SEED = int(os.environ.get("SEED", "1234").strip() or "1234")
 STATS = os.environ.get("NP_STATS", "").strip()
 # SIM_TXDUMP: if set, dump each direction's post-gain, pre-noise TX stream (the exact bytes the
@@ -689,6 +721,7 @@ class Link:
         self.sigma_onset_blocks = sigma_onset_blocks
         self.sigma_pre = sigma_pre
         self.sigma_post = self.sigma
+        self._atten_db_cur = None                 # SIM_ATTEN_SCHEDULE segment in force
         if sigma_onset_blocks is not None:
             self.sigma = sigma_pre
         self.fade = fade                          # WattersonChannel or None (per-direction)
@@ -856,6 +889,27 @@ class Link:
             self._update_key(w)                       # publish this station's keying + T/R state
         return w
 
+    def _atten_now(self):
+        """The scheduled path-loss factor for THIS block (SIM_ATTEN_SCHEDULE), on the
+        same per-direction audio clock as the sigma onset and the fade schedule
+        (`nblocks`; the block that crosses a boundary takes the new value). Logs each
+        transition once, one write (two directions log from two threads)."""
+        t_s = self.nblocks * BLOCK / FS           # this block's start (run() bumps after)
+        db, elapsed = ATTEN_SCHEDULE[-1][0], 0.0
+        for seg_db, secs in ATTEN_SCHEDULE:
+            if secs <= 0.0 or t_s < elapsed + secs:
+                db = seg_db
+                break
+            elapsed += secs
+        if db != self._atten_db_cur:
+            was = self._atten_db_cur
+            self._atten_db_cur = db
+            if was is not None:
+                sys.stderr.write(f"channel_sim: [atten-schedule {self.name}] "
+                                 f"t={t_s:.2f}s {was:g} -> {db:g}\n")
+                sys.stderr.flush()
+        return 10.0 ** (-db / 20.0)
+
     def _apply_sigma_onset(self):
         """Delayed per-direction sigma (SIM_SIGMA_BA_ONSET_S): switch at the
         block boundary, on the same audio clock both run() and lockstep
@@ -923,7 +977,9 @@ class Link:
             m = self.fx.skew.process(np.ascontiguousarray(w[0::NCH]))
             for c in range(NCH):
                 w[c::NCH] = m
-        if ATTEN_DB != 0.0:
+        if ATTEN_SCHEDULE is not None:
+            np.multiply(w, self._atten_now(), out=w)  # scheduled path loss, linear
+        elif ATTEN_DB != 0.0:
             np.multiply(w, ATTEN, out=w)              # path loss, linear (no clip)
         if self.dl.size:
             s = self._dlscratch                       # [dl | w], allocation-free

@@ -18,6 +18,7 @@ Set ARMSTRONG_BIN to a flat-CLI `armstrong-hf` build, then run it as `armstrong`
   skywave-sweep armstrong spec.json out.csv
 """
 import os
+import shlex
 import shutil
 import re
 import select
@@ -125,8 +126,34 @@ class ArmstrongAdapter(ModemAdapter):
     def preclean_patterns(self):
         # Scope kills to the flag so they can never match this Python adapter's own cmdline.
         if self.sock:
-            return ["armstrong-hf .*--audio sock"]
-        return ["armstrong-hf .*--audio cpal", "arecord -D plughw", "aplay -D plughw"]
+            return ["armstrong-(hf|fm) .*--audio sock"]
+        return ["armstrong-(hf|fm) .*--audio cpal", "arecord -D plughw", "aplay -D plughw"]
+
+    def _extra_args(self, station):
+        """Extra CLI args for a station: ARMSTRONG_ARGS (both) then
+        ARMSTRONG_ARGS_A / ARMSTRONG_ARGS_B (per station), shell-split. The
+        `--fm-*` profile flags of `armstrong-fm` reach the DUT this way (FM
+        cell B2.1). A session-wide flag that MUST agree on both ends
+        (`--fm-airtime-ms`) is rejected here when the per-station lists
+        disagree: a mismatched pair cannot connect and the row would record
+        a silent failed connect instead of a launch error."""
+        common = shlex.split(os.environ.get("ARMSTRONG_ARGS", ""))
+        per = shlex.split(os.environ.get(f"ARMSTRONG_ARGS_{station.upper()}", ""))
+        return common + per
+
+    @staticmethod
+    def _flag_value(args, flag):
+        # The LAST occurrence: a per-station list follows the common one.
+        idx = [i for i, a in enumerate(args) if a == flag]
+        return args[idx[-1] + 1] if idx and idx[-1] + 1 < len(args) else None
+
+    def _check_session_flags(self):
+        a, b = self._extra_args("a"), self._extra_args("b")
+        for flag in ("--fm-airtime-ms",):
+            va, vb = self._flag_value(a, flag), self._flag_value(b, flag)
+            if va != vb:
+                raise RuntimeError(f"{flag} must match on both stations "
+                                   f"(A={va!r}, B={vb!r}) — a session-wide value")
 
     def _no_web_flag(self):
         # Newer armstrong builds start an operator web API on a fixed port by default, so
@@ -158,6 +185,7 @@ class ArmstrongAdapter(ModemAdapter):
         return f"{base}.arm{station}.log"
 
     def start_stations(self):
+        self._check_session_flags()
         log_a, log_b = self.station_log("A"), self.station_log("B")
         if self.sock:
             self._launch_sock("W1CAL", self.A_PORT, "a", log_a)   # A caller/sender
@@ -189,10 +217,12 @@ class ArmstrongAdapter(ModemAdapter):
     def _launch_alsa(self, call, port, tx, rx, log):
         conf = os.path.join(os.path.dirname(os.path.abspath(__file__)), "armstrong_aloop.conf")
         env = dict(os.environ, RUST_LOG="info", ARM_FORCE_48K="1", ALSA_CONFIG_PATH=conf)
+        station = "a" if port == self.A_PORT else "b"
         p = sp.Popen([self.arm, "--config", self._bench_config(port),
                       "--audio", "cpal", "--tx-device", tx, "--rx-device", rx,
                       "--callsign", call, "--tnc-port", str(port)]
-                     + self._host_sock_flags(port) + self._no_web_flag(),
+                     + self._host_sock_flags(port) + self._no_web_flag()
+                     + self._extra_args(station),
                      env=env, stdout=open(log, "wb"), stderr=sp.STDOUT)
         self._stations.append(p)
 
@@ -202,7 +232,8 @@ class ArmstrongAdapter(ModemAdapter):
         p = sp.Popen([self.arm, "--config", self._bench_config(port),
                       "--audio", "sock", "--callsign", call,
                       "--tnc-port", str(port)]
-                     + self._host_sock_flags(port) + self._no_web_flag(),
+                     + self._host_sock_flags(port) + self._no_web_flag()
+                     + self._extra_args(station),
                      env=env, stdout=open(log, "wb"), stderr=sp.STDOUT)
         self._stations.append(p)
 

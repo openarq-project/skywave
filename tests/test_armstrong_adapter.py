@@ -144,3 +144,39 @@ def test_station_log_follows_np_stats_cell_base_and_falls_back_to_tmp():
     assert ArmstrongAdapter.station_log("A", env) == "/np/armstrong_s0_r0.armA.log"
     assert ArmstrongAdapter.station_log("A", {}) == "/tmp/armA.log"
     assert ArmstrongAdapter.station_log("B", {"NP_STATS": "  "}) == "/tmp/armB.log"
+
+
+def test_extra_args_reach_each_station_and_session_flags_must_agree(monkeypatch, sock_dir):
+    """FM cell B2.1 drives `armstrong-fm` through this adapter: the `--fm-*`
+    profile flags ride ARMSTRONG_ARGS (both stations) and ARMSTRONG_ARGS_A/_B
+    (per station — the squelch classes differ); the session airtime must
+    agree on both ends or the launch is refused (a mismatched pair records a
+    silent failed connect otherwise)."""
+    ad = _mk_adapter(monkeypatch, sock_dir)
+    monkeypatch.setenv("ARMSTRONG_ARGS", "--fm-airtime-ms 3600")
+    monkeypatch.setenv("ARMSTRONG_ARGS_A", "--fm-class open")
+    monkeypatch.setenv("ARMSTRONG_ARGS_B", "--fm-class repeater")
+    argvs = []
+    monkeypatch.setattr("skywave.adapters.armstrong.sp.run", _fake_run(b"... --no-web ..."))
+    monkeypatch.setattr("skywave.adapters.armstrong.sp.Popen",
+                        lambda argv, **kw: argvs.append(list(argv)) or _FakeProc())
+    ad.start_stations()
+    assert len(argvs) == 2
+    a, b = argvs
+    assert a[a.index("--fm-airtime-ms") + 1] == "3600" == b[b.index("--fm-airtime-ms") + 1]
+    assert a[a.index("--fm-class") + 1] == "open"
+    assert b[b.index("--fm-class") + 1] == "repeater"
+    # Per-station airtimes that disagree are refused before anything launches.
+    monkeypatch.setenv("ARMSTRONG_ARGS_B", "--fm-class repeater --fm-airtime-ms 2400")
+    argvs.clear()
+    with pytest.raises(RuntimeError):
+        ad.start_stations()
+    assert argvs == []
+
+
+def test_preclean_patterns_cover_the_fm_binary(monkeypatch, sock_dir):
+    ad = _mk_adapter(monkeypatch, sock_dir)
+    pat = ad.preclean_patterns()[0]
+    import re
+    assert re.search(pat, "armstrong-fm --config x --audio sock --callsign W1CAL")
+    assert re.search(pat, "armstrong-hf --config x --audio sock --callsign W1CAL")

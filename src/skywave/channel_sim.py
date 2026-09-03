@@ -603,6 +603,18 @@ class Keys:
         self.b_rf_up = False
         self.a_rx_ready = True
         self.b_rx_ready = True
+        # Both-keyed overlap accounting (WDP-REALPATH 2026-09-02: a bench session
+        # ending in a sender retry-budget timeout with the receiver having heard
+        # only a handful of bursts could not be attributed to fade vs. mutual
+        # keying — the sim kept no keying timeline and no collision count).
+        # Read/written from `Link._check_collision`, called from BOTH directions'
+        # `_update_key` off this one shared `Keys` instance (see `Link.keys`), so
+        # `.a`/`.b` here are always the freshest published raw-active flags.
+        self.collision = False          # currently inside an overlap window
+        self.collision_start_t = 0.0    # audio-clock seconds the overlap started
+        self.collision_last_block = -1  # dedup: last nblocks counted into collision_blocks
+        self.collisions = 0             # count of distinct overlap episodes
+        self.collision_blocks = 0       # count of blocks with both stations keyed
 
 
 try:
@@ -724,6 +736,9 @@ class Link:
         self.keyed_blocks = 0         # count of keyed blocks -> key duty (VOX validation)
         self.key_bursts = 0           # count of keyed rising edges -> TX bursts / T-R switches
         self._prev_keyed = False
+        self._prev_keyed_ptt = False  # edge tracker for the [ptt] audio-clock log (independent
+                                       # of _prev_keyed above, which only advances when SIM_KEYLOG
+                                       # is set)
         self.keylog = open(KEYLOG + "." + src_name, "w", buffering=1) if KEYLOG else None
         self.txdump = open(TXDUMP + "." + src_name, "wb") if TXDUMP else None
         # preallocated, reused every block (no per-block allocation in the hot loop)
@@ -1041,6 +1056,19 @@ class Link:
             self.hang -= 1                            # hold the key through intra-burst gaps
         else:
             self.keyed = False
+        if self.keyed != self._prev_keyed_ptt:
+            # Audio-clock-stamped PTT edge (WDP-REALPATH 2026-09-02): the sim kept no
+            # keying timeline, so a bench session that timed out after the receiver
+            # heard only a handful of the sender's bursts could not distinguish
+            # "missed" (fade) from "masked" (both stations keyed at once, HD). Same
+            # audio clock as the [audio-clock]/[sigma-onset] lines above (nblocks *
+            # BLOCK / FS), same channel_sim: stderr stream the harness already
+            # redirects into the cell's .sim.log.
+            sys.stderr.write(
+                f"channel_sim: [ptt] t={self.nblocks * BLOCK / FS:.3f} "
+                f"{self.src_name} {'key' if self.keyed else 'unkey'}\n")
+            sys.stderr.flush()
+            self._prev_keyed_ptt = self.keyed
         if self.keyed:
             self.keyed_blocks += 1
         # T/R switch model. Rising edge -> start RF-up settle; falling edge -> start RX
@@ -1070,6 +1098,41 @@ class Link:
         setattr(self.keys, self.src_name, self.active)   # peer reads RAW active for deafness
         setattr(self.keys, self.src_name + "_rf_up", self.rf_up)
         setattr(self.keys, self.src_name + "_rx_ready", rx_ready)
+        self._check_collision()
+
+    def _check_collision(self):
+        """Both-keyed (mutual RF) overlap accounting, read off the shared `Keys.a`/
+        `Keys.b` raw-active flags this station just published above -- the same
+        flags `deliver_block`'s peer-deafness gate reads, so "both keyed" here means
+        the same thing it means there. Works unmodified on both transports that call
+        `_update_key` (via `tx_shape`):
+          - the single-threaded `run_lockstep` (SIM_CLOCK=virt_time): it calls BOTH
+            directions' `tx_shape()` before either `deliver_block()`, so this sees a
+            consistent same-block snapshot, and `self.nblocks` is identical for `ab`
+            and `ba` at call time (both bumped once per loop iteration) -- the
+            `collision_last_block` dedup below is exact there.
+          - the threaded real-time/ALSA path (`Link.run`, one thread per direction):
+            the two threads' calls race on `self.keys.collision*`, same class of
+            benign interleaving as the existing peer-deafness read/write race on
+            `Keys` documented on the class -- an edge can land up to one block off,
+            acceptable for a diagnostic counter, not a correctness gate.
+        """
+        both = self.keys.a and self.keys.b
+        t = self.nblocks * BLOCK / FS
+        if both and self.nblocks != self.keys.collision_last_block:
+            self.keys.collision_last_block = self.nblocks
+            self.keys.collision_blocks += 1
+        if both and not self.keys.collision:
+            self.keys.collision = True
+            self.keys.collision_start_t = t
+            self.keys.collisions += 1
+            sys.stderr.write(f"channel_sim: [collision] t={t:.3f} start\n")
+            sys.stderr.flush()
+        elif (not both) and self.keys.collision:
+            self.keys.collision = False
+            dur = t - self.keys.collision_start_t
+            sys.stderr.write(f"channel_sim: [collision] t={t:.3f} end dur={dur:.3f}\n")
+            sys.stderr.flush()
 
     def _accum(self, w):
         a = np.abs(w)
@@ -1729,6 +1792,18 @@ def build_channel_effects():
     )
 
 
+def print_keying_summary(ab, ba, keys):
+    """Shutdown keying summary (WDP-REALPATH 2026-09-02 collision accounting):
+    per-station burst counts plus the both-keyed overlap totals accumulated on
+    the shared `Keys` instance by `Link._check_collision`. Extracted from
+    `main()`'s shutdown path so tests can call it directly against a
+    `feed()`-driven pair without running the full subprocess main loop."""
+    print(f"channel_sim: keying summary a_bursts={ab.key_bursts} "
+          f"b_bursts={ba.key_bursts} collisions={keys.collisions} "
+          f"collision_s={keys.collision_blocks * BLOCK / FS:.1f}",
+          file=sys.stderr, flush=True)
+
+
 def main():
     procs = []
     stop = threading.Event()
@@ -1874,6 +1949,8 @@ def main():
                 p99 = (sorted(L.times)[int(len(L.times) * 0.99)] if L.times else 0.0)
                 print(f"channel_sim {L.name}: {L.nblocks} blocks, period={period_ms:.1f}ms, "
                       f"p99={p99:.2f}ms worst={L.worst:.2f}ms", file=sys.stderr, flush=True)
+        if HALF_DUPLEX:
+            print_keying_summary(ab, ba, keys)
     return 0
 
 

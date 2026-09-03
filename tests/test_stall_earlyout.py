@@ -273,3 +273,42 @@ def test_byte_regression_is_not_a_recovery():
 
 def test_max_recovered_gap_is_a_trailing_schema_column():
     assert COLUMNS[-1] == "max_recovered_gap"
+
+
+# ---- got must reflect delivered bytes on a no-RESULT (stall/kill) row ------------
+#
+# WDP-REALPATH 2026-09-02: a stall early-out row reported got=0 although 1334
+# bytes had been delivered -- STALL_EARLYOUT never prints a RESULT line
+# (p.terminate() kills the adapter first), so `got` stayed at its 0
+# initializer while the progress ticks show the true count.
+
+def test_resolve_got_uses_last_progress_tick():
+    txt = ("PROGRESS t=0.0s bytes=0\nPROGRESS t=5.0s bytes=600\n"
+           "PROGRESS t=10.0s bytes=1334\nSTALL_EARLYOUT t=10.0s stall_s=20\n")
+    curve = sweep_runner.parse_progress(txt)
+    assert sweep_runner.resolve_got(txt, 0, curve) == 1334
+
+
+def test_resolve_got_never_lowers_a_result_parsed_got():
+    curve = [(0.0, 0), (5.0, 100)]
+    assert sweep_runner.resolve_got("...", 512, curve) == 512
+
+
+def test_resolve_got_blank_curve_is_a_no_op():
+    assert sweep_runner.resolve_got("no ticks here", 0, []) == 0
+
+
+def test_stall_earlyout_row_reports_delivered_bytes(tmp_path, monkeypatch):
+    """End-to-end through run_cell: a STALL_EARLYOUT kill with no RESULT line
+    must still report the last tick's byte count, not 0."""
+    monkeypatch.setenv("SKYW_PROGRESS_S", "5")
+    monkeypatch.setenv("SKYW_STALL_S", "20")
+    lines = ([f"PROGRESS t={t:.1f}s bytes={b}\n"
+              for t, b in ((0, 0), (5, 400), (10, 1334))]
+             + [f"PROGRESS t={t:.1f}s bytes=1334\n" for t in (15, 20, 25, 30)])
+    row, fake = _run_cell(tmp_path, monkeypatch, lines,
+                          cell={"sigma": 0, "payload": 2000, "timeout": 600})
+    assert fake.terminated
+    assert row["stopped_early"] == "true"
+    assert row["got"] == 1334
+    assert row["intact"] == "false", "intact must not flip true off the fallback got"

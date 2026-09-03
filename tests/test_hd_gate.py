@@ -9,6 +9,7 @@ no-op; fixed 2026-07-10).
 import os
 
 import numpy as np
+import pytest
 
 from conftest import load_sim, make_link, feed, tone_block
 
@@ -187,3 +188,75 @@ def test_key_bursts_in_npstats(tmp_path):
     stats = json.load(open(str(tmp_path / "np.11")))
     assert stats["key_bursts"] == 1
     assert stats["key_duty"] > 0
+
+
+def test_ptt_edges_and_collision_logged(capsys):
+    """WDP-REALPATH 2026-09-02: three bench sessions timed out on the sender's
+    retry budget with the receiver having heard only a handful of bursts, and
+    nothing on the bench could say whether the bursts were missed (fade) or
+    masked (both stations keyed at once, HD) -- the sim kept no keying
+    timeline and no collision count. Pins: audio-clock-stamped [ptt] key/unkey
+    edges (monotonic t) for BOTH stations, a single [collision] start/end pair
+    for one overlap window, and the shutdown keying-summary counters."""
+    cs = load_sim(SIM_HALF_DUPLEX=1, SIM_PTT=1, SIM_HANG_MS=0)
+    ab, ba, keys, ptt = hd_pair(cs)
+    silence = np.zeros(cs.NSAMP, dtype="<i2")
+    tone = tone_block(cs)
+
+    # block 0: idle both -- no edges, no overlap
+    feed(ab, silence)
+    feed(ba, silence)
+    ab.nblocks += 1
+    ba.nblocks += 1
+
+    # blocks 1-3: BOTH stations key up together -> a 3-block mutual overlap
+    ptt.a = True
+    ptt.b = True
+    for _ in range(3):
+        feed(ab, tone)
+        feed(ba, tone)
+        ab.nblocks += 1
+        ba.nblocks += 1
+
+    # unkey both; SIM_HANG_MS=0 still costs HANG_BLOCKS+1 silent blocks (max(1,...))
+    ptt.a = False
+    ptt.b = False
+    for _ in range(cs.HANG_BLOCKS + 1):
+        feed(ab, silence)
+        feed(ba, silence)
+        ab.nblocks += 1
+        ba.nblocks += 1
+    assert not ab.keyed and not ba.keyed
+    cs.print_keying_summary(ab, ba, keys)   # normally emitted at main()'s shutdown
+
+    err = capsys.readouterr().err
+    lines = err.splitlines()
+    ptt_lines = [l for l in lines if "[ptt]" in l]
+    coll_lines = [l for l in lines if "[collision]" in l]
+
+    assert any(l.endswith("a key") for l in ptt_lines)
+    assert any(l.endswith("b key") for l in ptt_lines)
+    assert any(l.endswith("a unkey") for l in ptt_lines)
+    assert any(l.endswith("b unkey") for l in ptt_lines)
+
+    def _t(line):
+        return float(line.split("t=")[1].split()[0])
+
+    times = [_t(l) for l in ptt_lines]
+    assert times == sorted(times), "audio-clock t must be monotonically increasing"
+
+    starts = [l for l in coll_lines if l.endswith("start")]
+    ends = [l for l in coll_lines if "end" in l]
+    assert len(starts) == 1, f"expected exactly one collision start, got {coll_lines}"
+    assert len(ends) == 1, f"expected exactly one collision end, got {coll_lines}"
+    dur = float(ends[0].split("dur=")[1])
+    assert dur > 0
+    assert keys.collisions == 1
+    assert keys.collision_blocks >= 3
+    assert dur == pytest.approx(keys.collision_blocks * cs.BLOCK / cs.FS, rel=1e-6)
+
+    summary = next(l for l in lines if "keying summary" in l)
+    assert "a_bursts=1" in summary
+    assert "b_bursts=1" in summary
+    assert "collisions=1" in summary
+    assert f"collision_s={keys.collision_blocks * cs.BLOCK / cs.FS:.1f}" in summary

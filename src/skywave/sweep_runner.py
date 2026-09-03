@@ -388,6 +388,21 @@ def parse_progress(txt):
     return sorted(curve.items())
 
 
+def resolve_got(txt, got, curve):
+    """Delivered-byte fallback for a row with no RESULT line -- a STALL_EARLYOUT
+    kill (`p.terminate()`) or the hard `timeout` firing before the adapter could
+    print one. Without a RESULT line `got` stays its 0 initializer even though
+    ticks show real bytes delivered (a bench row reported got=0 with 1334 B
+    actually delivered -- WDP-REALPATH 2026-09-02). The true count is the last
+    tick of the progress curve (`parse_progress(txt)`), which the RESULT-line
+    path never touches. Never LOWERS a `got` already parsed from a RESULT line;
+    a no-tick run (ticks off, or the adapter died before its first tick) is
+    unaffected."""
+    if curve:
+        got = max(got, curve[-1][1])
+    return got
+
+
 def stall_seconds(curve):
     """Longest span of the curve over which the delivered byte count did not increase.
 
@@ -747,6 +762,7 @@ def run_cell(modem, cell, rep, writer, fcsv, tag):
             p.wait()
         el = round(time.time() - t0, 1)
         txt = "".join(chunks)
+        curve = parse_progress(txt)
         got = tot = 0; dt = el; intact = "false"; gp = 0.0; peak = 0; sn = -99.0
         conn = ""    # blank = not reported (fail_connect row, or a pre-connect_s adapter)
         wall = ""    # blank = not reported (fail row, or a pre-wall_s adapter)
@@ -774,6 +790,8 @@ def run_cell(modem, cell, rep, writer, fcsv, tag):
                 status = "fail"
         else:
             tot = payload
+            got = resolve_got(txt, got, curve)   # e.g. a STALL_EARLYOUT kill: no RESULT
+                                                  # line, but ticks show real bytes delivered
             status = "timeout" if p.returncode == 124 else (
                 "fail_connect" if ("no CONNECT" in txt or "not listening" in txt
                                    or "not up" in txt or "NOCONN" in txt) else "fail")
@@ -805,8 +823,9 @@ def run_cell(modem, cell, rep, writer, fcsv, tag):
     # Delivery curve, when the adapter was run with ticks on. Parked beside the cell's
     # log rather than folded into the row: the row is one line per (cell, rep) and the
     # curve is a series. The row carries the pointer + the one summary a scorer needs
-    # without opening it. Written from the LAST attempt's output, same as `log`.
-    curve = parse_progress(txt)
+    # without opening it. Written from the LAST attempt's output, same as `log`
+    # (`curve` itself was already computed inside the attempt loop, from the same
+    # `txt` -- reused here rather than reparsed).
     progress_log = ""
     if curve:
         progress_log = os.path.basename(

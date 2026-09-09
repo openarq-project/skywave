@@ -78,6 +78,29 @@ class ArmstrongAdapter(ModemAdapter):
         # tests/test_ptt_isolation.py for the regression pins.
         self.cfgdir = self.sockdir if self.sock else f"/tmp/skywave-armcfg-{os.getpid()}"
         os.makedirs(self.cfgdir, exist_ok=True)
+        # Data direction: "ab" (default) A calls AND A sends; "ba" A still calls
+        # (the CONNECT handshake is unchanged) but B (the answerer) sends the
+        # payload and A receives it. See link_connect() for where this is applied.
+        self.direction = os.environ.get("SKYW_DIRECTION", "ab").strip() or "ab"
+        if self.direction not in ("ab", "ba"):
+            raise RuntimeError(f"SKYW_DIRECTION must be ab or ba (got {self.direction!r})")
+        # Connect-then-fade cells: hold the data phase off until SIM_ATTEN_SCHEDULE's
+        # first step has landed (+ this many extra seconds), so the whole transfer
+        # runs at the held (post-step) attenuation instead of starting at the flat
+        # pre-step value. Unset/empty = off; see _data_hold().
+        _hold = os.environ.get("SKYW_DATA_HOLD_AFTER_STEP_S", "").strip()
+        if _hold:
+            try:
+                self.data_hold_s = float(_hold)
+            except ValueError:
+                raise RuntimeError(
+                    f"SKYW_DATA_HOLD_AFTER_STEP_S must be a float (got {_hold!r})")
+            if self.data_hold_s < 0:
+                raise RuntimeError(
+                    f"SKYW_DATA_HOLD_AFTER_STEP_S must be >= 0 (got {self.data_hold_s})")
+        else:
+            self.data_hold_s = None
+        self._chan_t0 = None    # wall-clock anchor for the hold on a real-time rig; see launch_channel()
         self.a = self.b = self.adat = self.bdat = None
         self.nm = {}
         self.buf = {}
@@ -102,6 +125,11 @@ class ArmstrongAdapter(ModemAdapter):
 
     # ---- channel: default ALSA aloop rig; sock transport is opt-in ----
     def launch_channel(self):
+        # Anchor for SKYW_DATA_HOLD_AFTER_STEP_S on a real-time (non-virt) rig, where
+        # bench_time() is plain wall clock and so can't be diffed against 0 the way the
+        # sim's own signal clock can -- see _data_hold(). An approximation of the sim's
+        # audio clock (channel launch != first sample), good enough for a hold bound.
+        self._chan_t0 = time.time()
         if self.sock:
             # Armstrong's sock audio backend runs on a block-lockstep virtual clock, so the
             # sim must be the matching virtual-time master; a real_time-paced sim stalls the
@@ -274,8 +302,15 @@ class ArmstrongAdapter(ModemAdapter):
                     # and telemetry keep flowing (a hard sleep squelches the first burst).
                     # settle_s is short in virt_time so it can't race past keepalive-loss.
                     self._pump(time.time() + self.settle_s)
-                    self.adat = socket.create_connection(("127.0.0.1", self.A_PORT + 1))       # A sender
-                    self.bdat = socket.create_connection(("127.0.0.1", self.B_PORT + 1)); self.bdat.setblocking(False)
+                    self._data_hold()
+                    if self.direction == "ba":
+                        self.adat = socket.create_connection(("127.0.0.1", self.B_PORT + 1))     # B (answerer) sender
+                        self.bdat = socket.create_connection(("127.0.0.1", self.A_PORT + 1)); self.bdat.setblocking(False)
+                        print("DIRECTION ba (answerer sends)", flush=True)
+                    else:
+                        self.adat = socket.create_connection(("127.0.0.1", self.A_PORT + 1))     # A (caller) sender
+                        self.bdat = socket.create_connection(("127.0.0.1", self.B_PORT + 1)); self.bdat.setblocking(False)
+                        print("DIRECTION ab (caller sends)", flush=True)
                     return True
                 print(f"  (connect {attempt}/3 failed; retry)", flush=True)
                 self._snd(self.a, "ABORT"); time.sleep(3)
@@ -339,6 +374,63 @@ class ArmstrongAdapter(ModemAdapter):
                 sp.run(["pkill", "-9", "-f", pat], stdout=sp.DEVNULL, stderr=sp.DEVNULL)
 
     # ---- helpers ----
+    @staticmethod
+    def _atten_schedule_first_step_secs():
+        """The duration of SIM_ATTEN_SCHEDULE's FIRST segment ("<db>:<secs>,..."),
+        parsed locally so this module never imports skywave.channel_sim (it reads
+        the environment at import time and can sys.exit on a malformed value --
+        channel_sim itself, run as the channel-sim subprocess, is the real
+        validator). Returns None when there's no schedule (or it can't be parsed
+        here); a segment with no ":" or an empty seconds part is secs=0 (matches
+        parse_atten_schedule's own default)."""
+        text = os.environ.get("SIM_ATTEN_SCHEDULE", "").strip()
+        if not text:
+            return None
+        tok = text.split(",", 1)[0]
+        db, _, secs = tok.strip().partition(":")
+        if not db.strip():
+            return None
+        try:
+            return float(secs) if secs.strip() else 0.0
+        except ValueError:
+            return None
+
+    def _data_hold(self):
+        """Connect-then-fade support (SKYW_DATA_HOLD_AFTER_STEP_S): if a
+        SIM_ATTEN_SCHEDULE is in force and its first segment steps at secs0 > 0,
+        keep pumping the control sockets (never a hard sleep -- PTT/telemetry must
+        keep flowing) until bench time reaches secs0 + self.data_hold_s, so the
+        whole data phase runs at the held (post-step) attenuation. No-op when the
+        knob is unset, there's no schedule, or the schedule holds from t=0."""
+        if self.data_hold_s is None:
+            return
+        secs0 = self._atten_schedule_first_step_secs()
+        if not secs0:
+            return
+        target = secs0 + self.data_hold_s
+        print(f"DATA_HOLD until bench t={target:.1f} "
+              f"(step at {secs0:.1f} + {self.data_hold_s:.1f})", flush=True)
+        wall_deadline = time.time() + 4 * target
+        while True:
+            # virt sock rig: bench_time() IS the sim's signal clock the schedule steps
+            # on. Real-time rig (ALSA, or sock+SIM_CLOCK=real_time): bench_time() is
+            # plain wall clock, so diff it against the channel-launch anchor instead --
+            # an approximation of the sim's audio clock (see launch_channel()).
+            t = self.bench_time() if self._virt else (time.time() - (self._chan_t0 or time.time()))
+            if t >= target:
+                print(f"DATA_HOLD released at bench t={t:.1f}", flush=True)
+                return
+            if time.time() >= wall_deadline:
+                print("DATA_HOLD timeout", flush=True)
+                return
+            slice_end = min(time.time() + 1.0, wall_deadline)
+            alive = self._pump(slice_end)
+            if not alive and time.time() < slice_end - 0.05:
+                # _pump returned early (not just at its deadline): the dead-socket
+                # path (control-socket EOF) already logged its own line.
+                print("DATA_HOLD timeout", flush=True)
+                return
+
     def _snd(self, s, c):
         s.sendall((c + "\r").encode())
         print(f"  -> {self.nm[s]}: {c}", flush=True)

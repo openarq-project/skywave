@@ -180,3 +180,114 @@ def test_preclean_patterns_cover_the_fm_binary(monkeypatch, sock_dir):
     import re
     assert re.search(pat, "armstrong-fm --config x --audio sock --callsign W1CAL")
     assert re.search(pat, "armstrong-hf --config x --audio sock --callsign W1CAL")
+
+
+# ---- SKYW_DIRECTION / SKYW_DATA_HOLD_AFTER_STEP_S (connect-then-fade cells) ----
+
+class _FakeDataSock:
+    """Stand-in for socket.create_connection()'s return in link_connect's
+    data-socket-opening branch -- setblocking/sendall/close are all no-ops."""
+    def setblocking(self, v):
+        pass
+
+    def sendall(self, b):
+        pass
+
+    def close(self):
+        pass
+
+
+def _patch_link_connect_plumbing(monkeypatch, ad, pump_result=True):
+    """Let link_connect run to the socket-opening branch with no real armstrong
+    process: _snd becomes a no-op, _pump always reports success (so the
+    CONNECTED-wait branch is taken immediately), and socket.create_connection
+    (module-level, as the adapter imports it) is faked to record every
+    (host, port) it is asked to open. Returns (connections, pump_calls)."""
+    connections = []
+    monkeypatch.setattr("skywave.adapters.armstrong.socket.create_connection",
+                         lambda addr, *a, **kw: connections.append(addr) or _FakeDataSock())
+    monkeypatch.setattr(ad, "_snd", lambda s, c: None)
+    pump_calls = []
+
+    def fake_pump(*a, **kw):
+        pump_calls.append((a, kw))
+        return pump_result
+    monkeypatch.setattr(ad, "_pump", fake_pump)
+    return connections, pump_calls
+
+
+def test_direction_defaults_to_ab_and_data_flows_caller_to_answerer(monkeypatch, sock_dir, capsys):
+    ad = _mk_adapter(monkeypatch, sock_dir)
+    assert ad.direction == "ab"
+    connections, _ = _patch_link_connect_plumbing(monkeypatch, ad)
+    assert ad.link_connect(time.time() + 5) is True
+    # adat (the sender) opens A_PORT+1 first, then bdat (the receiver) B_PORT+1.
+    assert connections[-2:] == [("127.0.0.1", ad.A_PORT + 1), ("127.0.0.1", ad.B_PORT + 1)]
+    assert "DIRECTION ab (caller sends)" in capsys.readouterr().out
+
+
+def test_direction_ba_swaps_which_port_each_data_socket_opens(monkeypatch, sock_dir, capsys):
+    monkeypatch.setenv("SKYW_DIRECTION", "ba")
+    ad = _mk_adapter(monkeypatch, sock_dir)
+    assert ad.direction == "ba"
+    connections, _ = _patch_link_connect_plumbing(monkeypatch, ad)
+    assert ad.link_connect(time.time() + 5) is True
+    # adat now opens B_PORT+1 (B, the answerer, sends) and bdat A_PORT+1 (A receives) --
+    # transfer() is unchanged: it still writes to adat and reads bdat.
+    assert connections[-2:] == [("127.0.0.1", ad.B_PORT + 1), ("127.0.0.1", ad.A_PORT + 1)]
+    assert "DIRECTION ba (answerer sends)" in capsys.readouterr().out
+
+
+def test_direction_invalid_value_raises_at_construction(monkeypatch, sock_dir):
+    monkeypatch.setenv("SKYW_DIRECTION", "sideways")
+    with pytest.raises(RuntimeError):
+        _mk_adapter(monkeypatch, sock_dir)
+
+
+def test_data_hold_waits_for_the_atten_step_plus_hold_then_opens_sockets(monkeypatch, sock_dir, capsys):
+    """connect-then-fade: SIM_ATTEN_SCHEDULE="0:40,16:0" steps at bench t=40; with
+    SKYW_DATA_HOLD_AFTER_STEP_S=5 the data sockets must not open before t=45."""
+    monkeypatch.setenv("SIM_ATTEN_SCHEDULE", "0:40,16:0")
+    monkeypatch.setenv("SKYW_DATA_HOLD_AFTER_STEP_S", "5")
+    ad = _mk_adapter(monkeypatch, sock_dir)      # sock + virt_time -> _virt True -> bench_time() path
+    assert ad.data_hold_s == 5.0
+    ticks = iter([20.0, 30.0, 44.0, 46.0])
+    monkeypatch.setattr(ad, "bench_time", lambda: next(ticks))
+    connections, pump_calls = _patch_link_connect_plumbing(monkeypatch, ad)
+    assert ad.link_connect(time.time() + 5) is True
+    assert connections[-2:] == [("127.0.0.1", ad.A_PORT + 1), ("127.0.0.1", ad.B_PORT + 1)]
+    # 3 hold-loop pumps (t=20,30,44 all < 45) plus link_connect's own 3 fixed pumps
+    # (post-MYCALL ack, the CONNECTED wait, the post-connect settle).
+    assert len(pump_calls) == 6, pump_calls
+    out = capsys.readouterr().out
+    assert "DATA_HOLD until bench t=45.0 (step at 40.0 + 5.0)" in out
+    assert "DATA_HOLD released at bench t=46.0" in out
+
+
+def test_data_hold_is_a_noop_with_no_schedule(monkeypatch, sock_dir):
+    monkeypatch.delenv("SIM_ATTEN_SCHEDULE", raising=False)
+    monkeypatch.setenv("SKYW_DATA_HOLD_AFTER_STEP_S", "5")
+    ad = _mk_adapter(monkeypatch, sock_dir)
+    connections, pump_calls = _patch_link_connect_plumbing(monkeypatch, ad)
+    assert ad.link_connect(time.time() + 5) is True
+    assert connections[-2:] == [("127.0.0.1", ad.A_PORT + 1), ("127.0.0.1", ad.B_PORT + 1)]
+    # flat cells are unaffected: only link_connect's own 3 fixed pumps happen.
+    assert len(pump_calls) == 3, pump_calls
+
+
+def test_data_hold_is_a_noop_when_the_schedule_has_no_first_step(monkeypatch, sock_dir):
+    """A schedule that holds from t=0 (single segment, no step) must not hold data."""
+    monkeypatch.setenv("SIM_ATTEN_SCHEDULE", "16:0")
+    monkeypatch.setenv("SKYW_DATA_HOLD_AFTER_STEP_S", "5")
+    ad = _mk_adapter(monkeypatch, sock_dir)
+    connections, pump_calls = _patch_link_connect_plumbing(monkeypatch, ad)
+    assert ad.link_connect(time.time() + 5) is True
+    assert connections[-2:] == [("127.0.0.1", ad.A_PORT + 1), ("127.0.0.1", ad.B_PORT + 1)]
+    assert len(pump_calls) == 3, pump_calls
+
+
+@pytest.mark.parametrize("bad", ["not-a-number", "-1", "-0.5"])
+def test_data_hold_bad_value_raises_at_construction(monkeypatch, sock_dir, bad):
+    monkeypatch.setenv("SKYW_DATA_HOLD_AFTER_STEP_S", bad)
+    with pytest.raises(RuntimeError):
+        _mk_adapter(monkeypatch, sock_dir)

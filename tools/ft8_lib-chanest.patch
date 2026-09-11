@@ -1,0 +1,18 @@
+diff --git a/demo/decode_ft8.c b/demo/decode_ft8.c
+index dcb0299..67ce51f 100644
+--- a/demo/decode_ft8.c
++++ b/demo/decode_ft8.c
+@@ -225,6 +225,13 @@ void decode(const monitor_t* mon, struct tm* tm_slot_start)
+             printf("%02d%02d%02d %+05.1f %+4.2f %4.0f ~  %s\n",
+                 tm_slot_start->tm_hour, tm_slot_start->tm_min, tm_slot_start->tm_sec,
+                 snr, time_sec, freq_hz, text);
++            {   // channel-estimator hook: the decoded codeword's 79 tones (works for hashed calls too)
++                uint8_t tones79[79];
++                ft8_encode(message.payload, tones79);
++                printf("TONES %4.0f %+4.2f ", freq_hz, time_sec);
++                for (int ti = 0; ti < 79; ti++) printf("%d", tones79[ti]);
++                printf(" %s\n", text);
++            }
+         }
+     }
+     LOG(LOG_INFO, "Decoded %d messages, callsign hashtable size %d\n", num_decoded, callsign_hashtable_size);

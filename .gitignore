@@ -15,3 +15,5 @@ results/
 EXTRACTION-AUDIT.md
 # Claude Code local agent context (auto-generated memory mirror — machine-local)
 .claude/
+out/
+.ft8_lib

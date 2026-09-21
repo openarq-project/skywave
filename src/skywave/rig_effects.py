@@ -433,3 +433,169 @@ class QrmGenerator:
             self.sweep_phase = float(ph[-1] % (2 * np.pi))
             out += self.sweep_amp * np.sin(ph) * (frac < (hi - lo) / self.sweep_band)
         self.t += n
+
+
+class QrmReplay:
+    """Recorded-environment QRM: a KiwiSDR IQ capture IS the channel's additive
+    term (noise floor + every interferer in it), replayed exactly.
+
+    Pre-registered as the module's replay mode (openarq
+    reviews/QRM-KIWI-PILOT-PREREG-2026-09-09.md §7; built after the pilot's D3
+    REPLACE ruling, 2026-09-21). Interference ADDS, so a recording replays
+    exactly: the ONE free parameter is the level. Here the recording REPLACES
+    the simulator's white noise — it is scaled so that its own measured noise
+    floor (per-Hz mean, the pilot scorer's estimator: per-bin p10 over time
+    /0.1054, then p25 across bins) equals the white-noise density SIGMA
+    defines (sigma^2 over the fs/2 Nyquist band). The cell's SNR axis is then
+    unchanged by construction (in-band noise power = sigma^2 * bw/(fs/2), the
+    same 3 kHz-band fraction the AWGN calibration test pins) and every
+    interferer in the recording rides along at its TRUE INR over that floor.
+    `replaces_noise` tells the Link to skip its AWGN fill.
+
+    Slice: a USB receiver at `dial_hz` inside the capture's baseband — the
+    audio is the real part of the analytic band [dial, dial + bw] (positive IQ
+    frequency = above the capture centre; verified on the pilot corpus by the
+    FT8 15 s cadence sitting on the + side of a 30 m parking capture). The
+    capture's own Kiwi passband is flat to ±5 kHz, so |dial| + bw <= 5000.
+    Resampling to `fs` is exact band-limited interpolation (spectrum
+    zero-pad). Files play back-to-back in a seeded random order, looping,
+    with a short equal-power crossfade (no gap, no step). Each file is normalised
+    to ITS OWN floor, so a non-stationary corpus keeps the cell's floor fixed
+    while the QRM statistics come from the recordings.
+
+    Provenance: `describe()` names the files, the dial, the per-file floor in
+    dBm/Hz when the capture's sidecar carries the S-meter anchor
+    (`rssi_min_dbm` over 3 kHz), and `peak_amp` (the scaled peak over the
+    whole playlist) for the rail-budget gate."""
+
+    EXP_P10 = -math.log(0.9)          # p10 of an exponential in units of its mean
+
+    def __init__(self, fs, rng, sigma, files, dial_hz=0.0, bw_hz=3000.0,
+                 xfade_s=0.25, frame_s=1.0):
+        import wave, json, os
+        if not files:
+            raise ValueError("QrmReplay: no files")
+        if sigma <= 0.0:
+            raise ValueError("QrmReplay: sigma must be > 0 (the level anchor)")
+        if abs(float(dial_hz)) + float(bw_hz) > 5000.0 + 1e-9:
+            raise ValueError(f"QrmReplay: dial {dial_hz:g} + bw {bw_hz:g} Hz outside the "
+                             "capture's flat +-5 kHz passband")
+        self.fs = int(fs)
+        self.rng = rng
+        self.sigma = float(sigma)
+        self.files = list(files)
+        self.dial = float(dial_hz)
+        self.bw = float(bw_hz)
+        self.xfade = int(round(xfade_s * self.fs))
+        self.frame_s = float(frame_s)
+        self.target_n0 = self.sigma ** 2 / (self.fs / 2.0)       # per-Hz, one-sided
+        # per-file stats at construction (the rail gate needs the playlist peak)
+        self.stats = []
+        for p in self.files:
+            a, st = self._render(p)
+            side = {}
+            js = p[:-4] + ".json"
+            if os.path.exists(js):
+                try:
+                    side = json.load(open(js))
+                except Exception:
+                    side = {}
+            st["anchor_dbm_hz"] = (side["rssi_min_dbm"] - 10 * math.log10(3000.0)
+                                   if side.get("rssi_min_dbm") is not None else None)
+            st["station"] = side.get("station", "")
+            self.stats.append(st)
+        self.peak_amp = max(st["peak"] for st in self.stats)
+        # playlist: seeded permutation, looping
+        self.order = list(self.rng.permutation(len(self.files)))
+        self.idx = 0
+        self.cur = None            # current file's audio (float64, sim rate)
+        self.pos = 0
+        self.tail = None           # crossfade tail of the previous file
+        self._load(self.order[0])
+
+    # ----------------------------------------------------------------- render
+    def _read_iq(self, path):
+        import wave
+        with wave.open(path) as w:
+            fs_rec, n, ch = w.getframerate(), w.getnframes(), w.getnchannels()
+            if ch != 2:
+                raise ValueError(f"QrmReplay: {path} is not a 2-channel IQ wav")
+            x = np.frombuffer(w.readframes(n), dtype="<i2").reshape(-1, 2).astype(np.float64)
+        return fs_rec, x[:, 0] + 1j * x[:, 1]
+
+    def _render(self, path):
+        """USB slice -> real audio at the sim rate, scaled so the slice's noise
+        floor density equals target_n0. Returns (audio, stats)."""
+        fs_rec, z = self._read_iq(path)
+        n = len(z)
+        Z = np.fft.fft(z)
+        f = np.fft.fftfreq(n, 1.0 / fs_rec)
+        # floor of the slice: STFT frames of frame_s, per-bin p10 over time / EXP_P10, p25 across bins
+        seg = int(round(self.frame_s * fs_rec))
+        nfr = n // seg
+        if nfr < 5:
+            raise ValueError(f"QrmReplay: {path} shorter than 5 frames")
+        win = np.hanning(seg)
+        fr = np.fft.fftfreq(seg, 1.0 / fs_rec)
+        sel = (fr >= self.dial) & (fr < self.dial + self.bw)
+        pw = np.empty((nfr, int(sel.sum())))
+        for i in range(nfr):
+            X = np.fft.fft(z[i * seg:(i + 1) * seg] * win)
+            pw[i] = np.abs(X[sel]) ** 2
+        # per-bin power -> per-Hz density: |X|^2 / (sum(win^2) * fs_rec) is the periodogram density
+        dens = pw / (np.sum(win ** 2) * fs_rec)
+        per_bin = np.percentile(dens, 10, axis=0) / self.EXP_P10
+        n0_rec = float(np.percentile(per_bin, 25))
+        gain = math.sqrt(self.target_n0 / n0_rec)
+        # analytic slice -> audio: keep [dial, dial+bw], move dial -> 0, resample by spectrum padding
+        keep = (f >= self.dial) & (f < self.dial + self.bw)
+        k = np.flatnonzero(keep)
+        m = int(round(n * self.fs / fs_rec))                     # samples at the sim rate
+        S = np.zeros(m, dtype=complex)
+        shift = int(round(self.dial * n / fs_rec))               # bin of the dial
+        dst = k - shift                                          # 0 .. bw bins
+        S[dst] = Z[k] * (m / n)
+        audio = math.sqrt(2.0) * np.real(np.fft.ifft(S)) * gain  # Re() halves the analytic band's power; sqrt2 restores it
+        stats = {"file": path, "fs_rec": fs_rec, "seconds": n / fs_rec, "n0_rec": n0_rec,
+                 "gain": gain, "peak": float(np.max(np.abs(audio)))}
+        return audio, stats
+
+    def _load(self, j):
+        audio, _ = self._render(self.files[j])
+        self.cur = audio
+        self.pos = 0
+        if self.tail is not None and self.xfade > 0:
+            k = min(self.xfade, len(self.cur), len(self.tail))
+            # equal-POWER crossfade (sin/cos): two uncorrelated noise streams
+            # blended with linear amplitude ramps dip 3 dB at the midpoint
+            x = np.linspace(0.0, 1.0, k, endpoint=False)
+            self.cur[:k] = self.cur[:k] * np.sin(0.5 * np.pi * x) + self.tail[:k] * np.cos(0.5 * np.pi * x)
+            self.tail = None
+
+    # ------------------------------------------------------------------- run
+    def fill(self, out):
+        """ADD the replayed environment into `out` (mono float block)."""
+        n = len(out)
+        got = 0
+        while got < n:
+            avail = len(self.cur) - self.pos - (self.xfade if self.xfade else 0)
+            take = min(n - got, max(avail, 0))
+            if take > 0:
+                out[got:got + take] += self.cur[self.pos:self.pos + take]
+                self.pos += take
+                got += take
+            else:
+                # end of this file: keep its last xfade samples as the tail, advance
+                self.tail = self.cur[self.pos:self.pos + self.xfade].copy() if self.xfade else None
+                self.idx = (self.idx + 1) % len(self.order)
+                if self.idx == 0:
+                    self.order = list(self.rng.permutation(len(self.files)))
+                self._load(self.order[self.idx])
+
+    replaces_noise = True
+
+    def describe(self):
+        anchors = [st["anchor_dbm_hz"] for st in self.stats if st["anchor_dbm_hz"] is not None]
+        anc = (f"anchor {np.median(anchors):.1f} dBm/Hz (n={len(anchors)})" if anchors else "no S-meter anchor")
+        return (f"qrm=replay({len(self.files)} files, {sum(st['seconds'] for st in self.stats):.0f} s, "
+                f"dial {self.dial:+.0f} Hz, bw {self.bw:.0f}, {anc}, peak/sigma {self.peak_amp / self.sigma:.1f})")

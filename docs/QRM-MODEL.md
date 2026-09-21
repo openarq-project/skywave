@@ -195,6 +195,9 @@ degrading silently:
 | SIM_QRM_SWEEP_INR_DB    | sweeper peak (while-crossing) INR            | 10      |
 | SIM_QRM_SWEEP_RATE      | sweeps per second (burst repetition rate)    | 10      |
 | SIM_QRM_SWEEP_BAND_HZ   | virtual sweep span (duty = 2400 / span)      | 24000   |
+| SIM_QRM_REPLAY          | replay mode: IQ captures (paths/globs, comma-separated); replaces the white noise | (off) |
+| SIM_QRM_REPLAY_DIAL_HZ  | USB dial offset inside the capture (Hz)      | 0       |
+| SIM_QRM_REPLAY_BW_HZ    | replayed slice width (Hz)                    | 3000    |
 
 At occupancy 0 with the sweep off, the interferer process is not
 constructed at all, so output is bit-exact with QRM fully disabled. Given
@@ -232,3 +235,62 @@ keying) is deterministic and reproduces bit-identically across runs.
   source paper itself; its span and rate are IARUMS-plausible round
   numbers rather than a calibrated fit to a specific OTHR system
   (Section 5).
+
+## 10. Replay mode — a recorded environment as the channel's additive term (2026-09-21)
+
+The generative model above (Sections 2–5) was ruled REPLACED as the
+realistic-QRM baseline by the public-KiwiSDR occupancy pilot of
+2026-09-11→18 (openarq `reviews/qrm-pilot-2026-09-11/rulings/OWNER-RULINGS.md`,
+pre-registration `QRM-KIWI-PILOT-PREREG-2026-09-09.md` §0/§7). The ruling
+rests on bandwidth CLASS, the one statistic the pilot's 1 s / 28.6 Hz
+waterfall instrument measures independently of keying: 88 % of the busy
+events on the Winlink gateway channels (sites A + B, 229 k events) are wider
+than 100 Hz (segment width p50 314 Hz, 27 % at 600–3000 Hz), i.e. digital
+bursts, while this generator's keyed tone reads p50 86 Hz and nothing above
+300 Hz. The run-length ratio the pre-registration nominated turned out to be
+instrument-limited: pushed through the same 35 ms snapshot, the generator's
+busy runs read 1 s exactly like the real ones (`tools/qrm_d3_waveform_check.py`),
+so no run-length figure discriminates the two and none should be cited. The
+generator stays as the KNOWN BASELINE (Section 1) and for the sweeper.
+
+**Replay** (`rig_effects.QrmReplay`, `SIM_QRM_REPLAY`) is the exact mode:
+interference adds, so a recording of the band replays exactly, and the one
+free parameter is the level. A KiwiSDR IQ capture (the pilot's 2-min ±6 kHz
+fixed-gain wavs with `.json` sidecars) REPLACES the simulator's white noise:
+each file is scaled so its own measured noise floor (the pilot scorer's
+estimator — per-bin p10 over 1 s frames / 0.1054, then p25 across bins)
+equals the density SIGMA defines, sigma² over the fs/2 Nyquist band. The
+cell's SNR axis is therefore unchanged by construction (in-band noise power
+= sigma² · 3000/24000, the same 3 kHz-band fraction the AWGN calibration
+test pins), and every interferer in the recording rides along at its TRUE
+INR over that floor. The slice is a USB receiver at `SIM_QRM_REPLAY_DIAL_HZ`
+inside the capture (positive IQ frequency = above the capture centre,
+verified on the corpus by the FT8 cadence), `SIM_QRM_REPLAY_BW_HZ` wide;
+resampling to the simulator rate is exact (spectrum zero-pad). Files play
+in a seeded random order per direction (seeds 33/44, as the generator's),
+looping, with a 250 ms equal-power crossfade; each file is normalised to
+its OWN floor, so a non-stationary corpus keeps the cell's floor fixed while
+the QRM statistics come from the recordings. The sidecar's S-meter anchor
+(`rssi_min_dbm` over 3 kHz) is reported in the banner as the recording's
+absolute floor in dBm/Hz, so a cell's SNR maps to an absolute wanted-signal
+level when one is needed.
+
+Rail budget (Section 6): the recording's scaled peak over the whole
+playlist must fit under `qrm_rail_room_amp` (fail loud, never clamp). The
+pilot's site A 20 m gateway captures peak at ≈ 7.6 sigma, which fits the
+default −12 dB pad without fading at any sigma and with fading up to
+sigma ≈ 2000; deeper cells under fading need a deeper `SIM_RX_PAD_DB`.
+Conflicts fail loud: replay + `SIM_QRM_OCC`/`SIM_QRM_SWEEP` (one environment
+per cell) and replay + `SIM_NOISE_VD` (the recording carries its own
+impulsiveness). The AWGN path with replay off is byte-identical to before.
+
+Not built (pre-registered, pending): the **generative** mode fitted to the
+pilot's §5 statistics — bandwidth class, the +3…+10 dB level tail (D5:
+0.74–0.78 of detections, which the keyed-tone generator under-produces at
+0.42–0.56 through the same instrument), sub-second burst durations from the
+IQ tier — with waveforms from a snippet library by class; its acceptance
+bars are pre-registered (§7: busy fraction ±0.03, run-length p50 within
+25 %, INR p50 within 2 dB, and paired replay-vs-generative bench cells
+agreeing on goodput within 15 %). It earns its place when a cell must run
+without the private corpus.
+

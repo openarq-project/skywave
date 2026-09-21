@@ -430,6 +430,35 @@ if QRM_SWEEP and QRM_SWEEP_BAND_HZ < 2400.0:
         f"channel_sim: SIM_QRM_SWEEP_BAND_HZ={QRM_SWEEP_BAND_HZ:g} narrower "
         "than the 2400 Hz passband — the virtual sweep span must cover the "
         "channel (24000 default; 2400 = the retired continuous-jammer shape)")
+# QRM REPLAY mode (pre-reg §7, built 2026-09-21 after the pilot's D3 REPLACE):
+# SIM_QRM_REPLAY = comma-separated KiwiSDR IQ captures or globs (the pilot's
+# 2-min ±6 kHz fixed-gain wavs with .json sidecars). The recording REPLACES the
+# white noise: each file is scaled so its own measured noise floor equals the
+# density SIGMA defines, so the SNR axis is unchanged and every interferer in it
+# rides at its true INR (rig_effects.QrmReplay). SIM_QRM_REPLAY_DIAL_HZ = USB dial
+# offset inside the capture (default 0 = the capture centre, i.e. the gateway
+# cluster the pilot centred on); SIM_QRM_REPLAY_BW_HZ = slice width (3000).
+# Mutually exclusive with SIM_QRM_OCC/SWEEP (generative) and SIM_NOISE_VD (the
+# recording carries its own impulsiveness) — a conflict fails loud.
+QRM_REPLAY = os.environ.get("SIM_QRM_REPLAY", "").strip()
+QRM_REPLAY_DIAL_HZ = float(os.environ.get("SIM_QRM_REPLAY_DIAL_HZ", "0").strip() or "0")
+QRM_REPLAY_BW_HZ = float(os.environ.get("SIM_QRM_REPLAY_BW_HZ", "3000").strip() or "3000")
+if QRM_REPLAY and (QRM_OCC or QRM_SWEEP):
+    raise SystemExit("channel_sim: SIM_QRM_REPLAY and SIM_QRM_OCC/SIM_QRM_SWEEP are mutually exclusive "
+                     "(replay vs generative QRM — one environment per cell)")
+
+
+def qrm_replay_files(spec):
+    """Expand SIM_QRM_REPLAY (comma-separated paths/globs) to a sorted, de-duplicated file list."""
+    import glob as _glob
+    out = []
+    for item in spec.split(","):
+        item = os.path.expanduser(item.strip())
+        if not item:
+            continue
+        hits = sorted(_glob.glob(item)) if any(ch in item for ch in "*?[") else [item]
+        out.extend(h for h in hits if h.endswith(".wav"))
+    return sorted(dict.fromkeys(out))
 
 
 def qrm_rail_room_amp(sigma, rx_pad, fading):
@@ -996,13 +1025,16 @@ class Link:
         # to the signal, it does not saturate; the RX pad + guard below is the
         # only int16-boundary clip).
         qrm = self.fx.qrm if self.fx is not None else None
+        # QRM replay REPLACES the white noise (the recording is the floor + QRM,
+        # scaled to sigma's density): skip the AWGN fill, keep everything else.
+        awgn = self.sigma > 0.0 and not getattr(qrm, "replaces_noise", False)
         # FM ionosnc: the fade carries a complementary per-block noise-gain
         # track (the IONOS instrument raises the noise as the signal fades;
         # fm_channel docstring). None on every other fade kind — the baseline
         # noise path stays byte-identical.
         ngain = getattr(self.fade, "noise_gain", None)
         if deliver:
-            if self.sigma > 0.0:
+            if awgn:
                 self._fill_noise(self.noise)
                 if ngain is not None:
                     for c in range(NCH):
@@ -1013,7 +1045,7 @@ class Link:
         else:
             # receiver hears the noise floor (and any QRM — an independent
             # transmitter) only; no peer signal reaches it
-            if self.sigma > 0.0:
+            if awgn:
                 self._fill_noise(w)
                 if ngain is not None:
                     for c in range(NCH):
@@ -1725,7 +1757,7 @@ def build_channel_effects():
               file=sys.stderr, flush=True)
         return 2
     if any((FOFF_HZ, _foff_ramp, FOFF_DEV_HZ, CLOCK_PPM, ALC_DB, RX_AGC, NOISE_VD,
-            QRM_OCC, QRM_SWEEP)):
+            QRM_OCC, QRM_SWEEP, QRM_REPLAY)):
         from skywave import rig_effects as fxm
         if ALC_DB:
             fx_ab.alc = fxm.AlcOvershoot(FS, ALC_DB, ALC_SETTLE_MS, nch=NCH,
@@ -1828,6 +1860,34 @@ def build_channel_effects():
                       f"{QRM_SWEEP_BAND_HZ / 1000.0:g}kHz"
                       f"x{QRM_SWEEP_RATE:g}" if QRM_SWEEP else "")
             fx_desc.append(_qtag + _swtag)
+        if QRM_REPLAY:
+            if NOISE_VD:
+                print("channel_sim: SIM_QRM_REPLAY with SIM_NOISE_VD is a config conflict "
+                      "(the recording carries its own noise statistics)", file=sys.stderr, flush=True)
+                return 2
+            _files = qrm_replay_files(QRM_REPLAY)
+            if not _files:
+                print(f"channel_sim: SIM_QRM_REPLAY={QRM_REPLAY!r} matches no .wav", file=sys.stderr, flush=True)
+                return 2
+            _gate_sigma = max(SIGMA_AB, SIGMA_BA)
+            if _gate_sigma <= 0.0:
+                print("channel_sim: SIM_QRM_REPLAY needs SIGMA>0 (the recording's floor is "
+                      "scaled to it) — refusing to run inert", file=sys.stderr, flush=True)
+                return 2
+            fx_ab.qrm = fxm.QrmReplay(FS, np.random.default_rng(SEED + 33), SIGMA_AB, _files,
+                                      dial_hz=QRM_REPLAY_DIAL_HZ, bw_hz=QRM_REPLAY_BW_HZ)
+            fx_ba.qrm = fxm.QrmReplay(FS, np.random.default_rng(SEED + 44), SIGMA_BA, _files,
+                                      dial_hz=QRM_REPLAY_DIAL_HZ, bw_hz=QRM_REPLAY_BW_HZ)
+            # Rail-budget gate on the recording's own peaks (fail loud, never clamp)
+            _fading = WATTERSON != "off" or bool(FADE_SCHEDULE)
+            _room = qrm_rail_room_amp(_gate_sigma, RX_PAD, _fading)
+            _peak = max(fx_ab.qrm.peak_amp, fx_ba.qrm.peak_amp)
+            if _room <= 0.0 or _peak >= _room:
+                print(f"channel_sim: QRM replay rail budget exhausted (room {_room:.0f} vs recording peak "
+                      f"{_peak:.0f} at sigma={_gate_sigma:g}, rx_pad={RX_PAD_DB:g}dB, fading={_fading}) — "
+                      "deepen SIM_RX_PAD_DB or pick quieter captures", file=sys.stderr, flush=True)
+                return 2
+            fx_desc.append(fx_ab.qrm.describe())
 
     return _types.SimpleNamespace(
         fade_ab=fade_ab,

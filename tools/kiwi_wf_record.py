@@ -49,6 +49,11 @@ def main():
     ap.add_argument("-f", "--freq", type=float, required=True, help="centre, kHz")
     ap.add_argument("-z", "--zoom", type=int, default=10); ap.add_argument("--minutes", type=float, default=60)
     ap.add_argument("--out", required=True); ap.add_argument("--station", default="kiwi")
+    ap.add_argument("--interp", type=int, default=3,
+                    help="waterfall interpolation requested from the receiver: 3 = drop sampling WITHOUT CIC compensation "
+                         "(default; single-FFT exponential bins on every receiver). kiwirecorder's default 13 (drop + CIC "
+                         "compensation) compresses the noise bins and lifts the floor 4-10 dB on some KiwiSDR 2 units "
+                         "(2026-09-21 site C finding, reviews/qrm-pilot-2026-09-11/rulings/SITE-C-SPOT-CHECK.md)")
     a = ap.parse_args()
     os.makedirs(a.out, exist_ok=True)
     status = kiwi_status(a.server_host, a.server_port)
@@ -57,7 +62,7 @@ def main():
     tag = f"{a.station}_{int(a.freq)}_z{a.zoom}_{t0.strftime('%Y%m%dT%H%M%S')}"
     argv = ["kiwirecorder.py", "-s", a.server_host, "-p", str(a.server_port), "--wf", "-f", str(a.freq), "-z", str(a.zoom),
             "--tlimit", str(int(a.minutes * 60)), "--speed", "1", "--station", a.station, "--log=warn",
-            "--busy-retries", "1", "--busy-timeout", "5"]
+            "--busy-retries", "1", "--busy-timeout", "5", "--interp", str(a.interp)]
     sys.argv = argv
     kr.KiwiWaterfallRecorder._process_waterfall_samples = _dump   # method patch (the class name is used in super())
     try:
@@ -71,7 +76,7 @@ def main():
     span_khz = 30000.0 / (2 ** a.zoom)
     np.save(os.path.join(a.out, tag + ".wf.npy"), fr); np.save(os.path.join(a.out, tag + ".t.npy"), ts)
     json.dump({"host": f"{a.server_host}:{a.server_port}", "station": a.station, "centre_khz": a.freq, "zoom": a.zoom,
-               "span_khz": span_khz, "rbw_hz": 1000 * span_khz / 1024, "start_utc": t0.isoformat(),
+               "span_khz": span_khz, "rbw_hz": 1000 * span_khz / 1024, "interp": a.interp, "start_utc": t0.isoformat(),
                "frames": int(fr.shape[0]), "seconds": float(ts[-1] - ts[0]) if len(ts) > 1 else 0.0,
                "dbm_offset": -255, "wf_cal": wf_cal, "receiver": status,
                "note": "dBm/bin = byte + dbm_offset + wf_cal; first two bins are the DC notch"},

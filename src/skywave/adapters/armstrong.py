@@ -369,6 +369,25 @@ class ArmstrongAdapter(ModemAdapter):
         except OSError:
             pass
         super().teardown_stations()      # SIGTERM the armstrong processes
+        # Wait for each station to EXIT (bounded) before the channel is torn
+        # down and the runner moves on: the next cell's preclean pkill -9 of
+        # armstrong landed inside ~2.8 s of the SIGTERM on S1 (2026-09-10), and
+        # 4 connected sender logs ended without their `session summary` line
+        # (96/824 lacked one; the other 92 never connected). A station that
+        # is still alive after the bound is reported, not silently killed --
+        # its own `engine shutdown` / `pump exit` stage lines say where it
+        # stopped (armstrong 2026-09-21).
+        for p in self._stations:
+            t0 = time.time()
+            try:
+                rc = p.wait(timeout=10.0)
+                print(f"TEARDOWN station pid={p.pid} exited rc={rc} "
+                      f"in {time.time() - t0:.2f}s", flush=True)
+            except sp.TimeoutExpired:
+                print(f"TEARDOWN station pid={p.pid} STILL ALIVE 10 s after SIGTERM "
+                      f"(its log's last stage line names where it stopped)", flush=True)
+            except OSError:
+                pass
         if not self.sock:
             for pat in ["arecord -D plughw", "aplay -D plughw"]:
                 sp.run(["pkill", "-9", "-f", pat], stdout=sp.DEVNULL, stderr=sp.DEVNULL)

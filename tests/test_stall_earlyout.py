@@ -272,7 +272,9 @@ def test_byte_regression_is_not_a_recovery():
 
 
 def test_max_recovered_gap_is_a_trailing_schema_column():
-    assert COLUMNS[-1] == "max_recovered_gap"
+    # Trailing at the time it was added; later appends (`seed`, 2026-09-21)
+    # sit behind it -- the contract is "appended after every earlier column".
+    assert COLUMNS.index("max_recovered_gap") > COLUMNS.index("stopped_early")
 
 
 # ---- got must reflect delivered bytes on a no-RESULT (stall/kill) row ------------

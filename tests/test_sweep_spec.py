@@ -492,3 +492,53 @@ def test_require_txgain_explicit_escapes_do_not_raise(tmp_path, monkeypatch):
         _clear_gain_env(monkeypatch)
         monkeypatch.setenv(k, v)
         sweep_runner.require_txgain_or_die("ardop")   # each escape: must not raise
+
+
+# --------------------------------------------------------------------------
+# cell_seed: the shared-rep-seed default and the opt-in per-channel offset
+# (S1 addendum 2026-09-10: one shared seed hit every poor cell's rep 1).
+# --------------------------------------------------------------------------
+
+def test_cell_seed_default_is_the_shared_rep_seed():
+    cell = {"sigma": 0.3, "watterson": "poor", "tag": "x"}
+    for rep in range(5):
+        assert sweep_runner.cell_seed(cell, rep) == 1234 + 7 * rep
+    # Shared across cells by construction: any other cell, same rep, same seed.
+    other = {"sigma": 0.01, "watterson": "off", "payload": 256, "label": "arm-b"}
+    assert sweep_runner.cell_seed(other, 1) == sweep_runner.cell_seed(cell, 1) == 1241
+
+
+def test_seed_by_channel_pairs_arms_and_separates_channels():
+    a = {"sigma": 0.3, "watterson": "poor", "tag": "arm-a", "label": "on",
+         "payload": 256, "timeout": 900, "seed_by_channel": True}
+    b = {"sigma": 0.3, "watterson": "poor", "tag": "arm-b", "label": "off",
+         "payload": 1024, "timeout": 600, "seed_by_channel": True,
+         "reps": 3, "rep_base": 3}
+    # Arm pairing survives: same channel, whatever else differs.
+    for rep in range(4):
+        assert sweep_runner.cell_seed(a, rep) == sweep_runner.cell_seed(b, rep)
+    # Consecutive reps of one cell are the rep stride apart, so a top-up rep
+    # never collides with a collected one.
+    assert sweep_runner.cell_seed(a, 1) - sweep_runner.cell_seed(a, 0) == 7
+    # A different channel draws from a different block; so does a different
+    # SIM_* env, and the shared default is never one of them.
+    c = dict(a, sigma=0.35)
+    d = dict(a, env={"SIM_TR_JITTER_MS": "30"})
+    seeds = {sweep_runner.cell_seed(x, 0) for x in (a, c, d)}
+    assert len(seeds) == 3
+    assert all(s_ >= 1234 + 7 * 64 for s_ in seeds)
+    # The offset is a stable hash (zlib.crc32 of the canonical channel key),
+    # not Python's per-process hash(): pin one value so a corpus is
+    # reproducible from its spec on any machine.
+    import zlib
+    key = sweep_runner.channel_key(a)
+    assert key == '{"env":{},"sigma":"0.3","watterson":"poor"}'
+    expect = 1234 + 7 * 64 * (1 + zlib.crc32(key.encode()) % 65536)
+    assert sweep_runner.cell_seed(a, 0) == expect
+
+
+def test_seed_column_is_in_the_schema():
+    # Appended after every earlier column (results_schema policy: a trailing
+    # append needs no version bump); a later append may follow it.
+    assert COLUMNS.index("seed") > COLUMNS.index("max_recovered_gap")
+

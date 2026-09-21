@@ -441,6 +441,20 @@ the channel physics:
 - Every fading and noise realization is seeded. Paired-seed comparisons
   (the same channel realization run against two configurations) are the
   primary tool for isolating the effect of a single variable.
+- The sweep runner's default seed is `1234 + 7 * rep`, shared by every
+  cell in a spec per rep index. That is what makes paired-seed A/B
+  automatic, and it is also a trap worth naming in a pre-registration:
+  an N-rep campaign samples exactly N channel trajectories in total, not
+  N per cell, and one unlucky trajectory reaches every cell's same rep
+  (S1, 2026-09-10: seed 1241 carried a handshake-time fade into every
+  poor cell's rep 1, and a per-cell "more than k of N" bar counted that
+  one seed once per cell). A cell may opt in to `"seed_by_channel": true`,
+  which adds a block offset derived from the cell's channel-shaping
+  fields (sigma, fade preset or pair, attenuation, `SIM_*` env): cells at
+  different conditions then draw different realizations, while arms that
+  share a channel still share every seed, so pairing survives. Either
+  way the seed a row ran under is in the corpus `seed` column; a scorer
+  that pools reps across cells must read it rather than assume sharing.
 - The chain defaults to half-duplex, push-to-talk operation, matching real
   amateur and military HF practice; full-duplex operation is available but
   should be labeled explicitly wherever it is used, since it structurally

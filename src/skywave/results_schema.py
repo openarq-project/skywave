@@ -145,6 +145,15 @@ integer -- record the change in the changelog below.
         measured 0/8 resumes -- the premise was vacuous), so the safety
         obligation moved from a pre-run gate to a counter on every real row.
     "" on pre-existing corpora. Append = no bump per the policy above.
+  results-schema/1 + seed (2026-09-21): trailing column `seed` appended -- the
+    channel_sim SEED the row ACTUALLY ran under (sweep_runner.cell_seed). Default
+    1234 + 7*rep, shared by every cell per rep index (paired-seed A/B); a cell
+    with "seed_by_channel": true gets a per-channel block offset (zlib.crc32 of
+    its channel-shaping fields), so cells at different conditions draw different
+    realizations while arms sharing a channel still pair. Filed from S1 (2026-09-10:
+    one shared seed, 1241, carried a handshake-fade realization into every poor
+    cell's rep 1). Append = no bump; a scorer that groups reps must not assume
+    seeds are shared across cells -- read this column.
 """
 import csv
 import json
@@ -168,6 +177,7 @@ COLUMNS = [
     "stopped_early", "ceiling_s",
     "peak_dbfs", "papr_db",
     "max_recovered_gap",
+    "seed",
 ]
 
 # Per-column caster for the READER side (read_corpus). Everything is stored as text in
@@ -191,6 +201,7 @@ COLUMN_TYPES = {
     "stopped_early": str, "ceiling_s": float,
     "peak_dbfs": float, "papr_db": float,
     "max_recovered_gap": float,
+    "seed": int,
 }
 
 

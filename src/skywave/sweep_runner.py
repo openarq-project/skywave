@@ -54,6 +54,7 @@ Usage: skywave-sweep <modem> <cells.json> <out.csv> [tag]
 """
 import os, sys, json, subprocess as sp, time, re, csv, math, signal
 import skywave
+import zlib
 from skywave.rig_version import RIG_GEN
 from skywave.results_schema import COLUMNS, RESULTS_SCHEMA, write_manifest
 
@@ -542,12 +543,63 @@ def stall_config():
     return stall
 
 
+SEED_BASE = 1234
+SEED_REP_STRIDE = 7
+# Per-channel seed blocks for `seed_by_channel` cells: 64 reps of stride 7 per
+# block, so a block never overlaps the next one's rep range.
+SEED_CHANNEL_STRIDE = SEED_REP_STRIDE * 64
+SEED_CHANNEL_BLOCKS = 65536
+# The cell fields that shape the CHANNEL realization (everything channel_sim
+# derives from SEED is a function of these plus the seed itself). Not `tag`,
+# `label`, `payload`, `timeout`, `reps`: two arms that differ only in those
+# must keep the SAME seed, or a paired A/B stops being paired.
+SEED_CHANNEL_FIELDS = ("sigma", "watterson", "fade_delay_ms", "fade_doppler_hz",
+                       "atten_db", "atten_schedule")
+
+
+def channel_key(cell):
+    """Canonical text of a cell's channel-shaping fields (SEED_CHANNEL_FIELDS plus
+    its SIM_* `env`, keys sorted, values as str): equal for two cells that request
+    the same channel, whatever else differs between them."""
+    fields = {k: str(cell[k]) for k in SEED_CHANNEL_FIELDS if k in cell}
+    fields["env"] = {str(k): str(v) for k, v in (cell.get("env") or {}).items()}
+    return json.dumps(fields, sort_keys=True, separators=(",", ":"))
+
+
+def cell_seed(cell, rep):
+    """The channel_sim SEED for (cell, rep).
+
+    Default: SEED_BASE + SEED_REP_STRIDE*rep -- shared by EVERY cell in a spec per
+    rep index. That is what makes paired-seed A/B first-class (same rep, same
+    channel realization across arms), and it is also a trap: every 3-rep fading
+    campaign since July rested on the same three channel trajectories, and one
+    of them (seed 1241, rep 1) carried a handshake-fade realization that hit
+    every poor cell's rep 1 identically (S1 addendum 2026-09-10). A per-cell
+    bar counted one seed three times.
+
+    Opt-in per cell: `"seed_by_channel": true` adds a block offset keyed by the
+    cell's CHANNEL fields (channel_key: sigma, watterson, fade pair, atten,
+    SIM_* env) -- so cells at different channel conditions draw different
+    realizations per rep, while arms that share a channel (a mechanism A/B at
+    the same condition, differing only in tag/label/payload/env-free knobs)
+    still share every seed. zlib.crc32, not hash(): stable across processes
+    and machines, so a corpus is reproducible from its spec. The seed actually
+    used is recorded in the row's `seed` column either way.
+    """
+    seed = SEED_BASE + SEED_REP_STRIDE * int(rep)
+    if cell.get("seed_by_channel"):
+        block = zlib.crc32(channel_key(cell).encode()) % SEED_CHANNEL_BLOCKS
+        seed += SEED_CHANNEL_STRIDE * (1 + block)
+    return seed
+
+
 def rep_range(cell):
     """Absolute rep indices to run: rep_base .. rep_base+reps.
 
     rep_base (default 0) exists for the T5 floor-pin escalation: a later
     invocation ADDS reps 3..7 to a cell whose 0..2 are already in the corpus.
-    Absolute indices keep SEED = 1234 + rep*7 unique per rep and the
+    Absolute indices keep the seed (cell_seed: SEED = 1234 + rep*7, or that plus
+    a per-channel block for `seed_by_channel` cells) unique per rep and the
     log/npstats basenames distinct from the existing rows, so escalation
     never re-runs or supersedes collected data.
     """
@@ -640,7 +692,8 @@ def run_cell(modem, cell, rep, writer, fcsv, tag):
         env["SIM_ATTEN_DB"] = str(cell["atten_db"])
     if "atten_schedule" in cell:
         env["SIM_ATTEN_SCHEDULE"] = str(cell["atten_schedule"])
-    env["SEED"] = str(1234 + rep * 7)
+    seed = cell_seed(cell, rep)
+    env["SEED"] = str(seed)
     # Signal-time budget parity: bound the run at the cell timeout in VIRTUAL seconds.
     # Only the lockstep sock loop reads SIM_MAX_VIRTUAL_S, so this is inert on the
     # real-time rig -- but on a virtual-clock transport the WALL timeout alone buys
@@ -863,6 +916,11 @@ def run_cell(modem, cell, rep, writer, fcsv, tag):
            "fade_delay_ms": fade_ms, "fade_doppler_hz": fade_hz,
            "atten_db": atten_db,
            "connected": connected, "time_to_connect": time_to_connect,
+           # The channel_sim SEED this row ACTUALLY ran under (cell_seed):
+           # the shared 1234 + 7*rep, or the per-channel block when the cell
+           # opted in. Recorded so a scorer can tell shared from per-channel
+           # seeding without the spec (results_schema changelog).
+           "seed": seed,
            # F.1487 Annex 3 s6 statistical-coverage bookkeeping: independent
            # fade states this row sampled (channel seconds x Doppler spread).
            # A result is ensemble-converged when the SUM over its reps

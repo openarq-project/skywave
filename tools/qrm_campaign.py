@@ -33,6 +33,7 @@ SITES = {                                                     # pre-reg §2
     "C": ("22091.proxy.kiwisdr.com", 8073, "youngsvilleNC"),
     "FL": ("22315.proxy.kiwisdr.com", 8073, "palmharborFL"),
     "NC2": ("ssi.proxy.kiwisdr.com", 8073, "bakersvilleNC"),
+    "NC3": ("kiwisdr.itfais.com", 8073, "laurelspringsNC"),   # KT4RS Laurel Springs NC (EM96): passed qrm_site_gate 2026-09-21, C's alternate for the four-week run
 }
 BANDS = [                                                     # pre-reg §3: (name, wf centre kHz, zoom, IQ centres kHz)
     ("40m", 7097.0, 10, [7101.9, 7107.0]),
@@ -213,6 +214,15 @@ def check(a):
         v.sort(key=lambda x: abs(x[0] - t)); near = v[:60]
         f = float(np.median([x[1] for x in near])); dtm = (near[0][0] - t) / 60
         print(f"| {s['station']} | {s['band']} | {s['centre_khz']} | {s['start_utc'][11:19]} | {s['rssi_min_dbm']:.1f} → {n_hz:.1f} | {f:.1f} ({dtm:+.0f}) | {n_hz - f:+.1f} |")
+    # noise SHAPE per site x band (frames.csv noise_shape_db = per-frame median - p25 of the bins): 3.8-4.0 dB = single-FFT
+    # exponential bins (valid); ~3.0 dB = a processed waterfall (the kiwirecorder interp-13 CIC-compensation defect on some
+    # KiwiSDR 2 units, 2026-09-21) — the gate statistic, quoted in the heartbeat by name
+    shp = collections.defaultdict(list)
+    for r in csv.DictReader(open(os.path.join(a.score, "frames.csv"))):
+        shp[(r["site"], int(r["band_khz"]))].append(float(r["noise_shape_db"]))
+    print("\n| site | band kHz | frames | noise shape median−p25 dB (3.8–4.0 valid; ≤ 3.2 = processed waterfall ⇒ escalate) |\n|---|---|---|---|")
+    for (site, band), v in sorted(shp.items()):
+        print(f"| {site} | {band} | {len(v)} | {np.median(v):.1f} |")
 
 
 def main():

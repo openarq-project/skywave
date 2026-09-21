@@ -123,8 +123,10 @@ def test_describe_and_peak(corpus):
     rep = QrmReplay(48000, np.random.default_rng(SEED), 2000.0, corpus)
     d = rep.describe()
     assert "2 files" in d and "dial +0 Hz" in d and "anchor -127.8 dBm/Hz" in d
-    # the +12 dB tone alone has amplitude 2*sigma (power 16x the 3 kHz noise = 2 sigma^2); noise peaks add ~2.8 sigma
-    assert 2.0 * 2000.0 < rep.peak_amp < 4.5 * 2000.0
+    # peak_amp is a BOUND: sqrt2 * scaled complex peak * 1.5 — above anything streamed, but not absurd
+    y = run_fill(rep, 40.0)                       # crosses several boundaries (8 s files, crossfades)
+    assert rep.peak_seen <= rep.peak_amp <= 12.0 * 2000.0
+    assert np.max(np.abs(y)) <= rep.peak_amp
     assert rep.replaces_noise is True
 
 
@@ -170,4 +172,53 @@ def test_builder_constructs_replay_from_env_and_gates_the_rail(corpus):
     cs = load_sim(SIGMA=2000, SIM_QRM_REPLAY=corpus[0], SIM_NOISE_VD=5, SIM_RX_PAD_DB=-12)
     assert cs.build_channel_effects() == 2
     cs = load_sim(SIGMA=6000, SIM_QRM_REPLAY=corpus[0], SIM_RX_PAD_DB=0)
+    assert cs.build_channel_effects() == 2
+
+
+def test_negative_dial_straddling_zero_hz(tmp_path):
+    """Review 2026-09-21 finding 1: a tone at -1000 Hz IQ with the dial at -1500 Hz must land at +500 Hz audio
+    (bins on both sides of the FFT's 0 Hz wrap map by frequency, not by array index)."""
+    from skywave.rig_effects import QrmReplay
+    f = write_capture(str(tmp_path / "neg.wav"), n0=100.0, tones=[(-1000.0, 12.0)], seed=3)
+    fs, sigma = 48000, 2000.0
+    y = run_fill(QrmReplay(fs, np.random.default_rng(SEED), sigma, [f], dial_hz=-1500.0), 6.0)
+    tone = band_power(y, fs, 450, 550) - band_power(y, fs, 600, 700)
+    noise3k = sigma ** 2 * 3000.0 / (fs / 2.0)
+    assert abs(10 * math.log10(tone / noise3k) - 12.0) < 0.7, "tone lost or moved (0 Hz wrap)"
+    assert band_power(y, fs, 4000, 23000) < 0.02 * band_power(y, fs, 0, 3000), "energy dumped out of band"
+
+
+def test_fill_never_renders_and_prefetch_is_ready(corpus):
+    """Review finding 2: a file boundary inside fill() is a buffer swap, not a re-render — the next file was
+    rendered on a background thread; every render after construction runs off the calling thread."""
+    import threading, time
+    from skywave.rig_effects import QrmReplay
+    fs, sigma = 48000, 1000.0
+    rep = QrmReplay(fs, np.random.default_rng(SEED), sigma, corpus)
+    threads = []
+    orig = rep._render
+
+    def spy(path):
+        threads.append(threading.current_thread().name)
+        return orig(path)
+    rep._render = spy
+    time.sleep(1.0)                                   # let the first prefetch (started in __init__) finish
+    block = 1024
+    worst = 0.0
+    for _ in range(int(20.0 * fs / block)):           # 20 s over 8 s files: 2 boundaries
+        b = np.zeros(block); t0 = time.perf_counter(); rep.fill(b); worst = max(worst, time.perf_counter() - t0)
+        if rep.pos < block:                           # just crossed a boundary: the test runs ~40x faster than real
+            time.sleep(0.3)                           # time, so give the 8 s file's render the slack a real 8 s has
+    assert rep.renders_in_fill == 0, "a boundary waited on an unfinished render"
+    assert threads and all(t == "qrm-replay-prefetch" for t in threads), threads
+    assert worst < 0.05, f"a fill() call took {worst*1000:.0f} ms"
+
+
+def test_asymmetric_zero_sigma_and_onset_fail_loud(corpus):
+    """Review findings 4 + 5: one direction at sigma 0, or a sigma onset schedule, with replay set is a config
+    error (2 from the builder), never a ValueError and never a silent full-level pre-onset."""
+    d = os.path.dirname(corpus[0])
+    cs = load_sim(SIGMA=2000, SIM_SIGMA_BA=0, SIM_QRM_REPLAY=corpus[0], SIM_RX_PAD_DB=-12)
+    assert cs.build_channel_effects() == 2
+    cs = load_sim(SIGMA=2000, SIM_SIGMA_BA=2000, SIM_QRM_REPLAY=corpus[0], SIM_RX_PAD_DB=-12, SIM_SIGMA_BA_ONSET_S=30)
     assert cs.build_channel_effects() == 2

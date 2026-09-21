@@ -457,22 +457,40 @@ class QrmReplay:
     frequency = above the capture centre; verified on the pilot corpus by the
     FT8 15 s cadence sitting on the + side of a 30 m parking capture). The
     capture's own Kiwi passband is flat to ±5 kHz, so |dial| + bw <= 5000.
-    Resampling to `fs` is exact band-limited interpolation (spectrum
-    zero-pad). Files play back-to-back in a seeded random order, looping,
-    with a short equal-power crossfade (no gap, no step). Each file is normalised
-    to ITS OWN floor, so a non-stationary corpus keeps the cell's floor fixed
-    while the QRM statistics come from the recordings.
+    Bins are mapped by FREQUENCY (a negative dial straddles the 0 Hz wrap of
+    the FFT layout; review 2026-09-21 finding 1). Resampling to `fs` is exact
+    band-limited interpolation (spectrum zero-pad). Files play back-to-back
+    in a seeded random order, looping, with a short equal-power crossfade (no
+    gap, no step). Each file is normalised to ITS OWN floor, so a
+    non-stationary corpus keeps the cell's floor fixed while the QRM
+    statistics come from the recordings.
+
+    Real-time path: `fill()` never renders. Construction renders each file
+    ONCE for its floor and true peak (~0.6 s per 2-min capture; the
+    sigma-independent result is cached across the two directions), the first
+    file is rendered for playback, and every NEXT file is rendered on a
+    background thread while the current one plays, so a file boundary is a
+    buffer swap (review finding 2: the first version re-rendered the whole
+    file inside the audio callback). A run faster than ~30x real time can
+    reach a boundary before the render finishes; `renders_in_fill` counts
+    those stalls (0 at real time).
 
     Provenance: `describe()` names the files, the dial, the per-file floor in
     dBm/Hz when the capture's sidecar carries the S-meter anchor
-    (`rssi_min_dbm` over 3 kHz), and `peak_amp` (the scaled peak over the
-    whole playlist) for the rail-budget gate."""
+    (`rssi_min_dbm` over 3 kHz), and `peak_amp` — a conservative UPPER BOUND
+    on the streamed peak (the rendered slice's peak x 1.5 for the
+    equal-power crossfade of two correlated peaks, review finding 3) for the
+    rail-budget gate; `peak_seen` tracks the actual streamed peak. The bound
+    is the rendered slice's true peak x 1.5, not the full-band capture peak
+    (a broadcast carrier outside the slice would make that 5x too loose)."""
 
     EXP_P10 = -math.log(0.9)          # p10 of an exponential in units of its mean
+    PEAK_MARGIN = 1.5                 # crossfade worst case (two equal peaks in phase: sqrt2 = 1.41)
+    _CACHE = {}                       # (path, dial, bw, fs) -> (n0_rec, fs_rec, seconds, peak/gain): sigma-independent
 
     def __init__(self, fs, rng, sigma, files, dial_hz=0.0, bw_hz=3000.0,
                  xfade_s=0.25, frame_s=1.0):
-        import wave, json, os
+        import json, os, threading
         if not files:
             raise ValueError("QrmReplay: no files")
         if sigma <= 0.0:
@@ -489,10 +507,19 @@ class QrmReplay:
         self.xfade = int(round(xfade_s * self.fs))
         self.frame_s = float(frame_s)
         self.target_n0 = self.sigma ** 2 / (self.fs / 2.0)       # per-Hz, one-sided
-        # per-file stats at construction (the rail gate needs the playlist peak)
+        self._threading = threading
+        # per-file stats at construction: floor + gain + the rendered slice's TRUE peak (one render per
+        # file; the sigma-independent part is cached across directions, so B's construction is free)
         self.stats = []
         for p in self.files:
-            a, st = self._render(p)
+            key = (p, self.dial, self.bw, self.fs)
+            if key not in self._CACHE:
+                audio, n0_rec, fs_rec = self._render(p, want_meta=True)
+                self._CACHE[key] = (n0_rec, fs_rec, len(audio) / self.fs,
+                                    float(np.max(np.abs(audio))) / math.sqrt(self.target_n0 / n0_rec))
+                del audio
+            n0_rec, fs_rec, secs, peak_per_gain = self._CACHE[key]
+            gain = math.sqrt(self.target_n0 / n0_rec)
             side = {}
             js = p[:-4] + ".json"
             if os.path.exists(js):
@@ -500,18 +527,23 @@ class QrmReplay:
                     side = json.load(open(js))
                 except Exception:
                     side = {}
-            st["anchor_dbm_hz"] = (side["rssi_min_dbm"] - 10 * math.log10(3000.0)
-                                   if side.get("rssi_min_dbm") is not None else None)
-            st["station"] = side.get("station", "")
-            self.stats.append(st)
-        self.peak_amp = max(st["peak"] for st in self.stats)
+            self.stats.append({
+                "file": p, "fs_rec": fs_rec, "seconds": secs, "n0_rec": n0_rec, "gain": gain,
+                "peak_bound": float(peak_per_gain * gain * self.PEAK_MARGIN),
+                "anchor_dbm_hz": (side["rssi_min_dbm"] - 10 * math.log10(3000.0)
+                                  if side.get("rssi_min_dbm") is not None else None),
+                "station": side.get("station", "")})
+        self.peak_amp = max(st["peak_bound"] for st in self.stats)
+        self.peak_seen = 0.0
+        self.renders_in_fill = 0          # diagnostic: synchronous renders forced inside fill() (should stay 0)
         # playlist: seeded permutation, looping
         self.order = list(self.rng.permutation(len(self.files)))
         self.idx = 0
-        self.cur = None            # current file's audio (float64, sim rate)
+        self.cur = self._render(self.files[self.order[0]])
         self.pos = 0
-        self.tail = None           # crossfade tail of the previous file
-        self._load(self.order[0])
+        self.tail = None
+        self._next = None                 # (thread, holder) rendering the next file
+        self._prefetch()
 
     # ----------------------------------------------------------------- render
     def _read_iq(self, path):
@@ -523,18 +555,12 @@ class QrmReplay:
             x = np.frombuffer(w.readframes(n), dtype="<i2").reshape(-1, 2).astype(np.float64)
         return fs_rec, x[:, 0] + 1j * x[:, 1]
 
-    def _render(self, path):
-        """USB slice -> real audio at the sim rate, scaled so the slice's noise
-        floor density equals target_n0. Returns (audio, stats)."""
-        fs_rec, z = self._read_iq(path)
-        n = len(z)
-        Z = np.fft.fft(z)
-        f = np.fft.fftfreq(n, 1.0 / fs_rec)
-        # floor of the slice: STFT frames of frame_s, per-bin p10 over time / EXP_P10, p25 across bins
+    def _floor_gain(self, z, fs_rec):
+        """Slice floor density (recording units^2/Hz) and the gain taking it to target_n0."""
         seg = int(round(self.frame_s * fs_rec))
-        nfr = n // seg
+        nfr = len(z) // seg
         if nfr < 5:
-            raise ValueError(f"QrmReplay: {path} shorter than 5 frames")
+            raise ValueError("QrmReplay: capture shorter than 5 frames")
         win = np.hanning(seg)
         fr = np.fft.fftfreq(seg, 1.0 / fs_rec)
         sel = (fr >= self.dial) & (fr < self.dial + self.bw)
@@ -542,27 +568,55 @@ class QrmReplay:
         for i in range(nfr):
             X = np.fft.fft(z[i * seg:(i + 1) * seg] * win)
             pw[i] = np.abs(X[sel]) ** 2
-        # per-bin power -> per-Hz density: |X|^2 / (sum(win^2) * fs_rec) is the periodogram density
-        dens = pw / (np.sum(win ** 2) * fs_rec)
+        dens = pw / (np.sum(win ** 2) * fs_rec)                 # periodogram density per bin
         per_bin = np.percentile(dens, 10, axis=0) / self.EXP_P10
         n0_rec = float(np.percentile(per_bin, 25))
-        gain = math.sqrt(self.target_n0 / n0_rec)
-        # analytic slice -> audio: keep [dial, dial+bw], move dial -> 0, resample by spectrum padding
+        return n0_rec, math.sqrt(self.target_n0 / n0_rec)
+
+    def _render(self, path, want_meta=False):
+        """USB slice -> real audio at the sim rate, scaled so the slice's noise
+        floor density equals target_n0 (float64, whole file)."""
+        fs_rec, z = self._read_iq(path)
+        n = len(z)
+        n0_rec, gain = self._floor_gain(z, fs_rec)
+        Z = np.fft.fft(z)
+        f = np.fft.fftfreq(n, 1.0 / fs_rec)
         keep = (f >= self.dial) & (f < self.dial + self.bw)
         k = np.flatnonzero(keep)
         m = int(round(n * self.fs / fs_rec))                     # samples at the sim rate
         S = np.zeros(m, dtype=complex)
-        shift = int(round(self.dial * n / fs_rec))               # bin of the dial
-        dst = k - shift                                          # 0 .. bw bins
+        dst = np.round((f[k] - self.dial) * n / fs_rec).astype(int)   # by FREQUENCY: survives the 0 Hz wrap
         S[dst] = Z[k] * (m / n)
         audio = math.sqrt(2.0) * np.real(np.fft.ifft(S)) * gain  # Re() halves the analytic band's power; sqrt2 restores it
-        stats = {"file": path, "fs_rec": fs_rec, "seconds": n / fs_rec, "n0_rec": n0_rec,
-                 "gain": gain, "peak": float(np.max(np.abs(audio)))}
-        return audio, stats
+        return (audio, n0_rec, fs_rec) if want_meta else audio
 
-    def _load(self, j):
-        audio, _ = self._render(self.files[j])
-        self.cur = audio
+    def _prefetch(self):
+        """Render the NEXT playlist file on a background thread."""
+        j = (self.idx + 1) % len(self.order)
+        if j == 0:
+            self._next_order = list(self.rng.permutation(len(self.files)))
+            path = self.files[self._next_order[0]]
+        else:
+            self._next_order = None
+            path = self.files[self.order[j]]
+        holder = {}
+
+        def work():
+            holder["audio"] = self._render(path)
+        t = self._threading.Thread(target=work, name="qrm-replay-prefetch", daemon=True)
+        t.start()
+        self._next = (t, holder)
+
+    def _advance(self):
+        """Swap to the prefetched file (crossfading the reserved tail in) and prefetch the one after."""
+        t, holder = self._next
+        if t.is_alive():
+            self.renders_in_fill += 1     # the prefetch had not finished: a real-time stall, counted
+        t.join()
+        self.idx = (self.idx + 1) % len(self.order)
+        if self.idx == 0:
+            self.order = self._next_order
+        self.cur = holder["audio"]
         self.pos = 0
         if self.tail is not None and self.xfade > 0:
             k = min(self.xfade, len(self.cur), len(self.tail))
@@ -571,26 +625,28 @@ class QrmReplay:
             x = np.linspace(0.0, 1.0, k, endpoint=False)
             self.cur[:k] = self.cur[:k] * np.sin(0.5 * np.pi * x) + self.tail[:k] * np.cos(0.5 * np.pi * x)
             self.tail = None
+        self._prefetch()
 
     # ------------------------------------------------------------------- run
     def fill(self, out):
-        """ADD the replayed environment into `out` (mono float block)."""
+        """ADD the replayed environment into `out` (mono float block). Never renders."""
         n = len(out)
         got = 0
         while got < n:
-            avail = len(self.cur) - self.pos - (self.xfade if self.xfade else 0)
+            avail = len(self.cur) - self.pos - self.xfade
             take = min(n - got, max(avail, 0))
             if take > 0:
-                out[got:got + take] += self.cur[self.pos:self.pos + take]
+                seg = self.cur[self.pos:self.pos + take]
+                out[got:got + take] += seg
+                pk = float(np.max(np.abs(seg)))
+                if pk > self.peak_seen:
+                    self.peak_seen = pk
                 self.pos += take
                 got += take
             else:
-                # end of this file: keep its last xfade samples as the tail, advance
+                # end of this file: its last xfade samples become the tail blended into the next file's head
                 self.tail = self.cur[self.pos:self.pos + self.xfade].copy() if self.xfade else None
-                self.idx = (self.idx + 1) % len(self.order)
-                if self.idx == 0:
-                    self.order = list(self.rng.permutation(len(self.files)))
-                self._load(self.order[self.idx])
+                self._advance()
 
     replaces_noise = True
 
@@ -598,4 +654,4 @@ class QrmReplay:
         anchors = [st["anchor_dbm_hz"] for st in self.stats if st["anchor_dbm_hz"] is not None]
         anc = (f"anchor {np.median(anchors):.1f} dBm/Hz (n={len(anchors)})" if anchors else "no S-meter anchor")
         return (f"qrm=replay({len(self.files)} files, {sum(st['seconds'] for st in self.stats):.0f} s, "
-                f"dial {self.dial:+.0f} Hz, bw {self.bw:.0f}, {anc}, peak/sigma {self.peak_amp / self.sigma:.1f})")
+                f"dial {self.dial:+.0f} Hz, bw {self.bw:.0f}, {anc}, peak_bound/sigma {self.peak_amp / self.sigma:.1f})")

@@ -1041,7 +1041,7 @@ class Link:
                         self.noise[c::NCH] *= ngain
                 w += self.noise
             if qrm is not None:
-                self._add_qrm(w, qrm)
+                self._add_qrm(w, qrm, ngain)
         else:
             # receiver hears the noise floor (and any QRM — an independent
             # transmitter) only; no peer signal reaches it
@@ -1053,7 +1053,7 @@ class Link:
             else:
                 w[:] = 0.0
             if qrm is not None:
-                self._add_qrm(w, qrm)
+                self._add_qrm(w, qrm, ngain)
         # Rig RX audio filter (the receiving rig's SSB passband) band-limits the
         # delivered signal AND the in-band noise — linear, no clip.
         if self.rig_rx is not None:
@@ -1108,11 +1108,14 @@ class Link:
             # per-channel FIR; SIGMA stays the in-band per-sample sigma).
             self.noise_lpf.process(out)
 
-    def _add_qrm(self, w, qrm):
-        """One RF interference path, broadcast to all cable channels."""
+    def _add_qrm(self, w, qrm, ngain=None):
+        """One RF interference path, broadcast to all cable channels. A replay
+        stream IS the noise floor, so the FM noise-gain track applies to it."""
         q = self._qrmbuf                              # persistent buffer
         q.fill(0.0)
         qrm.fill(q)
+        if ngain is not None and getattr(qrm, "replaces_noise", False):
+            q *= ngain
         for c in range(NCH):
             w[c::NCH] += q
 
@@ -1870,9 +1873,14 @@ def build_channel_effects():
                 print(f"channel_sim: SIM_QRM_REPLAY={QRM_REPLAY!r} matches no .wav", file=sys.stderr, flush=True)
                 return 2
             _gate_sigma = max(SIGMA_AB, SIGMA_BA)
-            if _gate_sigma <= 0.0:
-                print("channel_sim: SIM_QRM_REPLAY needs SIGMA>0 (the recording's floor is "
-                      "scaled to it) — refusing to run inert", file=sys.stderr, flush=True)
+            if min(SIGMA_AB, SIGMA_BA) <= 0.0:
+                print("channel_sim: SIM_QRM_REPLAY needs SIGMA>0 in BOTH directions (each direction's "
+                      "recording is scaled to its own floor) — refusing to run inert", file=sys.stderr, flush=True)
+                return 2
+            if SIGMA_BA_ONSET_S is not None:
+                print("channel_sim: SIM_QRM_REPLAY with SIM_SIGMA_*_ONSET_S is a config conflict (the "
+                      "recording is scaled once to the post-onset sigma and would play at full level "
+                      "through the quiet pre-onset window)", file=sys.stderr, flush=True)
                 return 2
             fx_ab.qrm = fxm.QrmReplay(FS, np.random.default_rng(SEED + 33), SIGMA_AB, _files,
                                       dial_hz=QRM_REPLAY_DIAL_HZ, bw_hz=QRM_REPLAY_BW_HZ)

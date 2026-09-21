@@ -275,14 +275,37 @@ the QRM statistics come from the recordings. The sidecar's S-meter anchor
 absolute floor in dBm/Hz, so a cell's SNR maps to an absolute wanted-signal
 level when one is needed.
 
-Rail budget (Section 6): the recording's scaled peak over the whole
-playlist must fit under `qrm_rail_room_amp` (fail loud, never clamp). The
-pilot's site A 20 m gateway captures peak at ≈ 7.6 sigma, which fits the
-default −12 dB pad without fading at any sigma and with fading up to
-sigma ≈ 2000; deeper cells under fading need a deeper `SIM_RX_PAD_DB`.
+Rail budget (Section 6): the gate uses a conservative UPPER BOUND on the
+streamed peak — √2 × the scaled complex peak of each capture × 1.5 (an
+equal-power crossfade of two in-phase peaks reaches √2 × either) — and
+must fit under `qrm_rail_room_amp` (fail loud, never clamp); the actual
+streamed peak is tracked (`peak_seen`) for provenance. The pilot's site A
+20 m gateway captures stream at ≈ 5–8 sigma (bound ≈ 11 sigma), which
+fits the default −12 dB pad without fading at any sigma ≤ 4000 and with
+fading only at sigma ≲ 1000; deeper cells under fading need a deeper
+`SIM_RX_PAD_DB`.
 Conflicts fail loud: replay + `SIM_QRM_OCC`/`SIM_QRM_SWEEP` (one environment
-per cell) and replay + `SIM_NOISE_VD` (the recording carries its own
-impulsiveness). The AWGN path with replay off is byte-identical to before.
+per cell), replay + `SIM_NOISE_VD` (the recording carries its own
+impulsiveness), replay + `SIM_SIGMA_BA_ONSET_S` (the recording is scaled
+once to the post-onset sigma and would play at full level through the
+quiet pre-onset window), and replay with either direction at sigma 0 (each
+direction's recording is scaled to its own floor). The FM ionospheric
+noise-gain track applies to the replayed stream as it does to the AWGN (it
+IS the noise). The AWGN path with replay off is byte-identical to before.
+
+Real-time path: `fill()` never renders. Construction renders each file
+once for its floor and true peak (≈ 0.6 s per 2-min capture; the
+sigma-independent result is cached across the two directions), the first
+file is rendered for playback, and every next file is rendered on a
+background thread while the current one plays, so a file boundary inside
+the audio callback is a buffer swap. A run faster than ~30× real time can
+reach a boundary before the render finishes; that is a counted stall, not
+a gap (the previous file's reserved tail is not extended).
+`renders_in_fill` counts boundaries that had to wait on an unfinished
+render (a stall; 0 in every test). Bins are mapped by frequency, so a
+negative dial whose slice straddles the FFT's 0 Hz wrap is handled
+(adversarial review 2026-09-21 findings 1–7 folded; finding 8, a literal
+comma in a capture path, is not supported by the comma-separated spec).
 
 Not built (pre-registered, pending): the **generative** mode fitted to the
 pilot's §5 statistics — bandwidth class, the +3…+10 dB level tail (D5:

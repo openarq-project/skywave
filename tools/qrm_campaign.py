@@ -34,6 +34,7 @@ SITES = {                                                     # pre-reg §2
     "FL": ("22315.proxy.kiwisdr.com", 8073, "palmharborFL"),
     "NC2": ("ssi.proxy.kiwisdr.com", 8073, "bakersvilleNC"),
     "NC3": ("kiwisdr.itfais.com", 8073, "laurelspringsNC"),   # KT4RS Laurel Springs NC (EM96): passed qrm_site_gate 2026-09-21, C's alternate for the four-week run
+    "NC4": ("kiwisdr.ku4by.com", 8073, "elizabethcityNC"),   # KU4BY Elizabeth City NC (KiwiSDR 1, 8 ch, 6-BTV vertical): passed qrm_site_gate 2026-09-22 04:01 UTC (shape 4.0 x4, sd 5.4-6.0, delta -1.1..-1.4 dB); replaces site B (northernneckVA OFFLINE at the proxy from 02:33 UTC 09-22, FL alternate also gone)
 }
 BANDS = [                                                     # pre-reg §3: (name, wf centre kHz, zoom, IQ centres kHz)
     ("40m", 7097.0, 10, [7101.9, 7107.0]),

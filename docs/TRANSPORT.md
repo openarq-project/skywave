@@ -56,13 +56,13 @@ also needs a station that speaks sockets:
   portable option. Use it for the real-binary-on-the-cable regression topology, not for a
   no-hardware host.
 
-## Stations on other machines — `SIM_LISTEN`
+## Stations on other machines — `--listen` (`SIM_LISTEN`)
 
 `SIM_LISTEN` serves the same frames over TCP on one port instead of the two unix
 sockets, so the stations can run on other computers:
 
 ```console
-$ SIM_LISTEN=0.0.0.0 SIGMA=300 skywave-channel          # the sim host, port 8340
+$ skywave-channel --listen 0.0.0.0 --sigma 300          # the sim host, port 8340
 
 $ armstrong run --callsign W1CAL --relay simhost        # computer 1
 $ armstrong run --callsign W1ANS --relay simhost        # computer 2

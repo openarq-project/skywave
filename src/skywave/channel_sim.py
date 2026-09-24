@@ -116,6 +116,13 @@ try:
 except ImportError:  # run outside the skywave source dir
     RIG_GEN = -1
 
+# `python -m skywave.channel_sim --sigma 300 ...` takes the same command line as
+# skywave-channel (channel_cli.py): each flag is written into its environment
+# variable here, before any setting below is read. Imports never parse argv.
+if __name__ == "__main__" and len(sys.argv) > 1:
+    from skywave import channel_cli
+    channel_cli.apply_argv(sys.argv[1:])
+
 # FS is read below, AFTER the profiles apply (so a channel/transport profile can
 # set SIM_FS like any other SIM_* knob).
 # SIM_PROFILE=<file.toml|.json> pre-populates the SIM_* channel knobs

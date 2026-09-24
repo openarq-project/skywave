@@ -138,6 +138,19 @@ ch = Channel(ChannelConfig(sigma=200, watterson="poor"))
 rx_block = ch.process(tx_block)
 ```
 
+The two-station simulator, with two modems on other machines connecting over TCP
+(armstrong: `--relay simhost`):
+
+```
+skywave-channel --listen 0.0.0.0 --profile poor
+```
+
+`skywave-channel --help` lists every setting. Each one is also an environment
+variable by one rule, so the docs' `SIM_WATTERSON=poor` is `--watterson poor`
+(or `--fade poor`) and `SIGMA=300` is `--sigma 300`. A flag beats the variable,
+which beats a profile. `--profile` takes a file or a shipped name (`clean`,
+`poor`, `poor-weak-ack`).
+
 Compare a modem across a set of cells:
 
 ```

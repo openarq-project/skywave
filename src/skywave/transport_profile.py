@@ -59,7 +59,10 @@ _VALID_CLOCKS = {"real_time", "virt_time"}
 
 def load_profile(path):
     """Parse + validate a .toml or .json transport profile into its canonical nested
-    dict. Rejects unknown sections/keys (typo protection) and bad enum values."""
+    dict. Rejects unknown sections/keys (typo protection) and bad enum values. `path`
+    may be a shipped transport's bare name (`sock-virt_time`)."""
+    from skywave.channel_profile import resolve_path
+    path = resolve_path(path, "transports")
     with open(path, "rb") as f:
         raw = f.read()
     if str(path).endswith(".json"):

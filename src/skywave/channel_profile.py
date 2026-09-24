@@ -70,9 +70,29 @@ _SPECIAL = {("noise", "impulsive_vd_db"), ("rx", "agc"), ("meta", "name"),
 _VALID_SECTIONS = {"meta", "fade", "noise", "offset", "tx", "rx", "qrm", "link", "reverse"}
 
 
+def resolve_path(spec, subdir="profiles"):
+    """A profile argument -> a file path. An existing file always wins; otherwise a
+    bare name (no directory, no extension) names a profile shipped in the checkout's
+    `subdir`: `poor` -> profiles/poor.toml, `sock-virt_time` -> transports/... ."""
+    if os.path.exists(spec) or "/" in spec or os.sep in spec or os.path.splitext(spec)[1]:
+        return spec
+    shipped = os.path.join(os.path.dirname(os.path.dirname(os.path.dirname(
+        os.path.abspath(__file__)))), subdir)
+    for ext in (".toml", ".json"):
+        cand = os.path.join(shipped, spec + ext)
+        if os.path.isfile(cand):
+            return cand
+    names = sorted(os.path.splitext(f)[0] for f in os.listdir(shipped)
+                   if f.endswith((".toml", ".json"))) if os.path.isdir(shipped) else []
+    raise SystemExit(f"no profile {spec!r}: not a file, and not a shipped {subdir[:-1]} "
+                     f"({', '.join(names) or f'no {subdir}/ directory in this install'})")
+
+
 def load_profile(path):
     """Parse + validate a .toml or .json profile into its canonical nested dict. Rejects
-    unknown sections/keys (typo protection)."""
+    unknown sections/keys (typo protection). `path` may be a shipped profile's bare
+    name (see resolve_path)."""
+    path = resolve_path(path)
     with open(path, "rb") as f:
         raw = f.read()
     if str(path).endswith(".json"):

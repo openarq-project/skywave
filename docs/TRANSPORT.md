@@ -56,6 +56,40 @@ also needs a station that speaks sockets:
   portable option. Use it for the real-binary-on-the-cable regression topology, not for a
   no-hardware host.
 
+## Stations on other machines — `SIM_LISTEN`
+
+`SIM_LISTEN` serves the same frames over TCP on one port instead of the two unix
+sockets, so the stations can run on other computers:
+
+```console
+$ SIM_LISTEN=0.0.0.0 SIGMA=300 skywave-channel          # the sim host, port 8340
+
+$ armstrong run --callsign W1CAL --relay simhost        # computer 1
+$ armstrong run --callsign W1ANS --relay simhost        # computer 2
+```
+
+This is armstrong-relay's role and wire with the channel added, so an armstrong station
+uses its ordinary `--relay` flag. The first station to connect is A, the second B. A
+third is turned away while a pair runs. When either station leaves, the pair ends and the
+sim waits for the next two; each pair gets a fresh rig and a virtual clock from zero.
+Stations must send PTT in-band (there is no stdin PTT relay in this mode).
+
+- **Address:** `HOST:PORT`, `[IPv6]:PORT`, a bare `HOST` (port 8340, armstrong-relay's),
+  or a bare `PORT`, which binds loopback only. Serving another machine takes an explicit
+  address such as `0.0.0.0`. There is **no authentication**: keep it on a LAN or behind
+  an SSH tunnel.
+- **Defaults:** it sets `SIM_TRANSPORT=sock SIM_CLOCK=virt_time SIM_HALF_DUPLEX=1
+  SIM_PTT=1 SIM_VIRT_MAX_RATIO=1` (lockstep, half-duplex, wall-clock pace for people and
+  host applications). They are setdefaults: channel/transport profiles and explicit env
+  still win. `SIM_TRANSPORT=alsa` or `SIM_SOCK_SHIM=1` with it is an error.
+- **Network speed:** every block is a round trip to both stations, so a path slower
+  than one block (21 ms at 48 kHz / 1024 frames) runs slower than real time. What the
+  modems see is unchanged, because their timers follow the sim's clock.
+- **`SIM_LISTEN_STALL_S`** (default 60) ends a pair whose station stops answering, so a
+  station that vanishes without closing cannot hold the sim. `0` waits forever.
+- **`SIM_LISTEN_ONCE=1`** exits after the first pair ends.
+- No unix sockets are involved, so this mode does not need `AF_UNIX`.
+
 ## Transport profile schema
 
 ```toml

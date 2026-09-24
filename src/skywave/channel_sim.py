@@ -78,6 +78,23 @@ TRANSPORT:
   SIM_SOCK_BUF     SO_SNDBUF/SO_RCVBUF per socket, bytes — sized to mirror the
                    old sim->aplay pipe capacity, keeping transport buffering (and
                    thus turnaround latency) comparable                    [65536]
+  SIM_LISTEN=[HOST:]PORT | HOST   serve the stations over TCP instead: the same
+    frames on one port, so they can run on other machines. The first station
+    to connect is A, the second B; a third is turned away while a pair runs;
+    when either station leaves, the pair ends and the sim waits for the next
+    two (fresh rig, virtual clock from zero). armstrong stations connect with
+    `--relay HOST[:PORT]`: this is armstrong-relay's role and wire, with the
+    channel added. Stations must send in-band PTT (no stdin relay). A bare PORT
+    binds loopback only; give 0.0.0.0 (or an address) to serve other machines,
+    and a bare HOST takes port 8340. There is no authentication. It defaults
+    SIM_TRANSPORT=sock SIM_CLOCK=virt_time SIM_HALF_DUPLEX=1 SIM_PTT=1
+    SIM_VIRT_MAX_RATIO=1 (setdefault: explicit env and profiles win). Each
+    block is a round trip to both stations, so a path slower than a block
+    (21 ms at the defaults) runs slower than real time; what the modems see is
+    unchanged.
+  SIM_LISTEN_STALL_S  end a pair whose station answers nothing this long;
+                   0 = wait forever                                          [60]
+  SIM_LISTEN_ONCE=1   exit after the first pair ends
 """
 import os
 import sys
@@ -112,6 +129,17 @@ _PROFILE_NAME = _channel_profile.apply_to_environ()
 # semantics (explicit env wins). Portable, aloop-free selection in one shareable file.
 from skywave import transport_profile as _transport_profile
 _TRANSPORT_PROFILE_NAME = _transport_profile.apply_to_environ()
+# SIM_LISTEN serves the stations over TCP (see TRANSPORT in the header). It is
+# an operator mode, so it fills in what a person running two modems by hand
+# needs: the sock transport, the lockstep clock, half-duplex with in-band PTT,
+# and wall-clock pace. Applied AFTER the profiles and with the same setdefault
+# semantics, so a profile or an explicit env var still wins over these.
+LISTEN = os.environ.get("SIM_LISTEN", "").strip()
+if LISTEN:
+    for _k, _v in (("SIM_TRANSPORT", "sock"), ("SIM_CLOCK", "virt_time"),
+                   ("SIM_HALF_DUPLEX", "1"), ("SIM_PTT", "1"),
+                   ("SIM_VIRT_MAX_RATIO", "1")):
+        os.environ.setdefault(_k, _v)
 # Cable sample rate. 48 kHz is the validated soundcard default; SIM_FS=8000 runs
 # the cable at a modem's native rate for device-free sock transports (see the
 # module docstring). Everything downstream (rig BPF, Watterson, rig effects,
@@ -552,6 +580,45 @@ SOCK_BUF = int(os.environ.get("SIM_SOCK_BUF", "65536").strip() or "65536")
 # fails bind()/connect() with a cryptic "AF_UNIX path too long" -- easy to hit on
 # macOS, where a deep SIM_SOCK_DIR (or a long system tempdir) overflows fast.
 _SUN_PATH_MAX = 108 if sys.platform.startswith("linux") else 104
+# armstrong-relay's port, so an armstrong station's `--relay HOST` needs no port.
+LISTEN_DEFAULT_PORT = 8340
+
+
+def parse_listen(spec):
+    """SIM_LISTEN -> (host, port). A bare PORT binds loopback only, like
+    armstrong-relay's default --bind: serving another machine is a deliberate
+    choice (there is no authentication). A bare HOST takes the default port;
+    HOST:PORT and [IPv6]:PORT are explicit."""
+    s = spec.strip()
+    if s.isdigit():
+        host, port = "127.0.0.1", int(s)
+    elif s.startswith("["):
+        end = s.find("]")
+        rest = s[end + 1:] if end > 0 else None
+        if rest is None or (rest and (rest[0] != ":" or not rest[1:].isdigit())):
+            raise ValueError(f"SIM_LISTEN={spec!r}: expected [ADDR]:PORT")
+        host, port = s[1:end], int(rest[1:]) if rest else LISTEN_DEFAULT_PORT
+    elif s.count(":") == 1:
+        host, p = s.split(":")
+        if not p.isdigit():
+            raise ValueError(f"SIM_LISTEN={spec!r}: port {p!r} is not a number")
+        host, port = host or "127.0.0.1", int(p)
+    else:
+        host, port = s, LISTEN_DEFAULT_PORT     # a bare host, or a bare IPv6 literal
+    if not 0 < port < 65536:
+        raise ValueError(f"SIM_LISTEN={spec!r}: port {port} out of range")
+    return host, port
+
+
+try:
+    LISTEN_ADDR = parse_listen(LISTEN) if LISTEN else None
+except ValueError as e:
+    sys.exit(f"channel_sim: {e}")
+# A paired station that answers nothing for this long ends its pair, so a
+# station that vanished without closing (a laptop asleep, a dropped network)
+# cannot hold the simulator forever. 0 waits forever. armstrong-relay's value.
+LISTEN_STALL_S = float(os.environ.get("SIM_LISTEN_STALL_S", "60").strip() or "60")
+LISTEN_ONCE = os.environ.get("SIM_LISTEN_ONCE", "0").strip() == "1"
 # Virtual-rig stage 2 — block-lockstep virtual clock.
 # SIM_CLOCK=virt_time (requires SIM_TRANSPORT=sock, a station's `--audio sock` backend):
 # the sim is the clock master — per block it sends both stations their RX frame
@@ -1425,6 +1492,142 @@ def _sock_rig(procs):
     return conns["a"], conns["b"], list(lst.values()) + [conns["a"], conns["b"]]
 
 
+def _still_waiting(conn):
+    """True while an unpaired station is still connected. A station sends
+    nothing until the sim's first frame, so a readable socket means EOF."""
+    try:
+        conn.setblocking(False)
+        try:
+            return conn.recv(1, socket.MSG_PEEK) != b""
+        except (BlockingIOError, InterruptedError):
+            return True
+        finally:
+            conn.setblocking(True)
+    except OSError:
+        return False
+
+
+def _await_pair(lst, quit_):
+    """SIM_LISTEN: accept stations until two are connected at once; the first
+    is station A, the second B (armstrong-relay's rule). A station that hangs
+    up while waiting is dropped, not paired. Returns (conn_a, conn_b), or None
+    once quit_ is set."""
+    waiting = []
+    while not quit_.is_set():
+        try:
+            c, addr = lst.accept()
+        except (socket.timeout, InterruptedError):
+            continue
+        except OSError as e:
+            # A handshake aborted under us, or out of descriptors: never
+            # fatal for a long-running server, and never a tight loop.
+            print(f"channel_sim: accept: {e}", file=sys.stderr, flush=True)
+            time.sleep(0.5)
+            continue
+        for w, waddr in list(waiting):
+            if not _still_waiting(w):
+                print(f"channel_sim: station {waddr[0]}:{waddr[1]} left before pairing",
+                      file=sys.stderr, flush=True)
+                w.close()
+                waiting.remove((w, waddr))
+        waiting.append((c, addr))
+        if len(waiting) == 2:
+            (a, aaddr), (b, baddr) = waiting
+            for conn in (a, b):
+                conn.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
+                conn.setsockopt(socket.SOL_SOCKET, socket.SO_SNDBUF, SOCK_BUF)
+                conn.setsockopt(socket.SOL_SOCKET, socket.SO_RCVBUF, SOCK_BUF)
+                conn.settimeout(LISTEN_STALL_S if LISTEN_STALL_S > 0 else None)
+            print(f"channel_sim: paired A={aaddr[0]}:{aaddr[1]} B={baddr[0]}:{baddr[1]}",
+                  file=sys.stderr, flush=True)
+            return a, b
+        print(f"channel_sim: station {addr[0]}:{addr[1]} connected; waiting for a second",
+              file=sys.stderr, flush=True)
+    for w, _ in waiting:
+        w.close()
+    return None
+
+
+def _turn_away(lst, done):
+    """SIM_LISTEN: while a pair runs, close any other station at once, so it
+    redials instead of sitting in the accept backlog believing it is paired."""
+    seen = set()
+    while not done.is_set():
+        try:
+            c, addr = lst.accept()
+        except (socket.timeout, InterruptedError):
+            continue
+        except OSError:
+            break                           # listener closed under us
+        c.close()
+        if addr[0] not in seen:
+            seen.add(addr[0])
+            print(f"channel_sim: turned away {addr[0]}: a pair is already running",
+                  file=sys.stderr, flush=True)
+
+
+def serve():
+    """SIM_LISTEN: serve pairs of stations over TCP until SIGINT/SIGTERM. Each
+    pair gets a fresh rig (channel state, seeds, virtual clock from zero);
+    when either station leaves, the pair ends and the next two are paired."""
+    if TRANSPORT != "sock" or SIM_CLOCK != "virt_time" or SOCK_SHIM:
+        print("channel_sim: SIM_LISTEN needs SIM_TRANSPORT=sock and SIM_CLOCK=virt_time "
+              "without SIM_SOCK_SHIM (they are its defaults; an explicit override "
+              "conflicts)", file=sys.stderr, flush=True)
+        return 2
+    host, port = LISTEN_ADDR
+    quit_ = threading.Event()
+    current = [threading.Event()]
+
+    def _stop(_sig, _frm):
+        quit_.set()
+        current[0].set()
+    signal.signal(signal.SIGTERM, _stop)
+    signal.signal(signal.SIGINT, _stop)
+
+    try:
+        family = socket.getaddrinfo(host, port, type=socket.SOCK_STREAM)[0][0]
+        lst = socket.create_server((host, port), family=family)
+    except OSError as e:
+        print(f"channel_sim: cannot listen on {host}:{port}: {e}",
+              file=sys.stderr, flush=True)
+        return 2
+    lst.settimeout(0.5)
+    os.makedirs(SOCK_DIR, exist_ok=True)    # the virt_now_ms status file
+    print(f"channel_sim: listening on {host}:{port} for two stations "
+          f"(armstrong: --relay <this host>:{port})", file=sys.stderr, flush=True)
+    if host not in ("127.0.0.1", "::1", "localhost"):
+        print("channel_sim: no authentication; anyone who can reach this port can "
+              "take a station slot", file=sys.stderr, flush=True)
+    rc = 0
+    try:
+        while not quit_.is_set():
+            pair = _await_pair(lst, quit_)
+            if pair is None:
+                break
+            stop = threading.Event()
+            current[0] = stop
+            if quit_.is_set():
+                stop.set()
+            done = threading.Event()
+            guard = threading.Thread(target=_turn_away, args=(lst, done),
+                                     name="turn-away", daemon=True)
+            guard.start()
+            try:
+                rc = run_rig(stop, conns=pair)
+            finally:
+                done.set()
+                guard.join(timeout=2.0)
+                gc.enable()                 # run_rig disables it for the block loop
+                gc.collect()
+            print("channel_sim: pair ended", file=sys.stderr, flush=True)
+            if rc != 0 or LISTEN_ONCE:
+                break
+    finally:
+        lst.close()
+    return rc
+
+
 def run_lockstep(ab, ba, ptt, stop):
     """SIM_CLOCK=virt_time block-lockstep loop (single thread, no wall pacing).
 
@@ -1929,19 +2132,29 @@ def print_keying_summary(ab, ba, keys):
 
 
 def main():
-    procs = []
+    if LISTEN:
+        return serve()
     stop = threading.Event()
 
     def _stop(_sig, _frm):
         stop.set()
     signal.signal(signal.SIGTERM, _stop)
     signal.signal(signal.SIGINT, _stop)
+    return run_rig(stop)
 
+
+def run_rig(stop, conns=None):
+    """One run of the rig until `stop`, a station leaving, or a virtual
+    timeout. `conns` = (conn_a, conn_b) already accepted by SIM_LISTEN's
+    serve(); None opens the configured transport here."""
+    procs = []
     sp_a = (STATS + ".11") if STATS else ""
     sp_b = (STATS + ".22") if STATS else ""
     keys = Keys()
     ptt = PttState()
-    if SIM_PTT:
+    # SIM_LISTEN stations key in-band, and the sim runs attached to an
+    # operator's terminal: a stdin listener there would eat their typing.
+    if SIM_PTT and conns is None:
         threading.Thread(target=ptt_listener, args=(ptt,), name="ptt", daemon=True).start()
 
     eff = build_channel_effects()
@@ -1968,13 +2181,17 @@ def main():
     _ba_onset_blocks = (int(round(SIGMA_BA_ONSET_S * FS / BLOCK))
                         if SIGMA_BA_ONSET_S is not None else None)
     if TRANSPORT == "sock":
-        try:
-            conn_a, conn_b, closeables = _sock_rig(procs)
-        except RuntimeError as e:
-            print(f"channel_sim: {e}", file=sys.stderr, flush=True)
-            for p in procs:
-                p.kill()
-            return 2
+        if conns is not None:
+            conn_a, conn_b = conns
+            closeables = [conn_a, conn_b]
+        else:
+            try:
+                conn_a, conn_b, closeables = _sock_rig(procs)
+            except RuntimeError as e:
+                print(f"channel_sim: {e}", file=sys.stderr, flush=True)
+                for p in procs:
+                    p.kill()
+                return 2
         ab = SockLink("A->B", conn_a, conn_b, SEED + 11, sp_a, stop,
                       "a", "b", keys, ptt, fade_ab, LINK_DELAY_SAMP,
                       rig_ab_tx, rig_ab_rx, fx_ab,
@@ -2021,6 +2238,8 @@ def main():
     chan += f" {pad_desc}{env_desc}"
     transport = (f"sock({SOCK_DIR},shim={'on' if SOCK_SHIM else 'off'})"
                  if TRANSPORT == "sock" else "alsa")
+    if conns is not None:
+        transport = f"tcp({LISTEN_ADDR[0]}:{LISTEN_ADDR[1]})"
     if SIM_CLOCK == "virt_time":
         transport += f" clock=virt_time(max={MAX_VIRTUAL_S:g}s)"
     _level_desc = (f"gain(A/B)={GAIN_A:g}/{GAIN_B:g} sigma(AB/BA)={SIGMA_AB:g}/{SIGMA_BA:g} ASYM"

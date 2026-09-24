@@ -1,0 +1,12 @@
+#!/bin/sh
+# skywave pre-commit hook — no Claude session URL/id in the staged content.
+. "$(dirname "$0")/hook-lib.sh"
+hits=$(git diff --cached -U0 --diff-filter=AM | grep -E '^\+' | grep -vE '^\+\+\+' \
+  | grep -nE "$SESSION_PAT")
+if [ -n "$hits" ]; then
+  echo "pre-commit: a Claude session URL/id is in the staged changes:" >&2
+  echo "$hits" | head -20 >&2
+  echo "(a deliberate exception: git commit --no-verify, and say why in the message)" >&2
+  exit 1
+fi
+exit 0

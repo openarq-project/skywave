@@ -1,0 +1,24 @@
+#!/bin/sh
+# skywave pre-push hook — final sweep over every commit about to leave the box,
+# messages and content. Commits already on origin are skipped: history
+# published before this hook existed carries session trailers (by the owner's
+# choice, 2026-09-24), and a ref-only push to a bench remote that is behind
+# origin must not re-judge it.
+. "$(dirname "$0")/hook-lib.sh"
+z=0000000000000000000000000000000000000000
+while read -r lref lsha rref rsha; do
+  [ "$lsha" = "$z" ] && continue
+  if [ "$rsha" = "$z" ] || ! git cat-file -e "$rsha^{commit}" 2>/dev/null; then
+    range="$lsha --not --remotes=origin"
+  else
+    range="$rsha..$lsha --not --remotes=origin"
+  fi
+  if git log --format=%B $range | grep -qE "$SESSION_PAT"; then
+    echo "pre-push: a Claude session URL/id is in a commit message in $range" >&2; exit 1
+  fi
+  if git log -p --format= $range | grep -E '^\+' | grep -vE '^\+\+\+' | grep -qE "$SESSION_PAT"; then
+    echo "pre-push: a Claude session URL/id is in the content of $range:" >&2
+    git log -p --format=%h $range | grep -nE "$SESSION_PAT" | head -10 >&2; exit 1
+  fi
+done
+exit 0

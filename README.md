@@ -104,6 +104,11 @@ This puts the `skywave` package on the path and installs four console scripts:
 You can also run any entry point without installing, straight from `src/`, with
 `PYTHONPATH=src python3 -m skywave.<module>`.
 
+If you commit to skywave, enable the in-tree hooks once per clone:
+`git config core.hooksPath .githooks`. They block a Claude session URL or id
+in a commit message or in file content. A session URL links to a private
+transcript. Co-author trailers are fine.
+
 ### Platforms
 
 The channel sim, the DSP, and the full test suite run on Linux and macOS. The

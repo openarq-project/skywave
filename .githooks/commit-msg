@@ -1,0 +1,8 @@
+#!/bin/sh
+# skywave commit-msg hook — no Claude session URL/id in the message.
+. "$(dirname "$0")/hook-lib.sh"
+if grep -qE "$SESSION_PAT" "$1"; then
+  echo "commit-msg: a Claude session URL/id is in the message — remove it" >&2
+  exit 1
+fi
+exit 0

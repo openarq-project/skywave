@@ -479,11 +479,20 @@ if QRM_SWEEP and QRM_SWEEP_BAND_HZ < 2400.0:
 # Mutually exclusive with SIM_QRM_OCC/SWEEP (generative) and SIM_NOISE_VD (the
 # recording carries its own impulsiveness) — a conflict fails loud.
 QRM_REPLAY = os.environ.get("SIM_QRM_REPLAY", "").strip()
+# SIM_QRM_REPLAY_BA (2026-10-03, B6) = a SEPARATE list (same grammar) for the
+# B->A direction, i.e. what station A's receiver hears; unset = both directions
+# draw from SIM_QRM_REPLAY (seeds 33/44 pick different files). SIM_QRM_REPLAY is
+# then the A->B list: station B's receiver site. Lets a cell be a two-site link
+# (an Ohio end and a North Carolina end), each end hearing its own band.
+QRM_REPLAY_BA = os.environ.get("SIM_QRM_REPLAY_BA", "").strip()
 QRM_REPLAY_DIAL_HZ = float(os.environ.get("SIM_QRM_REPLAY_DIAL_HZ", "0").strip() or "0")
 QRM_REPLAY_BW_HZ = float(os.environ.get("SIM_QRM_REPLAY_BW_HZ", "3000").strip() or "3000")
 if QRM_REPLAY and (QRM_OCC or QRM_SWEEP):
     raise SystemExit("channel_sim: SIM_QRM_REPLAY and SIM_QRM_OCC/SIM_QRM_SWEEP are mutually exclusive "
                      "(replay vs generative QRM — one environment per cell)")
+if QRM_REPLAY_BA and not QRM_REPLAY:
+    raise SystemExit("channel_sim: SIM_QRM_REPLAY_BA needs SIM_QRM_REPLAY (the A->B list); a replay "
+                     "environment on one direction only is not a supported cell")
 
 
 def qrm_replay_files(spec, default_dial=0.0):
@@ -2105,6 +2114,11 @@ def build_channel_effects():
             if not _files:
                 print(f"channel_sim: SIM_QRM_REPLAY={QRM_REPLAY!r} matches no .wav", file=sys.stderr, flush=True)
                 return 2
+            _files_ba = qrm_replay_files(QRM_REPLAY_BA, QRM_REPLAY_DIAL_HZ) if QRM_REPLAY_BA else _files
+            if not _files_ba:
+                print(f"channel_sim: SIM_QRM_REPLAY_BA={QRM_REPLAY_BA!r} matches no .wav",
+                      file=sys.stderr, flush=True)
+                return 2
             _gate_sigma = max(SIGMA_AB, SIGMA_BA)
             if min(SIGMA_AB, SIGMA_BA) <= 0.0:
                 print("channel_sim: SIM_QRM_REPLAY needs SIGMA>0 in BOTH directions (each direction's "
@@ -2117,7 +2131,7 @@ def build_channel_effects():
                 return 2
             fx_ab.qrm = fxm.QrmReplay(FS, np.random.default_rng(SEED + 33), SIGMA_AB, _files,
                                       bw_hz=QRM_REPLAY_BW_HZ)
-            fx_ba.qrm = fxm.QrmReplay(FS, np.random.default_rng(SEED + 44), SIGMA_BA, _files,
+            fx_ba.qrm = fxm.QrmReplay(FS, np.random.default_rng(SEED + 44), SIGMA_BA, _files_ba,
                                       bw_hz=QRM_REPLAY_BW_HZ)
             # Rail-budget gate on the recording's own peaks (fail loud, never clamp)
             _fading = rail_fading()
@@ -2129,6 +2143,8 @@ def build_channel_effects():
                       "deepen SIM_RX_PAD_DB or pick quieter captures", file=sys.stderr, flush=True)
                 return 2
             fx_desc.append(fx_ab.qrm.describe())
+            if QRM_REPLAY_BA:
+                fx_desc.append(fx_ba.qrm.describe().replace("qrm=", "qrm_ba=", 1))
 
     return _types.SimpleNamespace(
         fade_ab=fade_ab,

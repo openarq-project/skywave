@@ -284,6 +284,15 @@ different offsets inside their captures (the selector's manifest carries
 them on the wrong channel. The same capture at two dials is two entries. The
 banner reads `dials -2100/+2000 Hz` when they differ.
 
+**Per-direction lists (2026-10-03).** `SIM_QRM_REPLAY_BA` (same grammar)
+gives the B→A direction — what station A's receiver hears — its own list;
+`SIM_QRM_REPLAY` is then the A→B list (station B's receiver). Unset, both
+directions draw from one list with different playlist seeds. A two-site
+link (an Ohio end and a North Carolina end) puts each site's captures on
+its own end. The rail gate takes the worse of the two directions' bounds;
+the banner adds a `qrm_ba=replay(...)` entry. `SIM_QRM_REPLAY_BA` without
+`SIM_QRM_REPLAY` fails loud.
+
 Rail budget (Section 6): the gate uses a conservative UPPER BOUND on the
 streamed peak — √2 × the scaled complex peak of each capture × 1.5 (an
 equal-power crossfade of two in-phase peaks reaches √2 × either) — and

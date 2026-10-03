@@ -292,3 +292,29 @@ def test_builder_wires_per_file_dials(corpus):
     for q in (eff.fx_ab.qrm, eff.fx_ba.qrm):
         assert sorted(q.entries) == [(a, -1500.0), (b, 1000.0)]
     assert "dials -1500/+1000 Hz" in " ".join(eff.fx_desc)
+
+
+def test_per_direction_replay_lists(corpus, tmp_path):
+    """B6 (2026-10-03): SIM_QRM_REPLAY_BA gives B->A its own list (a two-site link); unset, both directions share
+    SIM_QRM_REPLAY; BA alone fails loud; a BA list that matches nothing is a config error; the rail gate sees the
+    BA list's peak (a hot capture only on B->A still exhausts the room)."""
+    a, b = corpus
+    cs = load_sim(SIGMA=2000, SIM_QRM_REPLAY=a, SIM_QRM_REPLAY_BA=f"{b}@500", SIM_WATTERSON="off", SIM_RX_PAD_DB=-12)
+    eff = cs.build_channel_effects()
+    assert not isinstance(eff, int)
+    assert eff.fx_ab.qrm.entries == [(a, 0.0)] and eff.fx_ba.qrm.entries == [(b, 500.0)]
+    desc = " ".join(eff.fx_desc)
+    assert "qrm=replay(1 files" in desc and "qrm_ba=replay(1 files" in desc and "dial +500 Hz" in desc
+    cs = load_sim(SIGMA=2000, SIM_QRM_REPLAY=f"{a},{b}", SIM_WATTERSON="off", SIM_RX_PAD_DB=-12)
+    eff = cs.build_channel_effects()
+    assert sorted(eff.fx_ab.qrm.entries) == sorted(eff.fx_ba.qrm.entries) == [(a, 0.0), (b, 0.0)]
+    assert "qrm_ba=" not in " ".join(eff.fx_desc)
+    with pytest.raises(SystemExit):
+        load_sim(SIGMA=2000, SIM_QRM_REPLAY_BA=a)
+    cs = load_sim(SIGMA=2000, SIM_QRM_REPLAY=a, SIM_QRM_REPLAY_BA=str(tmp_path / "none*.wav"), SIM_RX_PAD_DB=-12)
+    assert cs.build_channel_effects() == 2
+    # rail: a capture with a strong tone, on B->A only, must trip the gate a quiet A->B list passes
+    hot = write_capture(str(tmp_path / "hot.wav"), n0=100.0, tones=[(1000.0, 40.0)], seed=9)
+    base = dict(SIGMA=4000, SIM_WATTERSON="off", SIM_RX_PAD_DB=-12)
+    assert not isinstance(load_sim(SIM_QRM_REPLAY=a, **base).build_channel_effects(), int)
+    assert load_sim(SIM_QRM_REPLAY=a, SIM_QRM_REPLAY_BA=hot, **base).build_channel_effects() == 2

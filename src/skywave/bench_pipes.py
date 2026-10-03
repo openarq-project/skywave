@@ -13,6 +13,7 @@ arecord/aplay children (they inherit the sim's process group).
 """
 import os
 import sys
+import time
 import subprocess as sp
 
 import skywave
@@ -48,11 +49,40 @@ def launch_channel_sim(extra_env=None):
     # truth for scoring mode-switch latency. sweep_runner therefore sets SIM_LOG per cell
     # (and calibrate_pep per ladder condition); any other campaign driver launching cells
     # in a loop should do the same rather than inherit this default.
-    simlog = open(env.get("SIM_LOG", "/tmp/channel_sim.log"), "wb")
+    log_path = env.get("SIM_LOG", "/tmp/channel_sim.log")
+    simlog = open(log_path, "wb")
     p = sp.Popen([sys.executable, "-u", SIM], env=env, stdin=stdin,
                  stdout=simlog, stderr=sp.STDOUT, preexec_fn=os.setsid)
     simlog.close()  # the child holds its own dup; the parent doesn't need it
+    wait_sim_ready(p, log_path, float(env.get("SKYW_SIM_READY_S", "600") or "600"))
     return p
+
+
+READY_MARK = b"channel_sim: READY"
+
+
+def wait_sim_ready(p, log_path, timeout_s, poll_s=0.1):
+    """Block until the sim has built its channel effects (its `channel_sim: READY` line in
+    the log it was just given, truncated at launch so no stale mark), it exits (a config
+    error: the caller's existing dead-sim handling reports it), or `timeout_s` passes
+    (SKYW_SIM_READY_S, default 600; a warning, then the caller proceeds as before).
+    Returns the seconds waited, or None on timeout/exit. A QRM-replay rig takes tens of
+    seconds here; without the wait the stations started into a channel that was not yet
+    pumping (2026-10-03)."""
+    t0 = time.time()
+    while time.time() - t0 < timeout_s:
+        try:
+            with open(log_path, "rb") as f:
+                if READY_MARK in f.read():
+                    return time.time() - t0
+        except OSError:
+            pass
+        if p.poll() is not None:
+            return None
+        time.sleep(poll_s)
+    print(f"bench_pipes: channel_sim not READY after {timeout_s:g}s -- starting stations anyway",
+          file=sys.stderr, flush=True)
+    return None
 
 
 def fwd_ptt(sim, station_label, line):

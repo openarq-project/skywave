@@ -2210,9 +2210,19 @@ def run_rig(stop, conns=None):
     if SIM_PTT and conns is None:
         threading.Thread(target=ptt_listener, args=(ptt,), name="ptt", daemon=True).start()
 
+    _t_build = time.time()
     eff = build_channel_effects()
     if isinstance(eff, int):
         return eff        # config error already printed to stderr by the builder
+    # The harness's launcher (bench_pipes.launch_channel_sim) waits for this line before
+    # it lets the stations start: building the effects can take tens of seconds (a QRM
+    # replay renders every capture once), and a station started before the transport is
+    # up burns its connect budget into a dead channel -- in a connect-inclusive goodput
+    # cell that is a score, not just a delay (2026-10-03; the 09-23 b0c-qrm sock failure
+    # was the same race). Printed before the transport opens, so a sock rig binds right
+    # after it and never deadlocks against a launcher that waits for it.
+    print(f"channel_sim: READY effects built in {time.time() - _t_build:.1f}s",
+          file=sys.stderr, flush=True)
     fade_ab, fade_ba = eff.fade_ab, eff.fade_ba
     rig_ab_tx, rig_ab_rx = eff.rig_ab_tx, eff.rig_ab_rx
     rig_ba_tx, rig_ba_rx = eff.rig_ba_tx, eff.rig_ba_rx

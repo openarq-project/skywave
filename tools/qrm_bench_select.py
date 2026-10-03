@@ -97,6 +97,21 @@ def pick(c, key, n, used, div=None, div_max=2):
     return pd.concat(out) if out else c.iloc[0:0]
 
 
+def prepare(d, adc_per_hour=2000.0):
+    """The derived columns every stratum rule reads, plus the ADC-overload flag (shared with qrm_scenario_select)."""
+    d = d.copy()
+    d["ft8"] = (d.centre_khz == 10133.0) & (d.dial_hz == 2000)
+    d["tone"] = (d.carrier_frac >= 0.6) & (d.bw_carrier >= 0.5)   # a persistent line that IS the busy-ness (the 14097.1 kHz pair)
+    d["b40"] = d.station.eq("northernneckVA") & d.band.eq("40m")    # OWNER-RULINGS D2: a site noise state, not traffic
+    d["hump"] = (d.wide_frac >= 0.1) | (d.bw_broad >= 0.2)          # wider than the slice: belongs to 'broad'
+    d["tone_bin"] = (d.carrier_khz * 2).round() / 2                 # 500 Hz tone bins, for carrier diversity
+    d["tone_pos"] = (d.carrier_khz - d.centre_khz) * 1000 - d.dial_hz   # Hz inside the slice
+    d["adc_rate"] = d.file.map(adc_flags(d, adc_per_hour))
+    med = d.drop_duplicates("file").groupby("station").adc_rate.median()
+    d["adc_flag"] = d.adc_rate > np.maximum(adc_per_hour, 3 * d.station.map(med))
+    return d
+
+
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("features"); ap.add_argument("--out-dir", required=True)
@@ -104,16 +119,7 @@ def main():
     ap.add_argument("--adc-per-hour", type=float, default=2000.0)
     a = ap.parse_args()
     os.makedirs(a.out_dir, exist_ok=True)
-    d = pd.read_csv(a.features)
-    d["ft8"] = (d.centre_khz == 10133.0) & (d.dial_hz == 2000)
-    d["tone"] = (d.carrier_frac >= 0.6) & (d.bw_carrier >= 0.5)   # a persistent line that IS the busy-ness (the 14097.1 kHz pair)
-    d["b40"] = d.station.eq("northernneckVA") & d.band.eq("40m")    # OWNER-RULINGS D2: a site noise state, not traffic
-    d["hump"] = (d.wide_frac >= 0.1) | (d.bw_broad >= 0.2)          # wider than the slice: belongs to 'broad'
-    d["tone_bin"] = (d.carrier_khz * 2).round() / 2                 # 500 Hz tone bins, for carrier diversity
-    d["tone_pos"] = (d.carrier_khz - d.centre_khz) * 1000 - d.dial_hz   # Hz inside the slice
-    d["adc_rate"] = d.file.map(adc_flags(d, a.adc_per_hour))
-    med = d.drop_duplicates("file").groupby("station").adc_rate.median()
-    d["adc_flag"] = d.adc_rate > np.maximum(a.adc_per_hour, 3 * d.station.map(med))
+    d = prepare(pd.read_csv(a.features), a.adc_per_hour)
     ok = d[~d.adc_flag & (d.peak_sigma <= a.peak_cap)]
     L = [f"# QRM replay bench — strata (from {os.path.basename(a.features)}: {d.file.nunique()} captures, {len(d)} slices)\n",
          f"Excluded: ADC overload > max({a.adc_per_hour:g}/h, 3x station median) on {int(d.drop_duplicates('file').adc_flag.sum())} captures; "

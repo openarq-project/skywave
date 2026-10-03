@@ -452,11 +452,16 @@ class QrmReplay:
     interferer in the recording rides along at its TRUE INR over that floor.
     `replaces_noise` tells the Link to skip its AWGN fill.
 
-    Slice: a USB receiver at `dial_hz` inside the capture's baseband — the
+    Slice: a USB receiver at a dial inside the capture's baseband — the
     audio is the real part of the analytic band [dial, dial + bw] (positive IQ
     frequency = above the capture centre; verified on the pilot corpus by the
     FT8 15 s cadence sitting on the + side of a 30 m parking capture). The
     capture's own Kiwi passband is flat to ±5 kHz, so |dial| + bw <= 5000.
+    The dial is PER FILE: an entry of `files` is a path (played at `dial_hz`)
+    or a (path, dial) pair, so one playlist can mix slices whose gateway or
+    parking channel sits at different offsets (a scenario stratum drawn
+    across bands and sites; 2026-10-03). The same capture at two dials is two
+    entries — two different slices.
     Bins are mapped by FREQUENCY (a negative dial straddles the 0 Hz wrap of
     the FFT layout; review 2026-09-21 finding 1). Resampling to `fs` is exact
     band-limited interpolation (spectrum zero-pad). Files play back-to-back
@@ -495,14 +500,15 @@ class QrmReplay:
             raise ValueError("QrmReplay: no files")
         if sigma <= 0.0:
             raise ValueError("QrmReplay: sigma must be > 0 (the level anchor)")
-        if abs(float(dial_hz)) + float(bw_hz) > 5000.0 + 1e-9:
-            raise ValueError(f"QrmReplay: dial {dial_hz:g} + bw {bw_hz:g} Hz outside the "
-                             "capture's flat +-5 kHz passband")
+        self.entries = [(f, float(dial_hz)) if isinstance(f, str) else (f[0], float(f[1])) for f in files]
+        for p, d in self.entries:
+            if abs(d) + float(bw_hz) > 5000.0 + 1e-9:
+                raise ValueError(f"QrmReplay: {p}: dial {d:g} + bw {bw_hz:g} Hz outside the "
+                                 "capture's flat +-5 kHz passband")
         self.fs = int(fs)
         self.rng = rng
         self.sigma = float(sigma)
-        self.files = list(files)
-        self.dial = float(dial_hz)
+        self.files = [p for p, _ in self.entries]
         self.bw = float(bw_hz)
         self.xfade = int(round(xfade_s * self.fs))
         self.frame_s = float(frame_s)
@@ -511,10 +517,10 @@ class QrmReplay:
         # per-file stats at construction: floor + gain + the rendered slice's TRUE peak (one render per
         # file; the sigma-independent part is cached across directions, so B's construction is free)
         self.stats = []
-        for p in self.files:
-            key = (p, self.dial, self.bw, self.fs)
+        for p, dial in self.entries:
+            key = (p, dial, self.bw, self.fs)
             if key not in self._CACHE:
-                audio, n0_rec, fs_rec = self._render(p, want_meta=True)
+                audio, n0_rec, fs_rec = self._render(p, dial, want_meta=True)
                 self._CACHE[key] = (n0_rec, fs_rec, len(audio) / self.fs,
                                     float(np.max(np.abs(audio))) / math.sqrt(self.target_n0 / n0_rec))
                 del audio
@@ -528,7 +534,7 @@ class QrmReplay:
                 except Exception:
                     side = {}
             self.stats.append({
-                "file": p, "fs_rec": fs_rec, "seconds": secs, "n0_rec": n0_rec, "gain": gain,
+                "file": p, "dial": dial, "fs_rec": fs_rec, "seconds": secs, "n0_rec": n0_rec, "gain": gain,
                 "peak_bound": float(peak_per_gain * gain * self.PEAK_MARGIN),
                 "anchor_dbm_hz": (side["rssi_min_dbm"] - 10 * math.log10(3000.0)
                                   if side.get("rssi_min_dbm") is not None else None),
@@ -539,7 +545,7 @@ class QrmReplay:
         # playlist: seeded permutation, looping
         self.order = list(self.rng.permutation(len(self.files)))
         self.idx = 0
-        self.cur = self._render(self.files[self.order[0]])
+        self.cur = self._render(*self.entries[self.order[0]])
         self.pos = 0
         self.tail = None
         self._next = None                 # (thread, holder) rendering the next file
@@ -555,7 +561,7 @@ class QrmReplay:
             x = np.frombuffer(w.readframes(n), dtype="<i2").reshape(-1, 2).astype(np.float64)
         return fs_rec, x[:, 0] + 1j * x[:, 1]
 
-    def _floor_gain(self, z, fs_rec):
+    def _floor_gain(self, z, fs_rec, dial):
         """Slice floor density (recording units^2/Hz) and the gain taking it to target_n0."""
         seg = int(round(self.frame_s * fs_rec))
         nfr = len(z) // seg
@@ -563,7 +569,7 @@ class QrmReplay:
             raise ValueError("QrmReplay: capture shorter than 5 frames")
         win = np.hanning(seg)
         fr = np.fft.fftfreq(seg, 1.0 / fs_rec)
-        sel = (fr >= self.dial) & (fr < self.dial + self.bw)
+        sel = (fr >= dial) & (fr < dial + self.bw)
         pw = np.empty((nfr, int(sel.sum())))
         for i in range(nfr):
             X = np.fft.fft(z[i * seg:(i + 1) * seg] * win)
@@ -573,19 +579,20 @@ class QrmReplay:
         n0_rec = float(np.percentile(per_bin, 25))
         return n0_rec, math.sqrt(self.target_n0 / n0_rec)
 
-    def _render(self, path, want_meta=False):
-        """USB slice -> real audio at the sim rate, scaled so the slice's noise
-        floor density equals target_n0 (float64, whole file)."""
+    def _render(self, path, dial, want_meta=False):
+        """USB slice at `dial` -> real audio at the sim rate, scaled so the slice's
+        noise floor density equals target_n0 (float64, whole file). The dial is a
+        parameter, never instance state: this runs on the prefetch thread."""
         fs_rec, z = self._read_iq(path)
         n = len(z)
-        n0_rec, gain = self._floor_gain(z, fs_rec)
+        n0_rec, gain = self._floor_gain(z, fs_rec, dial)
         Z = np.fft.fft(z)
         f = np.fft.fftfreq(n, 1.0 / fs_rec)
-        keep = (f >= self.dial) & (f < self.dial + self.bw)
+        keep = (f >= dial) & (f < dial + self.bw)
         k = np.flatnonzero(keep)
         m = int(round(n * self.fs / fs_rec))                     # samples at the sim rate
         S = np.zeros(m, dtype=complex)
-        dst = np.round((f[k] - self.dial) * n / fs_rec).astype(int)   # by FREQUENCY: survives the 0 Hz wrap
+        dst = np.round((f[k] - dial) * n / fs_rec).astype(int)   # by FREQUENCY: survives the 0 Hz wrap
         S[dst] = Z[k] * (m / n)
         audio = math.sqrt(2.0) * np.real(np.fft.ifft(S)) * gain  # Re() halves the analytic band's power; sqrt2 restores it
         return (audio, n0_rec, fs_rec) if want_meta else audio
@@ -595,14 +602,14 @@ class QrmReplay:
         j = (self.idx + 1) % len(self.order)
         if j == 0:
             self._next_order = list(self.rng.permutation(len(self.files)))
-            path = self.files[self._next_order[0]]
+            path, dial = self.entries[self._next_order[0]]
         else:
             self._next_order = None
-            path = self.files[self.order[j]]
+            path, dial = self.entries[self.order[j]]
         holder = {}
 
         def work():
-            holder["audio"] = self._render(path)
+            holder["audio"] = self._render(path, dial)
         t = self._threading.Thread(target=work, name="qrm-replay-prefetch", daemon=True)
         t.start()
         self._next = (t, holder)
@@ -653,5 +660,8 @@ class QrmReplay:
     def describe(self):
         anchors = [st["anchor_dbm_hz"] for st in self.stats if st["anchor_dbm_hz"] is not None]
         anc = (f"anchor {np.median(anchors):.1f} dBm/Hz (n={len(anchors)})" if anchors else "no S-meter anchor")
+        dials = sorted(set(d for _, d in self.entries))
+        dtxt = (f"dial {dials[0]:+.0f} Hz" if len(dials) == 1
+                else "dials " + "/".join(f"{d:+.0f}" for d in dials) + " Hz")
         return (f"qrm=replay({len(self.files)} files, {sum(st['seconds'] for st in self.stats):.0f} s, "
-                f"dial {self.dial:+.0f} Hz, bw {self.bw:.0f}, {anc}, peak_bound/sigma {self.peak_amp / self.sigma:.1f})")
+                f"{dtxt}, bw {self.bw:.0f}, {anc}, peak_bound/sigma {self.peak_amp / self.sigma:.1f})")

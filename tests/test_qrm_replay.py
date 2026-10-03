@@ -153,7 +153,7 @@ def test_env_wiring_and_conflicts(corpus, monkeypatch):
     """SIM_QRM_REPLAY expands globs; replay + generative or + noise_vd is a config conflict."""
     d = os.path.dirname(corpus[0])
     cs = load_sim(SIGMA=2000, SIM_QRM_REPLAY=os.path.join(d, "*.wav"))
-    assert cs.qrm_replay_files(cs.QRM_REPLAY) == sorted(corpus)
+    assert cs.qrm_replay_files(cs.QRM_REPLAY) == [(f, 0.0) for f in sorted(corpus)]
     with pytest.raises(SystemExit):
         load_sim(SIGMA=2000, SIM_QRM_REPLAY=corpus[0], SIM_QRM_OCC=0.1)
 
@@ -198,9 +198,9 @@ def test_fill_never_renders_and_prefetch_is_ready(corpus):
     threads = []
     orig = rep._render
 
-    def spy(path):
+    def spy(*args, **kw):
         threads.append(threading.current_thread().name)
-        return orig(path)
+        return orig(*args, **kw)
     rep._render = spy
     time.sleep(1.0)                                   # let the first prefetch (started in __init__) finish
     block = 1024
@@ -239,3 +239,56 @@ def test_rail_gate_budgets_the_fade_up_for_the_custom_doppler_pair(corpus):
     assert room_fade < eff.fx_ab.qrm.peak_amp < room_flat, "sigma no longer separates the two budgets"
     assert load_sim(SIM_WATTERSON="good", **base).build_channel_effects() == 2
     assert load_sim(SIM_FADE_DOPPLER_HZ=0.05, SIM_FADE_DELAY_MS=0.5, **base).build_channel_effects() == 2
+
+
+def test_per_file_dial_spec_parsing(corpus):
+    """B1 (2026-10-03): `path@dial` gives an entry its own dial; a glob's suffix applies to every match; unsuffixed
+    entries take the default (SIM_QRM_REPLAY_DIAL_HZ); one capture at two dials is two entries; an `@` that is not
+    followed by a number is part of the path."""
+    from skywave.channel_sim import qrm_replay_files
+    a, b = corpus
+    d = os.path.dirname(a)
+    assert qrm_replay_files(f"{a}@-1500,{b}@2000") == [(a, -1500.0), (b, 2000.0)]
+    assert qrm_replay_files(f"{a},{b}@2000", default_dial=-2100) == [(a, -2100.0), (b, 2000.0)]
+    assert qrm_replay_files(os.path.join(d, "*.wav") + "@500") == [(a, 500.0), (b, 500.0)]
+    assert qrm_replay_files(f"{a}@-1500,{a}@2000,{a}@2000") == [(a, -1500.0), (a, 2000.0)]
+    odd = os.path.join(d, "x@y.wav")
+    assert qrm_replay_files(odd) == [(odd, 0.0)]
+
+
+def test_per_file_dial_lands_each_slice_at_its_own_offset(tmp_path):
+    """B1: two captures in ONE playlist, each with its own dial. a.wav has a tone at -1000 Hz IQ (dial -1500 -> 500 Hz
+    audio), b.wav at +2700 Hz IQ (dial 2000 -> 700 Hz audio). Rendered through the class each slice puts its tone at
+    its own audio frequency at the pinned INR; with one shared dial the second tone would sit out of the slice."""
+    from skywave.rig_effects import QrmReplay
+    a = write_capture(str(tmp_path / "a.wav"), n0=100.0, tones=[(-1000.0, 12.0)], seed=4)
+    b = write_capture(str(tmp_path / "b.wav"), n0=400.0, tones=[(2700.0, 12.0)], seed=5)
+    fs, sigma = 48000, 2000.0
+    noise3k = sigma ** 2 * 3000.0 / (fs / 2.0)
+    rep = QrmReplay(fs, np.random.default_rng(SEED), sigma, [(a, -1500.0), (b, 2000.0)])
+    assert [st["dial"] for st in rep.stats] == [-1500.0, 2000.0]
+    assert "dials -1500/+2000 Hz" in rep.describe()
+    for path, f_audio in ((a, 500.0), (b, 700.0)):
+        i = rep.files.index(path)
+        y = rep._render(path, rep.entries[i][1])
+        tone = band_power(y, fs, f_audio - 50, f_audio + 50) - band_power(y, fs, 1500, 1600)
+        assert abs(10 * math.log10(tone / noise3k) - 12.0) < 0.7, f"{path}: tone not at {f_audio:g} Hz audio"
+    # and through fill(): over two files' worth of playback both tones are heard
+    y = run_fill(rep, 16.0)
+    for f_audio in (500.0, 700.0):
+        assert band_power(y, fs, f_audio - 50, f_audio + 50) > 3 * band_power(y, fs, 1500, 1600), f_audio
+    with pytest.raises(ValueError):
+        QrmReplay(fs, np.random.default_rng(SEED), sigma, [(a, 0.0), (b, 2500.0)])   # 2500 + 3000 > 5 kHz
+
+
+def test_builder_wires_per_file_dials(corpus):
+    """B1 through the real construction path: the env spec's per-file dials reach both directions' QrmReplay and
+    the banner; an unsuffixed entry takes SIM_QRM_REPLAY_DIAL_HZ."""
+    a, b = corpus
+    cs = load_sim(SIGMA=2000, SIM_QRM_REPLAY=f"{a}@-1500,{b}", SIM_QRM_REPLAY_DIAL_HZ=1000,
+                  SIM_WATTERSON="off", SIM_RX_PAD_DB=-12)
+    eff = cs.build_channel_effects()
+    assert not isinstance(eff, int)
+    for q in (eff.fx_ab.qrm, eff.fx_ba.qrm):
+        assert sorted(q.entries) == [(a, -1500.0), (b, 1000.0)]
+    assert "dials -1500/+1000 Hz" in " ".join(eff.fx_desc)

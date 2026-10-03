@@ -275,6 +275,15 @@ the QRM statistics come from the recordings. The sidecar's S-meter anchor
 absolute floor in dBm/Hz, so a cell's SNR maps to an absolute wanted-signal
 level when one is needed.
 
+**Per-file dial (2026-10-03).** An entry of `SIM_QRM_REPLAY` may carry its
+own dial as a suffix, `path@<Hz>` (a glob's suffix applies to every match);
+entries without one take `SIM_QRM_REPLAY_DIAL_HZ`. A scenario stratum drawn
+across bands and sites mixes slices whose gateway or parking channel sits at
+different offsets inside their captures (the selector's manifest carries
+`dial_hz` per slice), so one dial for the whole playlist would put most of
+them on the wrong channel. The same capture at two dials is two entries. The
+banner reads `dials -2100/+2000 Hz` when they differ.
+
 Rail budget (Section 6): the gate uses a conservative UPPER BOUND on the
 streamed peak — √2 × the scaled complex peak of each capture × 1.5 (an
 equal-power crossfade of two in-phase peaks reaches √2 × either) — and

@@ -467,11 +467,14 @@ if QRM_SWEEP and QRM_SWEEP_BAND_HZ < 2400.0:
         "channel (24000 default; 2400 = the retired continuous-jammer shape)")
 # QRM REPLAY mode (pre-reg §7, built 2026-09-21 after the pilot's D3 REPLACE):
 # SIM_QRM_REPLAY = comma-separated KiwiSDR IQ captures or globs (the pilot's
-# 2-min ±6 kHz fixed-gain wavs with .json sidecars). The recording REPLACES the
+# 2-min ±6 kHz fixed-gain wavs with .json sidecars), each optionally suffixed
+# `@<dial Hz>` — that entry's own USB dial (a glob's suffix applies to every
+# match; 2026-10-03, so one stratum can mix gateway/parking slices at different
+# offsets). The recording REPLACES the
 # white noise: each file is scaled so its own measured noise floor equals the
 # density SIGMA defines, so the SNR axis is unchanged and every interferer in it
 # rides at its true INR (rig_effects.QrmReplay). SIM_QRM_REPLAY_DIAL_HZ = USB dial
-# offset inside the capture (default 0 = the capture centre, i.e. the gateway
+# offset for entries WITHOUT a suffix (default 0 = the capture centre, i.e. the gateway
 # cluster the pilot centred on); SIM_QRM_REPLAY_BW_HZ = slice width (3000).
 # Mutually exclusive with SIM_QRM_OCC/SWEEP (generative) and SIM_NOISE_VD (the
 # recording carries its own impulsiveness) — a conflict fails loud.
@@ -483,16 +486,27 @@ if QRM_REPLAY and (QRM_OCC or QRM_SWEEP):
                      "(replay vs generative QRM — one environment per cell)")
 
 
-def qrm_replay_files(spec):
-    """Expand SIM_QRM_REPLAY (comma-separated paths/globs) to a sorted, de-duplicated file list."""
+def qrm_replay_files(spec, default_dial=0.0):
+    """Expand SIM_QRM_REPLAY (comma-separated paths/globs, each optionally `@<dial Hz>`) to a sorted,
+    de-duplicated [(path, dial)] list. A suffix that does not parse as a number is part of the path. The
+    same capture at two dials is two entries (two slices)."""
     import glob as _glob
     out = []
     for item in spec.split(","):
-        item = os.path.expanduser(item.strip())
+        item = item.strip()
         if not item:
             continue
+        dial = float(default_dial)
+        head, at, tail = item.rpartition("@")
+        if at:
+            try:
+                dial = float(tail)
+                item = head
+            except ValueError:
+                pass
+        item = os.path.expanduser(item)
         hits = sorted(_glob.glob(item)) if any(ch in item for ch in "*?[") else [item]
-        out.extend(h for h in hits if h.endswith(".wav"))
+        out.extend((h, dial) for h in hits if h.endswith(".wav"))
     return sorted(dict.fromkeys(out))
 
 
@@ -2087,7 +2101,7 @@ def build_channel_effects():
                 print("channel_sim: SIM_QRM_REPLAY with SIM_NOISE_VD is a config conflict "
                       "(the recording carries its own noise statistics)", file=sys.stderr, flush=True)
                 return 2
-            _files = qrm_replay_files(QRM_REPLAY)
+            _files = qrm_replay_files(QRM_REPLAY, QRM_REPLAY_DIAL_HZ)
             if not _files:
                 print(f"channel_sim: SIM_QRM_REPLAY={QRM_REPLAY!r} matches no .wav", file=sys.stderr, flush=True)
                 return 2
@@ -2102,9 +2116,9 @@ def build_channel_effects():
                       "through the quiet pre-onset window)", file=sys.stderr, flush=True)
                 return 2
             fx_ab.qrm = fxm.QrmReplay(FS, np.random.default_rng(SEED + 33), SIGMA_AB, _files,
-                                      dial_hz=QRM_REPLAY_DIAL_HZ, bw_hz=QRM_REPLAY_BW_HZ)
+                                      bw_hz=QRM_REPLAY_BW_HZ)
             fx_ba.qrm = fxm.QrmReplay(FS, np.random.default_rng(SEED + 44), SIGMA_BA, _files,
-                                      dial_hz=QRM_REPLAY_DIAL_HZ, bw_hz=QRM_REPLAY_BW_HZ)
+                                      bw_hz=QRM_REPLAY_BW_HZ)
             # Rail-budget gate on the recording's own peaks (fail loud, never clamp)
             _fading = rail_fading()
             _room = qrm_rail_room_amp(_gate_sigma, RX_PAD, _fading)

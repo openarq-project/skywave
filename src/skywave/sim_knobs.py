@@ -171,9 +171,10 @@ KNOBS = (
     ("SIM_QRM_SWEEP_BAND_HZ", "Interference (QRM)", "value", "HZ",
      "virtual sweep span; in-channel duty = passband/span, must be >= 2400 [24000]"),
     ("SIM_QRM_REPLAY", "Interference (QRM)", "value", "SPEC",
-     "comma-separated recorded-QRM WAV files/globs replacing generated noise; excl. SIM_QRM_OCC/SWEEP"),
+     "comma-separated recorded-QRM WAV files/globs replacing generated noise, each optionally "
+     "`@<dial Hz>` (that entry's own dial); excl. SIM_QRM_OCC/SWEEP"),
     ("SIM_QRM_REPLAY_DIAL_HZ", "Interference (QRM)", "value", "HZ",
-     "USB dial offset inside the SIM_QRM_REPLAY capture; 0 = capture centre [0]"),
+     "USB dial offset for SIM_QRM_REPLAY entries without an @dial suffix; 0 = capture centre [0]"),
     ("SIM_QRM_REPLAY_BW_HZ", "Interference (QRM)", "value", "HZ",
      "slice width taken from the SIM_QRM_REPLAY capture [3000]"),
 

@@ -195,8 +195,9 @@ degrading silently:
 | SIM_QRM_SWEEP_INR_DB    | sweeper peak (while-crossing) INR            | 10      |
 | SIM_QRM_SWEEP_RATE      | sweeps per second (burst repetition rate)    | 10      |
 | SIM_QRM_SWEEP_BAND_HZ   | virtual sweep span (duty = 2400 / span)      | 24000   |
-| SIM_QRM_REPLAY          | replay mode: IQ captures (paths/globs, comma-separated); replaces the white noise | (off) |
-| SIM_QRM_REPLAY_DIAL_HZ  | USB dial offset inside the capture (Hz)      | 0       |
+| SIM_QRM_REPLAY          | replay mode: IQ captures (paths/globs, comma-separated, each optionally `@<dial Hz>`); replaces the white noise; A→B (station B hears it) | (off) |
+| SIM_QRM_REPLAY_BA       | separate list for B→A (station A hears it), same grammar | = SIM_QRM_REPLAY |
+| SIM_QRM_REPLAY_DIAL_HZ  | USB dial offset for entries without `@` (Hz) | 0       |
 | SIM_QRM_REPLAY_BW_HZ    | replayed slice width (Hz)                    | 3000    |
 
 At occupancy 0 with the sweep off, the interferer process is not

@@ -73,6 +73,33 @@ def test_filters_hold_per_scenario():
     assert all(e["inr_p90"] < 1.0 for e in entries(scen["S7"]))
 
 
+def test_candidate_counts_exclude_every_trap():
+    """Review 2026-10-03 M1: the picks alone cannot see a leaked trap (pick() tie-breaks by name and never reaches
+    them). Pin the FILTER OUTPUT: per station, exactly the 6 designed rows (laurelspringsNC excluded) survive each
+    scenario's filter; an 18:00, a weekend or a 04:00 row, or a non-40 m contest row, never does."""
+    scen, _ = cut()
+    per = lambda n: {"coventryOH": n, "elizabethcityNC": n, "youngsvilleNC": n}
+    for sid in ("S1", "S2", "S3", "S4", "S6", "S7"):
+        assert scen[sid]["candidates"]["stations"] == per(6), (sid, scen[sid]["candidates"])
+    # S5's designed rows sit at 20, 22, 0, 2, 4, 6 h: 04 and 06 are outside 20-04
+    assert scen["S5"]["candidates"]["stations"] == per(4), scen["S5"]["candidates"]
+
+
+def test_filters_reject_each_trap_alone():
+    """Each trap row, given the median busy10 so pick() would choose it first if it leaked, stays out."""
+    base = corpus()
+    traps = [dict(band="20m", role="gw", hour=18), dict(band="20m", role="gw", hour=10, weekend=1),
+             dict(band="40m", role="park", hour=4), dict(band="40m", role="park", hour=6),
+             dict(band="20m", role="park", hour=21, contest=1, weekend=1)]
+    for k, t in enumerate(traps):
+        r = row(9000 + k, "coventryOH", t["band"], t["role"], t["hour"], busy10=0.3,
+                weekend=t.get("weekend", 0), contest=t.get("contest", 0))
+        r["file"] = "aaa_trap"                       # sorts FIRST on the name tie-break
+        scen, _ = qs.cut(qs.prepare(pd.concat([base, pd.DataFrame([r])])), 4, "~/qrm-replay", 7)
+        for sid in ("S1", "S2", "S4", "S5", "S6"):
+            assert "aaa_trap" not in [e["file"] for e in entries(scen[sid])], (t, sid)
+
+
 def test_no_capture_reused_across_scenarios():
     scen, _ = cut()
     files = [e["file"] for sid in ("S1", "S2", "S3", "S4", "S5", "S6", "S7") for e in entries(scen[sid])]
@@ -119,10 +146,16 @@ def test_twins_alias_the_base_lists_with_moderate_fading():
     assert scen["S4"]["env"]["SIM_FADE_DOPPLER_HZ"] == "0.05" and "SIM_WATTERSON" not in scen["S4"]["env"]
 
 
-def test_env_specs_parse_back_through_channel_sim():
-    """Every env spec reads back through channel_sim's own parser as (path, dial) pairs matching the manifest."""
+def test_env_specs_parse_back_through_channel_sim(tmp_path):
+    """Every env spec reads back through channel_sim's own parser as (path, dial) pairs matching the manifest
+    (the parser requires each file to exist, so the cut is staged as empty files under a tmp root)."""
     from skywave.channel_sim import qrm_replay_files
-    scen, _ = cut()
+    root = str(tmp_path)
+    scen, _ = qs.cut(qs.prepare(corpus()), 4, root, 7)
+    for s in scen.values():
+        for e in (s.get("ab") or []) + (s.get("ba") or []):
+            os.makedirs(os.path.join(root, e["dir"]), exist_ok=True)
+            open(os.path.join(root, e["dir"], e["file"] + ".wav"), "w").close()
     for sid, s in scen.items():
         if "alias_of" in s:
             continue
@@ -130,6 +163,6 @@ def test_env_specs_parse_back_through_channel_sim():
             if es is None:
                 continue
             got = qrm_replay_files(s["env"][key])
-            want = sorted((os.path.expanduser(f"~/qrm-replay/{e['dir']}/{e['file']}.wav"), float(e["dial_hz"]))
+            want = sorted((f"{root}/{e['dir']}/{e['file']}.wav", float(e["dial_hz"]))
                           for e in es)
             assert got == want, (sid, key)

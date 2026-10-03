@@ -211,8 +211,11 @@ def md5(path, chunk=1 << 20):
 def verify(root, manifest, aliases, want_md5):
     """List missing captures (and their sidecars) under root; optionally md5 the present ones."""
     m = json.load(open(manifest))
-    root = os.path.expanduser(root)
+    root = os.path.expanduser(root or m["meta"]["root"])
     alias = dict(a.split("=", 1) for a in aliases)
+    if alias:
+        print(f"WARNING: --alias maps {alias}; the env blocks need the UN-aliased layout "
+              f"{m['meta']['root']}/<out|out4>/<site>/ on the bench box — this checks a SOURCE tree, not staging")
     seen, missing, sums = set(), [], {}
     for sid, s in m["scenarios"].items():
         for e in (s.get("ab") or []) + (s.get("ba") or []):
@@ -267,11 +270,12 @@ def main():
     ap.add_argument("--root", default="~/qrm-replay")
     ap.add_argument("--seed", type=int, default=20261002)
     ap.add_argument("--adc-per-hour", type=float, default=2000.0)
-    ap.add_argument("--verify", metavar="ROOT")
+    ap.add_argument("--verify", metavar="ROOT", nargs="?", const="",
+                    help="check the manifest's captures under ROOT (default: the manifest's own root)")
     ap.add_argument("--alias", action="append", default=[], help="TOP=DIR: read {ROOT}/DIR for manifest dir TOP/...")
     ap.add_argument("--md5", action="store_true")
     a = ap.parse_args()
-    if a.verify:
+    if a.verify is not None:
         sys.exit(verify(a.verify, a.features, a.alias, a.md5))
     if not (a.features and a.out_dir):
         ap.error("features.csv and --out-dir are required")

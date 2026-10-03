@@ -253,7 +253,13 @@ def test_per_file_dial_spec_parsing(corpus):
     assert qrm_replay_files(os.path.join(d, "*.wav") + "@500") == [(a, 500.0), (b, 500.0)]
     assert qrm_replay_files(f"{a}@-1500,{a}@2000,{a}@2000") == [(a, -1500.0), (a, 2000.0)]
     odd = os.path.join(d, "x@y.wav")
+    open(odd, "w").close()
     assert qrm_replay_files(odd) == [(odd, 0.0)]
+    # review 2026-10-03 M2: a malformed or missing item is an error, never a silently shorter playlist
+    for bad in (f"{a} @-2100", f"{a}@-2100Hz", f"{a}@-2100,{b} @2000", os.path.join(d, "nope*.wav"),
+                os.path.join(d, "missing.wav")):
+        with pytest.raises(ValueError):
+            qrm_replay_files(bad)
 
 
 def test_per_file_dial_lands_each_slice_at_its_own_offset(tmp_path):
@@ -279,6 +285,10 @@ def test_per_file_dial_lands_each_slice_at_its_own_offset(tmp_path):
         assert band_power(y, fs, f_audio - 50, f_audio + 50) > 3 * band_power(y, fs, 1500, 1600), f_audio
     with pytest.raises(ValueError):
         QrmReplay(fs, np.random.default_rng(SEED), sigma, [(a, 0.0), (b, 2500.0)])   # 2500 + 3000 > 5 kHz
+    with pytest.raises(ValueError):
+        QrmReplay(fs, np.random.default_rng(SEED), sigma, [(a, float("nan"))])
+    import pathlib
+    assert QrmReplay(fs, np.random.default_rng(SEED), sigma, [pathlib.Path(a)]).entries == [(a, 0.0)]
 
 
 def test_builder_wires_per_file_dials(corpus):

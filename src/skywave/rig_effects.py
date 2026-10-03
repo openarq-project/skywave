@@ -503,9 +503,10 @@ class QrmReplay:
             raise ValueError("QrmReplay: no files")
         if sigma <= 0.0:
             raise ValueError("QrmReplay: sigma must be > 0 (the level anchor)")
-        self.entries = [(f, float(dial_hz)) if isinstance(f, str) else (f[0], float(f[1])) for f in files]
+        self.entries = [(os.fspath(f), float(dial_hz)) if isinstance(f, (str, os.PathLike))
+                        else (os.fspath(f[0]), float(f[1])) for f in files]
         for p, d in self.entries:
-            if d < -5000.0 - 1e-9 or d + float(bw_hz) > 5000.0 + 1e-9:
+            if not math.isfinite(d) or d < -5000.0 - 1e-9 or d + float(bw_hz) > 5000.0 + 1e-9:
                 raise ValueError(f"QrmReplay: {p}: dial {d:g} + bw {bw_hz:g} Hz outside the "
                                  "capture's flat +-5 kHz passband")
         self.fs = int(fs)

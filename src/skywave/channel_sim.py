@@ -498,7 +498,9 @@ if QRM_REPLAY_BA and not QRM_REPLAY:
 def qrm_replay_files(spec, default_dial=0.0):
     """Expand SIM_QRM_REPLAY (comma-separated paths/globs, each optionally `@<dial Hz>`) to a sorted,
     de-duplicated [(path, dial)] list. A suffix that does not parse as a number is part of the path. The
-    same capture at two dials is two entries (two slices)."""
+    same capture at two dials is two entries (two slices). An item that yields no existing .wav (a typo'd
+    suffix such as `@-2100Hz`, a missing file, an empty glob) raises ValueError: a hand-edited cell must
+    never play a silently shorter playlist (review 2026-10-03)."""
     import glob as _glob
     out = []
     for item in spec.split(","):
@@ -515,7 +517,10 @@ def qrm_replay_files(spec, default_dial=0.0):
                 pass
         item = os.path.expanduser(item)
         hits = sorted(_glob.glob(item)) if any(ch in item for ch in "*?[") else [item]
-        out.extend((h, dial) for h in hits if h.endswith(".wav"))
+        hits = [h for h in hits if h.endswith(".wav") and os.path.exists(h)]
+        if not hits:
+            raise ValueError(f"SIM_QRM_REPLAY item {item!r} matches no existing .wav")
+        out.extend((h, dial) for h in hits)
     return sorted(dict.fromkeys(out))
 
 
@@ -533,11 +538,13 @@ def qrm_rail_room_amp(sigma, rx_pad, fading):
 
 
 def rail_fading():
-    """True when a Watterson fade is configured by ANY of its three knobs (preset,
+    """True when a Watterson fade is configured by any of its three knobs (preset,
     schedule, or the custom SIM_FADE_DOPPLER_HZ + SIM_FADE_DELAY_MS pair): the rail
     gates must then budget the +10 dB constructive fade-up. The custom pair was
     missed until 2026-10-03 (the real-world campaign's 40 m short-path cell runs
-    0.05 Hz / 0.5 ms), which left the QRM gates ~10 dB too loose there."""
+    0.05 Hz / 0.5 ms), which left the QRM gates ~10 dB too loose there. The FM port's
+    fades (SIM_FM_FADE/SHADOW) are NOT covered: no cell combines FM with QRM; a
+    future one must extend this first."""
     return WATTERSON != "off" or bool(FADE_SCHEDULE) or bool(FADE_DOPPLER and FADE_DELAY)
 
 
@@ -2110,14 +2117,14 @@ def build_channel_effects():
                 print("channel_sim: SIM_QRM_REPLAY with SIM_NOISE_VD is a config conflict "
                       "(the recording carries its own noise statistics)", file=sys.stderr, flush=True)
                 return 2
-            _files = qrm_replay_files(QRM_REPLAY, QRM_REPLAY_DIAL_HZ)
-            if not _files:
-                print(f"channel_sim: SIM_QRM_REPLAY={QRM_REPLAY!r} matches no .wav", file=sys.stderr, flush=True)
+            try:
+                _files = qrm_replay_files(QRM_REPLAY, QRM_REPLAY_DIAL_HZ)
+                _files_ba = qrm_replay_files(QRM_REPLAY_BA, QRM_REPLAY_DIAL_HZ) if QRM_REPLAY_BA else _files
+            except ValueError as e:
+                print(f"channel_sim: {e}", file=sys.stderr, flush=True)
                 return 2
-            _files_ba = qrm_replay_files(QRM_REPLAY_BA, QRM_REPLAY_DIAL_HZ) if QRM_REPLAY_BA else _files
-            if not _files_ba:
-                print(f"channel_sim: SIM_QRM_REPLAY_BA={QRM_REPLAY_BA!r} matches no .wav",
-                      file=sys.stderr, flush=True)
+            if not _files or not _files_ba:
+                print("channel_sim: SIM_QRM_REPLAY / SIM_QRM_REPLAY_BA list no .wav", file=sys.stderr, flush=True)
                 return 2
             _gate_sigma = max(SIGMA_AB, SIGMA_BA)
             if min(SIGMA_AB, SIGMA_BA) <= 0.0:

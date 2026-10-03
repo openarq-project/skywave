@@ -222,3 +222,20 @@ def test_asymmetric_zero_sigma_and_onset_fail_loud(corpus):
     assert cs.build_channel_effects() == 2
     cs = load_sim(SIGMA=2000, SIM_SIGMA_BA=2000, SIM_QRM_REPLAY=corpus[0], SIM_RX_PAD_DB=-12, SIM_SIGMA_BA_ONSET_S=30)
     assert cs.build_channel_effects() == 2
+
+
+def test_rail_gate_budgets_the_fade_up_for_the_custom_doppler_pair(corpus):
+    """2026-10-03: the replay rail gate decided 'fading' from SIM_WATTERSON/SIM_FADE_SCHEDULE only, so the custom
+    SIM_FADE_DOPPLER_HZ + SIM_FADE_DELAY_MS pair (the real-world campaign's 40 m short path, 0.05 Hz / 0.5 ms) got
+    the NON-fading budget — ~10 dB too loose. At a sigma where only the fade-up term exhausts the room, the custom
+    pair must fail like a preset does, and the same cell without fading must build."""
+    sigma = 4000
+    base = dict(SIGMA=sigma, SIM_QRM_REPLAY=corpus[0], SIM_RX_PAD_DB=-12)
+    cs = load_sim(SIM_WATTERSON="off", **base)
+    eff = cs.build_channel_effects()
+    assert not isinstance(eff, int), "the no-fading control must build (else this test proves nothing)"
+    room_flat = cs.qrm_rail_room_amp(sigma, cs.RX_PAD, False)
+    room_fade = cs.qrm_rail_room_amp(sigma, cs.RX_PAD, True)
+    assert room_fade < eff.fx_ab.qrm.peak_amp < room_flat, "sigma no longer separates the two budgets"
+    assert load_sim(SIM_WATTERSON="good", **base).build_channel_effects() == 2
+    assert load_sim(SIM_FADE_DOPPLER_HZ=0.05, SIM_FADE_DELAY_MS=0.5, **base).build_channel_effects() == 2

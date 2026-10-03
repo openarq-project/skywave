@@ -509,6 +509,15 @@ def qrm_rail_room_amp(sigma, rx_pad, fading):
     return thr - sig_peak - 4.9 * sigma
 
 
+def rail_fading():
+    """True when a Watterson fade is configured by ANY of its three knobs (preset,
+    schedule, or the custom SIM_FADE_DOPPLER_HZ + SIM_FADE_DELAY_MS pair): the rail
+    gates must then budget the +10 dB constructive fade-up. The custom pair was
+    missed until 2026-10-03 (the real-world campaign's 40 m short-path cell runs
+    0.05 Hz / 0.5 ms), which left the QRM gates ~10 dB too loose there."""
+    return WATTERSON != "off" or bool(FADE_SCHEDULE) or bool(FADE_DOPPLER and FADE_DELAY)
+
+
 def qrm_amp(sigma, inr_db):
     """Carrier peak amplitude at inr_db over the noise power sigma^2."""
     return sigma * (10.0 ** (inr_db / 20.0)) * math.sqrt(2.0)
@@ -2035,7 +2044,7 @@ def build_channel_effects():
                       "SIGMA>0 (the qrm cell axis) — refusing to run inert",
                       file=sys.stderr, flush=True)
                 return 2
-            _fading = WATTERSON != "off" or bool(FADE_SCHEDULE)
+            _fading = rail_fading()
             _room = qrm_rail_room_amp(_gate_sigma, RX_PAD, _fading)
             _sw_amp = qrm_amp(_gate_sigma, QRM_SWEEP_INR_DB) if QRM_SWEEP else 0.0
             _cw_room = _room - _sw_amp
@@ -2097,7 +2106,7 @@ def build_channel_effects():
             fx_ba.qrm = fxm.QrmReplay(FS, np.random.default_rng(SEED + 44), SIGMA_BA, _files,
                                       dial_hz=QRM_REPLAY_DIAL_HZ, bw_hz=QRM_REPLAY_BW_HZ)
             # Rail-budget gate on the recording's own peaks (fail loud, never clamp)
-            _fading = WATTERSON != "off" or bool(FADE_SCHEDULE)
+            _fading = rail_fading()
             _room = qrm_rail_room_amp(_gate_sigma, RX_PAD, _fading)
             _peak = max(fx_ab.qrm.peak_amp, fx_ba.qrm.peak_amp)
             if _room <= 0.0 or _peak >= _room:

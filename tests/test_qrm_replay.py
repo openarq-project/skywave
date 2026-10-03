@@ -318,3 +318,16 @@ def test_per_direction_replay_lists(corpus, tmp_path):
     base = dict(SIGMA=4000, SIM_WATTERSON="off", SIM_RX_PAD_DB=-12)
     assert not isinstance(load_sim(SIM_QRM_REPLAY=a, **base).build_channel_effects(), int)
     assert load_sim(SIM_QRM_REPLAY=a, SIM_QRM_REPLAY_BA=hot, **base).build_channel_effects() == 2
+
+
+def test_passband_check_is_the_slice_not_abs_dial(tmp_path):
+    """The slice [dial, dial + bw] must sit inside the capture's flat +-5 kHz. The first check, |dial| + bw <= 5000,
+    refused real selector slices that do (20 m gateway at -2100: [-2100, +900]; parking at -5000: [-5000, -2000])."""
+    from skywave.rig_effects import QrmReplay
+    f = write_capture(str(tmp_path / "p.wav"), n0=100.0, seconds=6.0, seed=6)
+    mk = lambda d: QrmReplay(48000, np.random.default_rng(SEED), 2000.0, [(f, d)])
+    for ok in (-5000.0, -2100.0, 0.0, 2000.0):
+        mk(ok)
+    for bad in (-5100.0, 2100.0):
+        with pytest.raises(ValueError):
+            mk(bad)

@@ -456,7 +456,10 @@ class QrmReplay:
     audio is the real part of the analytic band [dial, dial + bw] (positive IQ
     frequency = above the capture centre; verified on the pilot corpus by the
     FT8 15 s cadence sitting on the + side of a 30 m parking capture). The
-    capture's own Kiwi passband is flat to ±5 kHz, so |dial| + bw <= 5000.
+    capture's own Kiwi passband is flat to ±5 kHz, so the slice must sit in
+    [-5000, +5000]: dial >= -5000 and dial + bw <= 5000 (the first version
+    tested |dial| + bw <= 5000, which wrongly refused the 20 m gateway slice
+    at -2100 and the -5000 parking slice; fixed 2026-10-03).
     The dial is PER FILE: an entry of `files` is a path (played at `dial_hz`)
     or a (path, dial) pair, so one playlist can mix slices whose gateway or
     parking channel sits at different offsets (a scenario stratum drawn
@@ -502,7 +505,7 @@ class QrmReplay:
             raise ValueError("QrmReplay: sigma must be > 0 (the level anchor)")
         self.entries = [(f, float(dial_hz)) if isinstance(f, str) else (f[0], float(f[1])) for f in files]
         for p, d in self.entries:
-            if abs(d) + float(bw_hz) > 5000.0 + 1e-9:
+            if d < -5000.0 - 1e-9 or d + float(bw_hz) > 5000.0 + 1e-9:
                 raise ValueError(f"QrmReplay: {p}: dial {d:g} + bw {bw_hz:g} Hz outside the "
                                  "capture's flat +-5 kHz passband")
         self.fs = int(fs)

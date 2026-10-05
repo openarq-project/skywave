@@ -138,25 +138,76 @@ def cadence(b, max_lag=20):
     return (best + 1, float(ac[best])) if best is not None else (None, None)
 
 
+class _Acc:
+    """One (channel, stratum) aggregate, filled file by file in file order. Constant size except `levels` (float64
+    arrays, exact) and `p_adj` (one float per file); run lengths are integers, so a Counter holds their multiset."""
+    __slots__ = ("n", "busy", "det", "nfiles", "bl", "bcen", "il", "icen", "bws", "lags", "p_adj", "levels")
+
+    def __init__(self):
+        self.n = self.busy = self.det = self.nfiles = self.bcen = self.icen = 0
+        self.bl, self.il, self.bws, self.lags = collections.Counter(), collections.Counter(), collections.Counter(), collections.Counter()
+        self.p_adj, self.levels = [], []
+
+
+def _multiset(counter):
+    return np.repeat(np.array(sorted(counter), dtype=np.int64), [counter[k] for k in sorted(counter)])
+
+
+def _rows_of(site, band, width, c, accs):
+    """The channels.csv rows of one channel: strata in first-seen file order, then ("all", "all")."""
+    out = []
+    for (blk, dty), a in accs.items():
+        lv = np.concatenate(a.levels) if a.levels else np.array([])
+        bl, il = _multiset(a.bl), _multiset(a.il)
+        out.append({"site": site, "band_khz": band, "width_hz": width, "channel_khz": c, "block": blk, "daytype": dty,
+                    "frames": a.n, "busy_frac": a.busy / a.n, "detect_frac": a.det / a.n,
+                    "d5_tail": (a.det - a.busy) / a.det if a.det else float("nan"),
+                    "n_busy_runs": len(bl), "busy_run_p50_s": q(bl, 50), "busy_run_p90_s": q(bl, 90), "busy_runs_censored": a.bcen,
+                    "idle_run_p50_s": q(il, 50), "idle_run_p90_s": q(il, 90), "idle_runs_censored": a.icen,
+                    "level_p50_db": q(lv, 50), "level_p90_db": q(lv, 90),
+                    "bw_carrier": a.bws["carrier"], "bw_narrow": a.bws["narrow"], "bw_voice_wide": a.bws["voice_wide"], "bw_broad": a.bws["broad"],
+                    "cadence_lag_s": a.lags.most_common(1)[0][0] if a.lags else "",
+                    "cadence_files_frac": sum(a.lags.values()) / a.nfiles,
+                    "p_adjacent_busy_given_idle": float(np.nanmean(a.p_adj)) if a.p_adj else float("nan")})
+    return out
+
+
 def score(args):
+    """Streams events.csv and frames.csv as it goes and aggregates per (channel, stratum) at file time; a (site, band)'s
+    aggregates are reduced to rows and freed after its last file, so memory is bounded by the largest site × band."""
+    import csv
     files = sorted(sum([glob.glob(os.path.join(d, "*.wf.npy")) for d in args.dirs], []))
     if not files:
         raise SystemExit("no .wf.npy files")
     os.makedirs(args.out, exist_ok=True)
-    frames_rows, events, per = [], [], collections.defaultdict(list)       # per[(site, band, width, ch)] -> list of per-file dicts
-    segrows = collections.defaultdict(collections.Counter)                # (site, band, block, daytype) -> class -> bin-seconds
+    keys = []
     for p in files:
+        side = json.load(open(p[:-7] + ".json"))
+        keys.append((side.get("station", "kiwi"), int(round(side["centre_khz"]))))
+    last = {k: i for i, k in enumerate(keys)}                            # flush a (site, band) after its last file
+    fev = open(os.path.join(args.out, "events.csv"), "w", newline=""); wev = csv.writer(fev)
+    wev.writerow(["site", "band_khz", "width_hz", "channel_khz", "start_utc", "len_s", "censored", "level_db", "bw_hz"])
+    ffr = open(os.path.join(args.out, "frames.csv"), "w", newline=""); wfr = csv.writer(ffr)
+    wfr.writerow(["site", "band_khz", "utc", "floor_dbm_hz", "floor_frame_p25_dbm_hz", "noise_shape_db", "frac_bins_in_segments"])
+    n_frames = n_events = 0
+    rows, floors = [], {}                                                # floors[(site, band)] -> REPORT floor-table numbers
+    per = collections.defaultdict(dict)                                  # per[(site, band, width, ch)][stratum] -> _Acc
+    fl = collections.defaultdict(list)                                   # fl[(site, band)] -> (file floor, frame p25, shape) rows
+    segrows = collections.defaultdict(collections.Counter)                # (site, band, block, daytype) -> class -> bin-seconds
+    for fi, p in enumerate(files):
         side, dbm, ts, f_khz, rbw = load(p)
         site = side.get("station", "kiwi"); band = int(round(side["centre_khz"]))
         t0 = ts[0]
+        strat = stratum_of(t0, args.utc_offset)
         ffloor = file_floor(dbm)
         frame_p25, shape_db = frame_floor(dbm)
-        floor_db = np.full(len(ts), ffloor)
         segs = [segments(dbm[i], ffloor, rbw) for i in range(len(ts))]
         for i in range(len(ts)):
             occ = sum(sg[1] - sg[0] + 1 for sg in segs[i]) / (dbm.shape[1] - 2)
-            frames_rows.append((site, band, dt.datetime.fromtimestamp(ts[i], dt.timezone.utc).isoformat(timespec="seconds"),
-                                round(ffloor, 1), round(float(frame_p25[i]), 1), round(float(shape_db[i]), 1), round(float(occ), 3)))
+            r = (site, band, dt.datetime.fromtimestamp(ts[i], dt.timezone.utc).isoformat(timespec="seconds"),
+                 round(ffloor, 1), round(float(frame_p25[i]), 1), round(float(shape_db[i]), 1), round(float(occ), 3))
+            wfr.writerow(r); n_frames += 1
+            fl[(site, band)].append((r[3], r[4], r[5]))
             for sg in segs[i]:
                 segrows[(site, band) + stratum_of(ts[i], args.utc_offset)][bw_class(sg[2])] += 1
                 segrows[(site, band, "all", "all")][bw_class(sg[2])] += 1
@@ -174,9 +225,22 @@ def score(args):
                         adj.append(busy[:, k])
                 idle = ~b
                 p_adj = float(np.mean(np.any(np.stack(adj), axis=0)[idle])) if adj and idle.sum() else float("nan")
-                ev = []
+                accs = per[(site, band, width, round(float(c), 1))]
+                ga = accs.get(strat) or accs.setdefault(strat, _Acc())
+                aa = accs.pop(("all", "all"), None) or _Acc(); accs[("all", "all")] = aa   # keep "all" last
+                nb, nd = int(b.sum()), int(det[:, j].sum())
+                lv = lev[det[:, j], j]
+                for a in (ga, aa):
+                    a.n += len(b); a.busy += nb; a.det += nd; a.nfiles += 1
+                    a.levels.append(lv)
+                    if lag:
+                        a.lags[lag] += 1
+                    if p_adj == p_adj:
+                        a.p_adj.append(p_adj)
                 for s, n, val, cl, cr in runs_of(b):
                     if not val:
+                        for a in (ga, aa):
+                            a.il[n] += 1; a.icen += int(cl or cr)
                         continue
                     seg = lev[s:s + n, j]
                     ipk = s + int(np.argmax(seg))
@@ -186,65 +250,35 @@ def score(args):
                     ib = w0 + int(np.argmax(fr[w0:w1]))
                     inside = [sg for sg in segs[ipk] if sg[0] <= ib <= sg[1]]
                     bw_hz = inside[0][2] if inside else rbw
-                    ev.append((n, cl or cr, float(seg.max()), bw_hz))
-                    events.append((site, band, width, round(float(c), 1), dt.datetime.fromtimestamp(t0 + ts[s] - ts[0], dt.timezone.utc)
-                                   .isoformat(timespec="seconds"), n, int(cl or cr), round(float(seg.max()), 1), int(bw_hz)))
-                idle_runs = [(n, cl or cr) for s, n, val, cl, cr in runs_of(b) if not val]
-                per[(site, band, width, round(float(c), 1))].append({
-                    "t0": t0, "n": len(b), "busy": int(b.sum()), "det": int(det[:, j].sum()),
-                    "det_below_busy": int((det[:, j] & ~b).sum()),
-                    "levels": lev[det[:, j], j].tolist(), "ev": ev, "idle": idle_runs, "lag": lag, "h": h, "p_adj": p_adj})
-    # ---- aggregate per stratum
-    def stratum(t0):
-        return stratum_of(t0, args.utc_offset)
-    rows = []
-    for (site, band, width, c), lst in sorted(per.items()):
-        groups = collections.defaultdict(list)
-        for d in lst:
-            groups[stratum(d["t0"])].append(d)
-        groups[("all", "all")] = lst
-        for (blk, dty), g in groups.items():
-            n = sum(d["n"] for d in g); busy = sum(d["busy"] for d in g); det = sum(d["det"] for d in g)
-            ev = sum((d["ev"] for d in g), []); idle = sum((d["idle"] for d in g), [])
-            lv = np.array(sum((d["levels"] for d in g), []))
-            bl = [e[0] for e in ev]; bcen = sum(e[1] for e in ev); il = [e[0] for e in idle]
-            bws = collections.Counter(bw_class(e[3]) for e in ev)
-            lags = [(d["lag"], d["h"]) for d in g if d["lag"]]
-            rows.append({"site": site, "band_khz": band, "width_hz": width, "channel_khz": c, "block": blk, "daytype": dty,
-                         "frames": n, "busy_frac": busy / n, "detect_frac": det / n,
-                         "d5_tail": (det - busy) / det if det else float("nan"),
-                         "n_busy_runs": len(bl), "busy_run_p50_s": q(bl, 50), "busy_run_p90_s": q(bl, 90), "busy_runs_censored": bcen,
-                         "idle_run_p50_s": q(il, 50), "idle_run_p90_s": q(il, 90), "idle_runs_censored": sum(e[1] for e in idle),
-                         "level_p50_db": q(lv, 50), "level_p90_db": q(lv, 90),
-                         "bw_carrier": bws["carrier"], "bw_narrow": bws["narrow"], "bw_voice_wide": bws["voice_wide"], "bw_broad": bws["broad"],
-                         "cadence_lag_s": collections.Counter(l for l, _ in lags).most_common(1)[0][0] if lags else "",
-                         "cadence_files_frac": len(lags) / len(g),
-                         "p_adjacent_busy_given_idle": float(np.nanmean(pa)) if (pa := [d["p_adj"] for d in g if d["p_adj"] == d["p_adj"]]) else float("nan")})
-    import csv
+                    for a in (ga, aa):
+                        a.bl[n] += 1; a.bcen += int(cl or cr); a.bws[bw_class(bw_hz)] += 1
+                    wev.writerow((site, band, width, round(float(c), 1), dt.datetime.fromtimestamp(t0 + ts[s] - ts[0], dt.timezone.utc)
+                                  .isoformat(timespec="seconds"), n, int(cl or cr), round(float(seg.max()), 1), int(bw_hz)))
+                    n_events += 1
+        if last[keys[fi]] == fi:                                         # this (site, band) is complete: reduce and free it
+            for k in sorted(k for k in per if k[:2] == keys[fi]):
+                rows += _rows_of(*k, per.pop(k))
+            a = np.array(fl.pop(keys[fi]))
+            floors[keys[fi]] = (len(a), q(a[:, 0], 10), q(a[:, 0], 50), q(a[:, 0], 90), np.mean(a[:, 1] - a[:, 0]), np.mean(a[:, 2]))
+    fev.close(); ffr.close()
+    rows.sort(key=lambda r: (r["site"], r["band_khz"], r["width_hz"], r["channel_khz"]))   # stable: strata order kept
     with open(os.path.join(args.out, "channels.csv"), "w", newline="") as f:
         w = csv.DictWriter(f, fieldnames=list(rows[0].keys())); w.writeheader(); w.writerows(rows)
-    with open(os.path.join(args.out, "events.csv"), "w", newline="") as f:
-        w = csv.writer(f); w.writerow(["site", "band_khz", "width_hz", "channel_khz", "start_utc", "len_s", "censored", "level_db", "bw_hz"]); w.writerows(events)
-    with open(os.path.join(args.out, "frames.csv"), "w", newline="") as f:
-        w = csv.writer(f); w.writerow(["site", "band_khz", "utc", "floor_dbm_hz", "floor_frame_p25_dbm_hz", "noise_shape_db", "frac_bins_in_segments"]); w.writerows(frames_rows)
     with open(os.path.join(args.out, "segments.csv"), "w", newline="") as f:
         w = csv.writer(f); w.writerow(["site", "band_khz", "block", "daytype", "carrier", "narrow", "voice_wide", "broad"])
         for k, c in sorted(segrows.items()):
             w.writerow(list(k) + [c["carrier"], c["narrow"], c["voice_wide"], c["broad"]])
-    report(args, rows, frames_rows, files, segrows)
+    report(args, rows, n_frames, floors, files, segrows)
     plot(args, rows)
-    print(f"{len(files)} files, {len(frames_rows)} frames, {len(events)} busy runs → {args.out}")
+    print(f"{len(files)} files, {n_frames} frames, {n_events} busy runs → {args.out}")
 
 
-def report(args, rows, frames_rows, files, segrows):
-    L = [f"# QRM occupancy — {len(files)} captures, {len(frames_rows)} frames ({args.busy_db} dB busy / {args.detect_db} dB detect passband INR over the per-frame noise-mean floor)\n"]
-    fl = collections.defaultdict(list)
-    for r in frames_rows:
-        fl[(r[0], r[1])].append((r[3], r[4], r[5]))
+def report(args, rows, n_frames, floors, files, segrows):
+    L = [f"# QRM occupancy — {len(files)} captures, {n_frames} frames ({args.busy_db} dB busy / {args.detect_db} dB detect passband INR over the per-frame noise-mean floor)\n"]
     L.append("## Floor per site × band (noise MEAN, dBm/Hz; per-file time-p10 → bin-p25 estimator)\n\n| site | band kHz | frames | file floor p10 / p50 / p90 | per-frame p25 floor − file floor (dB) | noise shape median−p25 dB (3.8 = single-FFT exponential) | segments carrier/narrow/wide/broad (bin·s) |\n|---|---|---|---|---|---|---|")
-    for (s, b), v in sorted(fl.items()):
-        a = np.array(v); c = segrows[(s, b, "all", "all")]
-        L.append(f"| {s} | {b} | {len(a)} | {q(a[:, 0], 10):.1f} / {q(a[:, 0], 50):.1f} / {q(a[:, 0], 90):.1f} | {np.mean(a[:, 1] - a[:, 0]):+.1f} | {np.mean(a[:, 2]):.1f} | "
+    for (s, b), (nf, p10, p50, p90, dp25, shp) in sorted(floors.items()):
+        c = segrows[(s, b, "all", "all")]
+        L.append(f"| {s} | {b} | {nf} | {p10:.1f} / {p50:.1f} / {p90:.1f} | {dp25:+.1f} | {shp:.1f} | "
                  f"{c['carrier']}/{c['narrow']}/{c['voice_wide']}/{c['broad']} |")
     for width in (500, 2400):
         L.append(f"\n## {width} Hz channels, all strata — the busiest 12 per site × band\n")

@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """qrm_occupancy.py — score KiwiSDR waterfall captures (kiwi_wf_record.py) for the QRM pilot (pre-reg §5).
 
-    qrm_occupancy.py DIR [DIR ...] --out REPORT_DIR [--utc-offset -4] [--busy-db 10] [--detect-db 6]
+    qrm_occupancy.py DIR [DIR ...] --out REPORT_DIR [--utc-offset -4] [--busy-db 10] [--detect-db 6] [--cache DIR]
 
 Per capture file: dBm/Hz per bin = byte − 255 + wf_cal − 10·log10(rbw). Floor per FILE = noise mean from the
 per-bin 10th percentile over time, then the 25th percentile across bins (see file_floor; the per-frame p25
@@ -172,9 +172,90 @@ def _rows_of(site, band, width, c, accs):
     return out
 
 
+def scan_file(p, busy_db, detect_db, utc_offset):
+    """Everything score() needs from one capture, in emission order: (site, band, stratum, frames.csv rows,
+    segment bin-second increments, per-channel records, events.csv rows). Pure, so it can be cached."""
+    side, dbm, ts, f_khz, rbw = load(p)
+    site = side.get("station", "kiwi"); band = int(round(side["centre_khz"]))
+    t0 = ts[0]
+    ffloor = file_floor(dbm)
+    frame_p25, shape_db = frame_floor(dbm)
+    segs = [segments(dbm[i], ffloor, rbw) for i in range(len(ts))]
+    frames, seginc, chans, events = [], collections.defaultdict(collections.Counter), [], []
+    for i in range(len(ts)):
+        occ = sum(sg[1] - sg[0] + 1 for sg in segs[i]) / (dbm.shape[1] - 2)
+        frames.append((site, band, dt.datetime.fromtimestamp(ts[i], dt.timezone.utc).isoformat(timespec="seconds"),
+                       round(ffloor, 1), round(float(frame_p25[i]), 1), round(float(shape_db[i]), 1), round(float(occ), 3)))
+        for sg in segs[i]:
+            seginc[(site, band) + stratum_of(ts[i], utc_offset)][bw_class(sg[2])] += 1
+            seginc[(site, band, "all", "all")][bw_class(sg[2])] += 1
+    dbm_nn = np.nan_to_num(dbm, nan=-999)
+    for width in (500, 2400):
+        centres, lev, floor = channel_levels(dbm, f_khz, rbw, width, floor_db=ffloor)
+        busy = lev >= busy_db; det = lev >= detect_db
+        for j, c in enumerate(centres):
+            b = busy[:, j]
+            lag, h = cadence(b)
+            # adjacent coupling: P(busy at ±3 kHz | this channel idle)
+            adj = []
+            for off in (-3.0, 3.0):
+                k = int(np.argmin(np.abs(centres - (c + off))))
+                if abs(centres[k] - (c + off)) < 0.15:
+                    adj.append(busy[:, k])
+            idle = ~b
+            p_adj = float(np.mean(np.any(np.stack(adj), axis=0)[idle])) if adj and idle.sum() else float("nan")
+            w0 = int(np.argmin(np.abs(f_khz - (c - width / 2000)))); w1 = w0 + max(1, int(round(width / rbw)))
+            brun, irun = [], []
+            for s, n, val, cl, cr in runs_of(b):
+                if not val:
+                    irun.append((n, int(cl or cr)))
+                    continue
+                seg = lev[s:s + n, j]
+                ipk = s + int(np.argmax(seg))
+                # peak bin inside the window at the peak frame
+                ib = w0 + int(np.argmax(dbm_nn[ipk, w0:w1]))
+                inside = [sg for sg in segs[ipk] if sg[0] <= ib <= sg[1]]
+                bw_hz = inside[0][2] if inside else rbw
+                brun.append((n, int(cl or cr), bw_class(bw_hz)))
+                events.append((site, band, width, round(float(c), 1), dt.datetime.fromtimestamp(t0 + ts[s] - ts[0], dt.timezone.utc)
+                               .isoformat(timespec="seconds"), n, int(cl or cr), round(float(seg.max()), 1), int(bw_hz)))
+            chans.append((width, round(float(c), 1), len(b), int(b.sum()), int(det[:, j].sum()), lev[det[:, j], j], lag, p_adj, brun, irun))
+    return site, band, stratum_of(t0, utc_offset), frames, dict(seginc), chans, events
+
+
+def _sig(p):
+    """(size, mtime_ns) of a capture's three files: rsync -a preserves both, so a re-pulled file never matches."""
+    return tuple((st.st_size, st.st_mtime_ns) for st in (os.stat(p), os.stat(p[:-7] + ".t.npy"), os.stat(p[:-7] + ".json")))
+
+
+def _scans(files, args):
+    """scan_file over `files`, yielded in file order. With --cache DIR each scan is kept as DIR/<key>/<capture>.pkl.z
+    and reused while the capture's files are unchanged; <key> covers the thresholds, the numpy version and this
+    script's source, so any change to them starts a fresh cache (old <key> dirs are left for the operator to delete)."""
+    import hashlib, pickle, zlib
+    scan = lambda p: scan_file(p, args.busy_db, args.detect_db, args.utc_offset)
+    if not args.cache:
+        yield from map(scan, files); return
+    src = hashlib.sha256(open(os.path.abspath(__file__), "rb").read()).hexdigest()[:12]
+    cdir = os.path.join(args.cache, f"busy{args.busy_db}_det{args.detect_db}_utc{args.utc_offset}_np{np.__version__}_src{src}")
+    os.makedirs(cdir, exist_ok=True)
+    hits = 0
+    for p in files:
+        cp = os.path.join(cdir, os.path.basename(p)[:-7] + ".pkl.z"); sig = _sig(p)
+        if os.path.exists(cp):
+            csig, r = pickle.loads(zlib.decompress(open(cp, "rb").read()))
+            if csig == sig:
+                hits += 1; yield r; continue
+        r = scan(p)
+        tmp = cp + ".tmp"; open(tmp, "wb").write(zlib.compress(pickle.dumps((sig, r), protocol=5), 1)); os.replace(tmp, cp)
+        yield r
+    print(f"cache {cdir}: {hits} hits, {len(files) - hits} scanned")
+
+
 def score(args):
     """Streams events.csv and frames.csv as it goes and aggregates per (channel, stratum) at file time; a (site, band)'s
-    aggregates are reduced to rows and freed after its last file, so memory is bounded by the largest site × band."""
+    aggregates are reduced to rows and freed after its last file, so memory is bounded by the largest site × band.
+    The outputs do not depend on --cache."""
     import csv
     files = sorted(sum([glob.glob(os.path.join(d, "*.wf.npy")) for d in args.dirs], []))
     if not files:
@@ -194,67 +275,27 @@ def score(args):
     per = collections.defaultdict(dict)                                  # per[(site, band, width, ch)][stratum] -> _Acc
     fl = collections.defaultdict(list)                                   # fl[(site, band)] -> (file floor, frame p25, shape) rows
     segrows = collections.defaultdict(collections.Counter)                # (site, band, block, daytype) -> class -> bin-seconds
-    for fi, p in enumerate(files):
-        side, dbm, ts, f_khz, rbw = load(p)
-        site = side.get("station", "kiwi"); band = int(round(side["centre_khz"]))
-        t0 = ts[0]
-        strat = stratum_of(t0, args.utc_offset)
-        ffloor = file_floor(dbm)
-        frame_p25, shape_db = frame_floor(dbm)
-        segs = [segments(dbm[i], ffloor, rbw) for i in range(len(ts))]
-        for i in range(len(ts)):
-            occ = sum(sg[1] - sg[0] + 1 for sg in segs[i]) / (dbm.shape[1] - 2)
-            r = (site, band, dt.datetime.fromtimestamp(ts[i], dt.timezone.utc).isoformat(timespec="seconds"),
-                 round(ffloor, 1), round(float(frame_p25[i]), 1), round(float(shape_db[i]), 1), round(float(occ), 3))
-            wfr.writerow(r); n_frames += 1
-            fl[(site, band)].append((r[3], r[4], r[5]))
-            for sg in segs[i]:
-                segrows[(site, band) + stratum_of(ts[i], args.utc_offset)][bw_class(sg[2])] += 1
-                segrows[(site, band, "all", "all")][bw_class(sg[2])] += 1
-        for width in (500, 2400):
-            centres, lev, floor = channel_levels(dbm, f_khz, rbw, width, floor_db=ffloor)
-            busy = lev >= args.busy_db; det = lev >= args.detect_db
-            for j, c in enumerate(centres):
-                b = busy[:, j]
-                lag, h = cadence(b)
-                # adjacent coupling: P(busy at ±3 kHz | this channel idle)
-                adj = []
-                for off in (-3.0, 3.0):
-                    k = int(np.argmin(np.abs(centres - (c + off))))
-                    if abs(centres[k] - (c + off)) < 0.15:
-                        adj.append(busy[:, k])
-                idle = ~b
-                p_adj = float(np.mean(np.any(np.stack(adj), axis=0)[idle])) if adj and idle.sum() else float("nan")
-                accs = per[(site, band, width, round(float(c), 1))]
-                ga = accs.get(strat) or accs.setdefault(strat, _Acc())
-                aa = accs.pop(("all", "all"), None) or _Acc(); accs[("all", "all")] = aa   # keep "all" last
-                nb, nd = int(b.sum()), int(det[:, j].sum())
-                lv = lev[det[:, j], j]
-                for a in (ga, aa):
-                    a.n += len(b); a.busy += nb; a.det += nd; a.nfiles += 1
-                    a.levels.append(lv)
-                    if lag:
-                        a.lags[lag] += 1
-                    if p_adj == p_adj:
-                        a.p_adj.append(p_adj)
-                for s, n, val, cl, cr in runs_of(b):
-                    if not val:
-                        for a in (ga, aa):
-                            a.il[n] += 1; a.icen += int(cl or cr)
-                        continue
-                    seg = lev[s:s + n, j]
-                    ipk = s + int(np.argmax(seg))
-                    # peak bin inside the window at the peak frame
-                    fr = np.nan_to_num(dbm[ipk], nan=-999)
-                    w0 = int(np.argmin(np.abs(f_khz - (c - width / 2000)))); w1 = w0 + max(1, int(round(width / rbw)))
-                    ib = w0 + int(np.argmax(fr[w0:w1]))
-                    inside = [sg for sg in segs[ipk] if sg[0] <= ib <= sg[1]]
-                    bw_hz = inside[0][2] if inside else rbw
-                    for a in (ga, aa):
-                        a.bl[n] += 1; a.bcen += int(cl or cr); a.bws[bw_class(bw_hz)] += 1
-                    wev.writerow((site, band, width, round(float(c), 1), dt.datetime.fromtimestamp(t0 + ts[s] - ts[0], dt.timezone.utc)
-                                  .isoformat(timespec="seconds"), n, int(cl or cr), round(float(seg.max()), 1), int(bw_hz)))
-                    n_events += 1
+    for fi, (site, band, strat, frames, seginc, chans, events) in enumerate(_scans(files, args)):
+        wfr.writerows(frames); n_frames += len(frames)
+        fl[(site, band)] += [(r[3], r[4], r[5]) for r in frames]
+        for k, c in seginc.items():
+            segrows[k].update(c)
+        for width, c, n, nb, nd, lv, lag, p_adj, brun, irun in chans:
+            accs = per[(site, band, width, c)]
+            ga = accs.get(strat) or accs.setdefault(strat, _Acc())
+            aa = accs.pop(("all", "all"), None) or _Acc(); accs[("all", "all")] = aa   # keep "all" last
+            for a in (ga, aa):
+                a.n += n; a.busy += nb; a.det += nd; a.nfiles += 1
+                a.levels.append(lv)
+                if lag:
+                    a.lags[lag] += 1
+                if p_adj == p_adj:
+                    a.p_adj.append(p_adj)
+                for rn, cen in irun:
+                    a.il[rn] += 1; a.icen += cen
+                for rn, cen, cls in brun:
+                    a.bl[rn] += 1; a.bcen += cen; a.bws[cls] += 1
+        wev.writerows(events); n_events += len(events)
         if last[keys[fi]] == fi:                                         # this (site, band) is complete: reduce and free it
             for k in sorted(k for k in per if k[:2] == keys[fi]):
                 rows += _rows_of(*k, per.pop(k))
@@ -328,6 +369,7 @@ def main():
     ap.add_argument("dirs", nargs="+"); ap.add_argument("--out", required=True)
     ap.add_argument("--utc-offset", type=float, default=-4, help="receiver-local hours vs UTC (US Eastern DST = -4)")
     ap.add_argument("--busy-db", type=float, default=10, help="passband INR for BUSY"); ap.add_argument("--detect-db", type=float, default=3)
+    ap.add_argument("--cache", help="keep each capture's scan here and reuse it while the capture is unchanged")
     score(ap.parse_args())
 
 
